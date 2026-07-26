@@ -49,20 +49,24 @@ def get_gspread_client(service_account_info: dict):
 
 # --- Učitavanje podataka ---
 
-def load_ucenici(sheet) -> pd.DataFrame:
-    ws = sheet.worksheet("Učenici")
+def _load_worksheet_df(ws) -> pd.DataFrame:
+    """Robustno učitavanje - radi ispravno i kad tab ima samo header, bez ijednog retka podataka."""
+    headers = ws.row_values(1)
     records = ws.get_all_records()
-    df = pd.DataFrame(records)
-    df["_row"] = range(2, len(df) + 2)  # stvarni redak u Sheetu (header = redak 1)
+    if not records:
+        df = pd.DataFrame(columns=headers)
+    else:
+        df = pd.DataFrame(records)
+    df["_row"] = range(2, len(df) + 2)
     return df
+
+
+def load_ucenici(sheet) -> pd.DataFrame:
+    return _load_worksheet_df(sheet.worksheet("Učenici"))
 
 
 def load_prijave(sheet) -> pd.DataFrame:
-    ws = sheet.worksheet("Prijave")
-    records = ws.get_all_records()
-    df = pd.DataFrame(records)
-    df["_row"] = range(2, len(df) + 2)
-    return df
+    return _load_worksheet_df(sheet.worksheet("Prijave"))
 
 
 # --- Uređivanje kontakt podataka učenika ---
@@ -178,19 +182,11 @@ def postavi_tabove_booking(sheet):
 
 
 def load_grupe(sheet) -> pd.DataFrame:
-    ws = sheet.worksheet("Grupe")
-    records = ws.get_all_records()
-    df = pd.DataFrame(records)
-    df["_row"] = range(2, len(df) + 2)
-    return df
+    return _load_worksheet_df(sheet.worksheet("Grupe"))
 
 
 def load_rezervacije(sheet) -> pd.DataFrame:
-    ws = sheet.worksheet("Rezervacije")
-    records = ws.get_all_records()
-    df = pd.DataFrame(records)
-    df["_row"] = range(2, len(df) + 2)
-    return df
+    return _load_worksheet_df(sheet.worksheet("Rezervacije"))
 
 
 def kreiraj_grupu(sheet, program, dan, vrijeme, ucionica, kapacitet, tip, aktivna=True):
