@@ -122,7 +122,10 @@ for _, red in komponente_ucenika.iterrows():
                         sheet, grupa["grupa_id"], ucenik_id, ucenik["ime_djeteta"],
                         ucenik.get("mobitel_roditelja", ""), status="Rezervirano"
                     )
-                    st.success("Mjesto rezervirano! Uplatite u roku od 5 dana da potvrdite mjesto.")
+                    st.success(
+                        f"Vaša rezervacija je evidentirana: {grupa['dan']} {grupa['vrijeme']} "
+                        f"({grupa['ucionica']}) — čekamo potvrdu uplate"
+                    )
                     st.cache_data.clear()
                     st.rerun()
             elif dostupnost["status_boja"] == "narancasto":
