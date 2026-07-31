@@ -144,13 +144,13 @@ def dodaj_komponentu(sheet, ucenik_id: str, ime_djeteta: str, komponenta_kod: st
     redak_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
     ws.append_row([
         redak_id,
-        ucenik_id,
-        ime_djeteta,
-        komponenta_kod,
-        nacin_placanja,
+        str(ucenik_id),
+        str(ime_djeteta),
+        str(komponenta_kod),
+        str(nacin_placanja),
         "Čeka poziv",
         "Ne",
-        napomena,
+        str(napomena),
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "",
         "",
@@ -254,8 +254,14 @@ def kreiraj_rezervaciju(sheet, grupa_id, ucenik_id, ime_djeteta, kontakt_roditel
     ws = sheet.worksheet("Rezervacije")
     rezervacija_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
     ws.append_row([
-        rezervacija_id, grupa_id, ucenik_id, ime_djeteta,
-        kontakt_roditelja, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), status, SEZONA
+        rezervacija_id,
+        str(grupa_id),
+        str(ucenik_id),
+        str(ime_djeteta),
+        str(kontakt_roditelja),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        str(status),
+        SEZONA,
     ])
     return rezervacija_id
 
