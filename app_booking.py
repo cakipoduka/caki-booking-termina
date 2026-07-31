@@ -77,10 +77,10 @@ for _, red in komponente_ucenika.iterrows():
     st.divider()
     st.subheader(KOMPONENTE.get(komponenta, komponenta))
 
-    # Već ima aktivnu rezervaciju za ovu komponentu?
+    # Već ima aktivnu rezervaciju za ovu komponentu (uključujući listu čekanja)?
     postojece = df_rezervacije[
         (df_rezervacije["ucenik_id"] == ucenik_id)
-        & (df_rezervacije["status"].isin(["Rezervirano", "Potvrđeno"]))
+        & (df_rezervacije["status"].isin(["Rezervirano", "Potvrđeno", "Čekanje"]))
     ]
     grupe_te_komponente = df_grupe[df_grupe["program"] == komponenta]
     postojeca_za_komp = postojece[postojece["grupa_id"].isin(grupe_te_komponente["grupa_id"])]
@@ -90,9 +90,12 @@ for _, red in komponente_ucenika.iterrows():
         grupa_info = df_grupe[df_grupe["grupa_id"] == r["grupa_id"]]
         if not grupa_info.empty:
             g = grupa_info.iloc[0]
-            ikonica = "🟠" if r["status"] == "Rezervirano" else "🔴"
-            napomena_status = "čeka potvrdu uplate" if r["status"] == "Rezervirano" else "potvrđeno"
-            st.write(f"{ikonica} Već rezervirano: **{g['dan']} {g['vrijeme']}** ({g['ucionica']}) — {napomena_status}")
+            if r["status"] == "Čekanje":
+                st.info(f"🕐 Na listi čekanja: **{g['dan']} {g['vrijeme']}** ({g['ucionica']}) — javit ćemo vam se ako se mjesto oslobodi")
+            else:
+                ikonica = "🟠" if r["status"] == "Rezervirano" else "🔴"
+                napomena_status = "čeka potvrdu uplate" if r["status"] == "Rezervirano" else "potvrđeno"
+                st.write(f"{ikonica} Već rezervirano: **{g['dan']} {g['vrijeme']}** ({g['ucionica']}) — {napomena_status}")
         continue
 
     aktivne_grupe = grupe_te_komponente[grupe_te_komponente["aktivna"].astype(str).str.lower() == "da"]
@@ -116,25 +119,44 @@ for _, red in komponente_ucenika.iterrows():
 
         with col2:
             kljuc = f"btn_{grupa['grupa_id']}"
+
+            def vec_postoji_rezervacija(grupa_id_provjera):
+                """Sigurnosna mreža protiv brzog dvostrukog klika — svježa provjera direktno iz Sheeta."""
+                svjeze = load_rezervacije(sheet)
+                if svjeze.empty:
+                    return False
+                match = svjeze[
+                    (svjeze["ucenik_id"] == ucenik_id)
+                    & (svjeze["grupa_id"] == grupa_id_provjera)
+                    & (svjeze["status"].isin(["Rezervirano", "Potvrđeno", "Čekanje"]))
+                ]
+                return not match.empty
+
             if dostupnost["status_boja"] == "zeleno":
                 if st.button("Rezerviraj", key=kljuc):
-                    kreiraj_rezervaciju(
-                        sheet, grupa["grupa_id"], ucenik_id, ucenik["ime_djeteta"],
-                        ucenik.get("mobitel_roditelja", ""), status="Rezervirano"
-                    )
-                    st.success(
-                        f"Vaša rezervacija je evidentirana: {grupa['dan']} {grupa['vrijeme']} "
-                        f"({grupa['ucionica']}) — čekamo potvrdu uplate"
-                    )
+                    if vec_postoji_rezervacija(grupa["grupa_id"]):
+                        st.warning("Rezervacija za ovaj termin je već zabilježena.")
+                    else:
+                        kreiraj_rezervaciju(
+                            sheet, grupa["grupa_id"], ucenik_id, ucenik["ime_djeteta"],
+                            ucenik.get("mobitel_roditelja", ""), status="Rezervirano"
+                        )
+                        st.success(
+                            f"Vaša rezervacija je evidentirana: {grupa['dan']} {grupa['vrijeme']} "
+                            f"({grupa['ucionica']}) — čekamo potvrdu uplate"
+                        )
                     st.cache_data.clear()
                     st.rerun()
             elif dostupnost["status_boja"] == "narancasto":
                 if st.button("Lista čekanja", key=kljuc):
-                    kreiraj_rezervaciju(
-                        sheet, grupa["grupa_id"], ucenik_id, ucenik["ime_djeteta"],
-                        ucenik.get("mobitel_roditelja", ""), status="Čekanje"
-                    )
-                    st.success("Dodani ste na listu čekanja — javit ćemo vam se ako se mjesto oslobodi.")
+                    if vec_postoji_rezervacija(grupa["grupa_id"]):
+                        st.warning("Već ste na listi čekanja za ovaj termin.")
+                    else:
+                        kreiraj_rezervaciju(
+                            sheet, grupa["grupa_id"], ucenik_id, ucenik["ime_djeteta"],
+                            ucenik.get("mobitel_roditelja", ""), status="Čekanje"
+                        )
+                        st.success("Dodani ste na listu čekanja — javit ćemo vam se ako se mjesto oslobodi.")
                     st.cache_data.clear()
                     st.rerun()
             else:
