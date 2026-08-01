@@ -266,6 +266,17 @@ def kreiraj_rezervaciju(sheet, grupa_id, ucenik_id, ime_djeteta, kontakt_roditel
     return rezervacija_id
 
 
+def azuriraj_rezervaciju(sheet, row_number: int, novi_status: str, resetiraj_vrijeme: bool = False):
+    ws = sheet.worksheet("Rezervacije")
+    headers = ws.row_values(1)
+    col_status = headers.index("status") + 1
+    ws.update_cell(row_number, col_status, novi_status)
+
+    if resetiraj_vrijeme and "vrijeme_rezervacije" in headers:
+        col_vrijeme = headers.index("vrijeme_rezervacije") + 1
+        ws.update_cell(row_number, col_vrijeme, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
 def dohvati_ucenika_po_id(df_ucenici: pd.DataFrame, ucenik_id: str):
     red = df_ucenici[df_ucenici["ucenik_id"] == ucenik_id]
     return red.iloc[0] if not red.empty else None
