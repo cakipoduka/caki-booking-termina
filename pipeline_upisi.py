@@ -360,7 +360,8 @@ def _mozda_upisi_zamjenu(sheet, grupa_id, datum, redovni_nastavnik, zamjena_nast
 
 
 def spremi_dolazak(sheet, termin_id: str, grupa_id: str, ucenik_id: str, ime_djeteta: str, status: str):
-    """Upsert - ako već postoji zapis za (termin_id, ucenik_id), ažurira status umjesto duplog upisa."""
+    """Upsert - ako već postoji zapis za (termin_id, ucenik_id), ažurira status umjesto duplog upisa.
+    NAPOMENA: koristi spremi_cijeli_termin() za spremanje više učenika odjednom - puno manje API poziva."""
     ws = sheet.worksheet("Dolasci")
     postojeci = ws.get_all_records()
     headers = ws.row_values(1)
@@ -373,6 +374,86 @@ def spremi_dolazak(sheet, termin_id: str, grupa_id: str, ucenik_id: str, ime_dje
 
     dolazak_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
     ws.append_row([dolazak_id, str(termin_id), str(grupa_id), str(ucenik_id), str(ime_djeteta), str(status), SEZONA])
+
+
+def spremi_cijeli_termin(sheet, grupa_id, datum, nastavnik_odrzao, redovni_nastavnik, roster_zapisi, gosti_zapisi):
+    """Sprema termin + sve dolaske (roster i goste) u minimalnom broju API poziva - jedan Save klik = par poziva, ne desetci.
+    roster_zapisi / gosti_zapisi = liste dictova: {"ucenik_id":..., "ime_djeteta":..., "status":..., "maticna_grupa": (samo gosti)}"""
+
+    # --- 1) Termin: jedan get_all_records + jedan append/update ---
+    ws_termini = sheet.worksheet("Termini")
+    termini_postojeci = ws_termini.get_all_records()
+    termini_headers = ws_termini.row_values(1)
+
+    termin_id = None
+    for i, red in enumerate(termini_postojeci, start=2):
+        if str(red.get("grupa_id")) == str(grupa_id) and str(red.get("datum")) == str(datum):
+            termin_id = red.get("termin_id")
+            if str(red.get("nastavnik_odrzao")) != str(nastavnik_odrzao):
+                col = termini_headers.index("nastavnik_odrzao") + 1
+                ws_termini.update_cell(i, col, str(nastavnik_odrzao))
+            break
+
+    if termin_id is None:
+        termin_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        ws_termini.append_row([termin_id, str(grupa_id), str(datum), str(nastavnik_odrzao), SEZONA])
+
+    if str(nastavnik_odrzao) != str(redovni_nastavnik):
+        _mozda_upisi_zamjenu(sheet, grupa_id, datum, redovni_nastavnik, nastavnik_odrzao)
+
+    # --- 2) Dolasci: jedan get_all_records, pa batch update + batch append ---
+    ws_dolasci = sheet.worksheet("Dolasci")
+    dolasci_postojeci = ws_dolasci.get_all_records()
+    dolasci_headers = ws_dolasci.row_values(1)
+    col_status = dolasci_headers.index("status") + 1
+
+    postojeci_lookup = {}
+    for i, red in enumerate(dolasci_postojeci, start=2):
+        if str(red.get("termin_id")) == str(termin_id):
+            postojeci_lookup[str(red.get("ucenik_id"))] = i
+
+    svi_zapisi = list(roster_zapisi) + list(gosti_zapisi)
+
+    batch_update_podaci = []
+    novi_redovi = []
+    for z in svi_zapisi:
+        uid = str(z["ucenik_id"])
+        if uid in postojeci_lookup:
+            redak = postojeci_lookup[uid]
+            batch_update_podaci.append({
+                "range": gspread.utils.rowcol_to_a1(redak, col_status),
+                "values": [[str(z["status"])]],
+            })
+        else:
+            dolazak_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+            novi_redovi.append([dolazak_id, str(termin_id), str(grupa_id), uid, str(z["ime_djeteta"]), str(z["status"]), SEZONA])
+
+    if batch_update_podaci:
+        ws_dolasci.batch_update(batch_update_podaci)
+    if novi_redovi:
+        ws_dolasci.append_rows(novi_redovi)
+
+    # --- 3) Gostovanja: jedan get_all_records, pa batch append (samo novi) ---
+    if gosti_zapisi:
+        ws_gost = sheet.worksheet("Gostovanja")
+        gost_postojeci = ws_gost.get_all_records()
+        gost_postojeci_set = {
+            (str(r.get("datum")), str(r.get("ucenik_id")), str(r.get("grupa_gostovanja")))
+            for r in gost_postojeci
+        }
+        novi_gosti = []
+        for z in gosti_zapisi:
+            kljuc = (str(datum), str(z["ucenik_id"]), str(grupa_id))
+            if kljuc not in gost_postojeci_set:
+                gostovanje_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+                novi_gosti.append([
+                    gostovanje_id, str(datum), str(z["ucenik_id"]), str(z["ime_djeteta"]),
+                    str(z["maticna_grupa"]), str(grupa_id), SEZONA
+                ])
+        if novi_gosti:
+            ws_gost.append_rows(novi_gosti)
+
+    return termin_id
 
 
 def dodaj_gostovanje(sheet, datum: str, ucenik_id: str, ime_djeteta: str, maticna_grupa: str, grupa_gostovanja: str):
