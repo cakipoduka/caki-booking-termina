@@ -3,6 +3,8 @@ CAKI Upisi u SŠ — pipeline_upisi.py
 Pomoćne funkcije za rad s Učenici/Prijave tabovima preko gspread-a.
 Isti stack kao baza zadataka (get_credentials/get_gspread_client pattern).
 """
+import io
+import os
 import random
 import string
 from datetime import datetime, timedelta
@@ -10,6 +12,13 @@ from datetime import datetime, timedelta
 import gspread
 import pandas as pd
 from google.oauth2.service_account import Credentials
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -39,11 +48,30 @@ REZERVACIJA_ROK_DANA = 5
 # Popis nastavnika — jednostavan popis imena, dovoljno za sad (bez zasebnog Nastavnici taba)
 NASTAVNICI = ["Caki (ja)", "Neira", "Slađana", "Mirela", "Ivica", "Martina"]
 
+# --- Matura predmeti (nema Cjenik šifri kao za Upise — v. CRM master §21.2, otvoreno) ---
+# Predmeti se dodaju BEZ komponenta/nacin_placanja, isti oblik retka kakav piše
+# CAKI_matura_onFormSubmit.gs. Kad Cjenik za Maturu bude definiran, ovo se nadograđuje.
+PREDMETI_MATURA = {
+    "hrvatski": "Hrvatski",
+    "matematika": "Matematika",
+    "engleski": "Engleski",
+    "fizika": "Fizika",
+    "kemija": "Kemija",
+    "biologija": "Biologija",
+    "fizika_medicina": "Fizika (Paket MEDICINA)",
+    "kemija_medicina": "Kemija (Paket MEDICINA)",
+    "biologija_medicina": "Biologija (Paket MEDICINA)",
+}
+
+# Predmeti za koje se pita razina ispita A/B (v. §21.2)
+PREDMETI_S_RAZINOM = ["matematika", "engleski"]
+
+NACINI_PRACENJA = ["uživo", "isključivo online"]
 DANI_U_TJEDNU = ["Ponedjeljak", "Utorak", "Srijeda", "Četvrtak", "Petak", "Subota", "Nedjelja"]
 
-# Pravni subjekti za Solo ponude — ručan odabir po komponenti u admin panelu (14.9.2026.)
-# "Caki obrt za poduke" namjerno izostavljen — nije još povezan.
-SOLO_SUBJEKTI = ["CAKI centar d.o.o.", "Caki poduka obrt"]
+# --- Instrukcije (individualne/male-grupne, odvojeno od Upisi grupnih Termina/Dolazaka) ---
+INSTRUKCIJE_TRAJANJA = [45, 60, 90, 120]  # minuta
+INSTRUKCIJE_OBLICI = ["Individualno", "Grupa"]
 
 
 # --- Autentifikacija (identično baza zadataka) ---
@@ -146,17 +174,6 @@ def oznaci_otkazano(sheet, row_number: int):
     ws.update_cell(row_number, col_status, "Otkazano")
 
 
-def postavi_solo_racun(sheet, row_number: int, subjekt: str):
-    """Ručno postavlja koji pravni subjekt izdaje Solo ponudu za taj Prijave redak.
-    Prazno/nepostavljeno = solo_ponuda_i_mail.gs preskače redak dok se ne odabere."""
-    ws = sheet.worksheet("Prijave")
-    headers = ws.row_values(1)
-    if "solo_racun" not in headers:
-        raise ValueError("Stupac 'solo_racun' ne postoji u Prijave tabu — dodaj ga ručno u header.")
-    col = headers.index("solo_racun") + 1
-    ws.update_cell(row_number, col, subjekt)
-
-
 # --- Dodavanje nove komponente postojećem učeniku ---
 
 def dodaj_komponentu(sheet, ucenik_id: str, ime_djeteta: str, komponenta_kod: str, nacin_placanja: str, napomena: str = ""):
@@ -177,6 +194,36 @@ def dodaj_komponentu(sheet, ucenik_id: str, ime_djeteta: str, komponenta_kod: st
         SEZONA,
     ])
 
+
+def dodaj_maturu_predmet(sheet, ucenik_id: str, ime_djeteta: str, predmet: str,
+                          razina_ispita: str = "", nacin_pracenja: str = "", napomena: str = ""):
+    """Dodaje jedan Matura predmet postojećem učeniku. Piše po NAZIVU stupca (ne
+    pozicijski) da radi bez obzira gdje su stupci program_tip/predmet/... u headeru —
+    isti pristup kao CAKI_matura_onFormSubmit.gs."""
+    ws = sheet.worksheet("Prijave")
+    headers = ws.row_values(1)
+
+    redak_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    vrijednosti = {
+        "redak_id": redak_id,
+        "ucenik_id": str(ucenik_id),
+        "ime_djeteta": str(ime_djeteta),
+        "status_kontakta": "Čeka poziv",
+        "napomena": str(napomena),
+        "timestamp_prijave": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "sezona": SEZONA,
+        "program_tip": "Matura",
+        "predmet": str(predmet),
+        "stupanj_skolovanja": "Srednja škola",
+        "razina_ispita": str(razina_ispita),
+        "nacin_pracenja": str(nacin_pracenja),
+    }
+
+    red = ["" for _ in headers]
+    for naziv, vrijednost in vrijednosti.items():
+        if naziv in headers:
+            red[headers.index(naziv)] = vrijednost
+    ws.append_row(red)
 
 # ============================================================
 # GRUPE / REZERVACIJE — booking sustav
@@ -521,3 +568,321 @@ def izgradi_grid_dolazaka(df_dolasci: pd.DataFrame, df_termini: pd.DataFrame, gr
     # Sortiraj stupce kronološki
     grid = grid[sorted(grid.columns)]
     return grid, nastavnici_po_datumu
+
+
+# --- Bilješke / povijest kontakta + follow-up ---
+
+def postavi_tabove_biljeske(sheet):
+    """Kreira 'Biljeske' tab ako ne postoji. Pokreni jednom ručno (gumb u sidebaru)."""
+    nazivi_tabova = [ws.title for ws in sheet.worksheets()]
+    if "Biljeske" not in nazivi_tabova:
+        ws = sheet.add_worksheet(title="Biljeske", rows=1000, cols=6)
+        ws.append_row(["biljeska_id", "ucenik_id", "datum", "autor", "tekst", "sljedeci_kontakt"])
+
+
+def load_biljeske(sheet) -> pd.DataFrame:
+    return _load_worksheet_df(sheet.worksheet("Biljeske"))
+
+
+def dodaj_biljesku(sheet, ucenik_id: str, autor: str, tekst: str, sljedeci_kontakt: str = ""):
+    ws = sheet.worksheet("Biljeske")
+    biljeska_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    ws.append_row([
+        biljeska_id,
+        str(ucenik_id),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        str(autor),
+        str(tekst),
+        str(sljedeci_kontakt),
+    ])
+
+
+# --- Obitelj (braća/sestre) — poveznica umjesto spajanja u jedan zapis ---
+
+def osiguraj_stupac_povezani_ucenici(sheet):
+    """Dodaje stupac 'povezani_ucenici' na Učenici tab ako ne postoji (na desni kraj headera)."""
+    ws = sheet.worksheet("Učenici")
+    headers = ws.row_values(1)
+    if "povezani_ucenici" not in headers:
+        ws.update_cell(1, len(headers) + 1, "povezani_ucenici")
+
+
+def poveci_kao_obitelj(sheet, ucenik_id_1: str, ucenik_id_2: str):
+    """Povezuje dva zapisa kao braću/sestre (dvosmjerno), bez spajanja u jedan zapis.
+    Zahtijeva stupac 'povezani_ucenici' na Učenici tabu (gumb 'Dodaj povezani_ucenici stupac')."""
+    ws = sheet.worksheet("Učenici")
+    headers = ws.row_values(1)
+    if "povezani_ucenici" not in headers:
+        raise ValueError("Nedostaje stupac 'povezani_ucenici' na Učenici tabu — klikni prvo gumb za njegovo dodavanje.")
+    col = headers.index("povezani_ucenici") + 1
+    ucenici = ws.get_all_records()
+
+    def dodaj_vezu(ciljni_id, novi_id):
+        for i, red in enumerate(ucenici, start=2):
+            if red.get("ucenik_id") == ciljni_id:
+                trenutno = str(red.get("povezani_ucenici", "")).strip()
+                popis = [x.strip() for x in trenutno.split(",") if x.strip()]
+                if novi_id not in popis:
+                    popis.append(novi_id)
+                ws.update_cell(i, col, ", ".join(popis))
+                return
+
+    dodaj_vezu(ucenik_id_1, ucenik_id_2)
+    dodaj_vezu(ucenik_id_2, ucenik_id_1)
+
+
+# ============================================================
+# INSTRUKCIJE — individualne/male-grupne, NAMJERNO odvojeno od
+# Upisi grupnih "Termini"/"Dolasci" (druga poslovna logika: naplata
+# po terminu, ne po sezonskom paketu; dolazak jednog djeteta, ne
+# cijele grupe). Vidi CAKI_MASTER_CRM razgovor o Instrukcije CRM-u.
+# ============================================================
+
+def postavi_tab_instrukcije(sheet):
+    """Kreira 'Instrukcije_termini' tab ako ne postoji. Pokreni jednom ručno."""
+    postojeci = [ws.title for ws in sheet.worksheets()]
+
+    if "Instrukcije_termini" not in postojeci:
+        ws = sheet.add_worksheet(title="Instrukcije_termini", rows=2000, cols=13)
+        ws.append_row([
+            "termin_id", "ucenik_id", "ime_djeteta", "nastavnik", "datum",
+            "duljina_min", "oblik", "broj_ucenika_u_grupi",
+            "placeno_oznaka_prof", "uplata_potvrdjena_admin",
+            "napomena_interna", "napomena_javna", "sezona",
+        ])
+
+
+def load_instrukcije(sheet) -> pd.DataFrame:
+    return _load_worksheet_df(sheet.worksheet("Instrukcije_termini"))
+
+
+def dodaj_instrukciju_termin(
+    sheet,
+    ucenik_id: str,
+    ime_djeteta: str,
+    nastavnik: str,
+    datum: str,
+    duljina_min,
+    oblik: str,
+    broj_ucenika_u_grupi,
+    placeno_oznaka_prof: str,
+    napomena_interna: str = "",
+    napomena_javna: str = "",
+) -> str:
+    """Dodaje novi termin instrukcija. Poziva ga i instruktor (nastavnik = iz
+    logina, ne uređuje se ručno) i admin (nastavnik bira sam iz padajućeg popisa).
+    'uplata_potvrdjena_admin' UVIJEK kreće prazno ('Ne') — to polje smije
+    mijenjati isključivo admin preko azuriraj_instrukciju(), nikad ovaj poziv."""
+    ws = sheet.worksheet("Instrukcije_termini")
+    termin_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    ws.append_row([
+        termin_id,
+        str(ucenik_id),
+        str(ime_djeteta),
+        str(nastavnik),
+        str(datum),
+        str(duljina_min),
+        str(oblik),
+        str(broj_ucenika_u_grupi or ""),
+        str(placeno_oznaka_prof),
+        "Ne",
+        str(napomena_interna),
+        str(napomena_javna),
+        SEZONA,
+    ])
+    return termin_id
+
+
+def azuriraj_instrukciju(sheet, row_number: int, polja: dict):
+    """Generičko uređivanje retka (isti obrazac kao azuriraj_ucenika).
+    polja = {"uplata_potvrdjena_admin": "Da", ...}
+    NAPOMENA za UI sloj: stranica za instruktore smije zvati ovo SAMO za
+    polja koja instruktor smije mijenjati (napomena_interna, napomena_javna,
+    placeno_oznaka_prof) — nikad za uplata_potvrdjena_admin. To ograničenje
+    nije tehnički nametnuto ovdje (funkcija je generička), nego mora biti
+    nametnuto u Streamlit sučelju (ne nuditi to polje instruktoru u formi)."""
+    ws = sheet.worksheet("Instrukcije_termini")
+    headers = ws.row_values(1)
+    for naziv_polja, vrijednost in polja.items():
+        if naziv_polja in headers:
+            col = headers.index(naziv_polja) + 1
+            ws.update_cell(row_number, col, vrijednost)
+
+
+def obrisi_instrukciju(sheet, row_number: int):
+    """Trajno brisanje retka termina. Samo admin."""
+    ws = sheet.worksheet("Instrukcije_termini")
+    ws.delete_rows(row_number)
+
+
+def pretrazi_ucenike(df_ucenici: pd.DataFrame, upit: str) -> pd.DataFrame:
+    """Pretraga po imenu ili ucenik_id. Pretraga po školi NAMJERNO izostavljena —
+    'skola' polje ne postoji na Učenici tabu, odgođeno na Cakijev zahtjev."""
+    if not upit:
+        return df_ucenici
+    return df_ucenici[
+        df_ucenici["ime_djeteta"].str.contains(upit, case=False, na=False)
+        | df_ucenici["ucenik_id"].str.contains(upit, case=False, na=False)
+    ]
+
+
+# ============================================================
+# NASTAVNICI — upravljanje imenima/šiframa kroz Sheet, ne kroz kod.
+# NASTAVNICI konstanta (na vrhu fajla) ostaje SAMO kao početni seed pri
+# prvom kreiranju taba i kao fallback ako tab još ne postoji — nakon
+# postavljanja, sve stranice čitaju popis odavde, ne iz konstante.
+# ============================================================
+
+def postavi_tab_nastavnici(sheet):
+    """Kreira 'Nastavnici' tab ako ne postoji, seed-an trenutnom NASTAVNICI
+    konstantom sa privremenom lozinkom (svatko je treba promijeniti pri prvom
+    korištenju). Pokreni jednom ručno."""
+    postojeci = [ws.title for ws in sheet.worksheets()]
+    if "Nastavnici" not in postojeci:
+        ws = sheet.add_worksheet(title="Nastavnici", rows=50, cols=3)
+        ws.append_row(["ime", "lozinka", "aktivan"])
+        for ime in NASTAVNICI:
+            ws.append_row([ime, "promijeni123", "Da"])
+
+
+def load_nastavnici(sheet) -> pd.DataFrame:
+    return _load_worksheet_df(sheet.worksheet("Nastavnici"))
+
+
+def nastavnici_aktivni(df_nastavnici: pd.DataFrame) -> list:
+    """Popis imena AKTIVNIH nastavnika za padajuće izbornike — zamjena za staru
+    hardkodiranu NASTAVNICI konstantu. Fallback na konstantu ako tab još nije
+    kreiran (prije prvog klika na setup gumb), da ništa ne pukne u međuvremenu."""
+    if df_nastavnici.empty:
+        return NASTAVNICI
+    aktivni = df_nastavnici[df_nastavnici["aktivan"].astype(str).str.lower() == "da"]
+    return aktivni["ime"].tolist() or NASTAVNICI
+
+
+def provjeri_lozinku_instruktora(df_nastavnici: pd.DataFrame, ime: str, lozinka: str) -> bool:
+    """True samo ako ime+lozinka odgovaraju i nastavnik je trenutno aktivan —
+    deaktiviran (bivši) nastavnik se više ne može prijaviti čak i sa starom lozinkom."""
+    red = df_nastavnici[
+        (df_nastavnici["ime"] == ime)
+        & (df_nastavnici["lozinka"] == lozinka)
+        & (df_nastavnici["aktivan"].astype(str).str.lower() == "da")
+    ]
+    return not red.empty
+
+
+def dodaj_nastavnika(sheet, ime: str, lozinka: str):
+    ws = sheet.worksheet("Nastavnici")
+    ws.append_row([str(ime), str(lozinka), "Da"])
+
+
+def azuriraj_nastavnika(sheet, row_number: int, polja: dict):
+    """polja = {"lozinka": "...", "aktivan": "Ne", ...} — isti generički obrazac
+    kao azuriraj_ucenika/azuriraj_instrukciju."""
+    ws = sheet.worksheet("Nastavnici")
+    headers = ws.row_values(1)
+    for naziv, vrijednost in polja.items():
+        if naziv in headers:
+            col = headers.index(naziv) + 1
+            ws.update_cell(row_number, col, vrijednost)
+
+
+# ============================================================
+# SOLO — dva pravna subjekta, ručan odabir po prijavi (14.9.2026.)
+# "Caki obrt za poduke" (treći subjekt) namjerno izostavljen — nije povezan.
+# ============================================================
+
+SOLO_SUBJEKTI = ["CAKI centar d.o.o.", "Caki poduka obrt"]
+
+
+def postavi_solo_racun(sheet, row_number: int, subjekt: str):
+    """Ručno postavlja koji pravni subjekt izdaje Solo ponudu za taj Prijave redak.
+    Prazno/nepostavljeno = solo_ponuda_i_mail.gs preskače redak dok se ne odabere."""
+    ws = sheet.worksheet("Prijave")
+    headers = ws.row_values(1)
+    if "solo_racun" not in headers:
+        raise ValueError("Stupac 'solo_racun' ne postoji u Prijave tabu — dodaj ga ručno u header.")
+    col = headers.index("solo_racun") + 1
+    ws.update_cell(row_number, col, subjekt)
+
+
+# ============================================================
+# PDF IZVOZ — reusable helper (koristi ga "Uredi učenika" izvoz,
+# može ga koristiti i bilo koji budući izvoz popisa)
+# ============================================================
+
+_DEJAVU_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+_DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+_font_registriran = False
+
+
+def _osiguraj_pdf_font() -> bool:
+    """Registrira DejaVuSans (podržava č,ć,š,đ,ž ispravno — ugrađeni Helvetica ne
+    podržava đ/č/ć) ako je dostupan na sustavu. Streamlit Cloud treba paket
+    'fonts-dejavu-core' u packages.txt. Ako font nije nađen, tiho vraća False —
+    pozivatelj onda koristi Helvetica (PDF se svejedno generira, dijakritici
+    mogu biti krivi, ali app ne puca)."""
+    global _font_registriran
+    if _font_registriran:
+        return True
+    if os.path.exists(_DEJAVU_REGULAR):
+        pdfmetrics.registerFont(TTFont("DejaVuSans", _DEJAVU_REGULAR))
+        if os.path.exists(_DEJAVU_BOLD):
+            pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", _DEJAVU_BOLD))
+        _font_registriran = True
+        return True
+    return False
+
+
+def izgradi_pdf_izvoza(naslov: str, stupci: list, retci: list) -> bytes:
+    """stupci = ["Ime djeteta", "Mobitel roditelja", ...] (već prevedeni nazivi za prikaz).
+    retci = [[vrijednost1, vrijednost2, ...], ...] (isti redoslijed kao stupci).
+    Vraća PDF kao bytes — spremno za st.download_button. Landscape A4 jer popisi
+    učenika lako imaju 4-6 stupaca."""
+    ima_dejavu = _osiguraj_pdf_font()
+    font_normal = "DejaVuSans" if ima_dejavu else "Helvetica"
+    font_bold = "DejaVuSans-Bold" if ima_dejavu else "Helvetica-Bold"
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=landscape(A4),
+        leftMargin=1.5 * cm, rightMargin=1.5 * cm, topMargin=1.5 * cm, bottomMargin=1.5 * cm,
+    )
+
+    stilovi = getSampleStyleSheet()
+    stil_naslov = stilovi["Title"]
+    stil_naslov.fontName = font_bold
+
+    stil_celija = stilovi["Normal"]
+    stil_celija.fontName = font_normal
+    stil_celija.fontSize = 8
+    stil_celija.leading = 10
+
+    stil_zaglavlje = stilovi["Normal"].clone("zaglavlje")
+    stil_zaglavlje.fontName = font_bold
+    stil_zaglavlje.fontSize = 8
+    stil_zaglavlje.textColor = colors.white
+
+    zaglavlje_red = [Paragraph(str(s), stil_zaglavlje) for s in stupci]
+    podaci = [zaglavlje_red]
+    for redak in retci:
+        podaci.append([Paragraph(str(v) if v not in (None, "nan") else "", stil_celija) for v in redak])
+
+    tablica = Table(podaci, repeatRows=1)
+    tablica.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a3f5f")),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f2f2")]),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+    ]))
+
+    elementi = [
+        Paragraph(naslov, stil_naslov),
+        Spacer(1, 0.3 * cm),
+        Paragraph(f"Generirano: {datetime.now().strftime('%d.%m.%Y. %H:%M')}", stil_celija),
+        Spacer(1, 0.5 * cm),
+        tablica,
+    ]
+    doc.build(elementi)
+    return buffer.getvalue()
