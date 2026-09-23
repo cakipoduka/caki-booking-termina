@@ -7,7 +7,10 @@ import io
 import os
 import random
 import string
-from datetime import datetime, timedelta
+import json
+import math
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import gspread
 import pandas as pd
@@ -44,6 +47,19 @@ SEZONA = "2026/27"
 KOMPONENTE_ZA_BOOKING = ["MAT-KRATKI", "MAT-DUGI", "PRELOG-KRATKI", "PRELOG-DUGI", "ENG"]
 
 REZERVACIJA_ROK_DANA = 5
+
+# Koliko sati nakon telefonske potvrde ("Potvrdio") ponuda smije krenuti (§23.6: jedinstveno 36h
+# za sve programe, odluka 22.9.2026.). Mijenja se samo ovdje.
+POSALJI_NAKON_SATI = 36
+
+# Streamlit Cloud radi u UTC vremenu, a Apps Script u zagrebačkom — sva vremena koja
+# Apps Script čita (posalji_nakon) moraju biti zagrebačka, inače se ponuda šalje 1-2 h ranije.
+ZAGREB = ZoneInfo("Europe/Zagreb")
+
+
+def sada_zagreb() -> datetime:
+    """Trenutno vrijeme u Zagrebu, bez oznake zone (isti oblik koji Apps Script očekuje)."""
+    return datetime.now(ZAGREB).replace(tzinfo=None)
 
 # Popis nastavnika — jednostavan popis imena, dovoljno za sad (bez zasebnog Nastavnici taba)
 NASTAVNICI = ["Caki (ja)", "Neira", "Slađana", "Mirela", "Ivica", "Martina"]
@@ -145,7 +161,7 @@ def spoji_ucenike(sheet, primarni_id: str, duplikat_id: str):
 
 def postavi_status_poziva(sheet, ucenik_id: str, novi_status: str):
     """Postavlja status_kontakta na sve 'Čeka poziv' retke tog učenika.
-    Ako je novi_status == 'Potvrdio', upisuje i posalji_nakon = sada + 24h."""
+    Ako je novi_status == 'Potvrdio', upisuje i posalji_nakon = sada + POSALJI_NAKON_SATI (36h)."""
     ws = sheet.worksheet("Prijave")
     prijave = ws.get_all_records()
     headers = ws.row_values(1)
@@ -154,7 +170,7 @@ def postavi_status_poziva(sheet, ucenik_id: str, novi_status: str):
 
     posalji_nakon_vrijednost = ""
     if novi_status == "Potvrdio":
-        posalji_nakon_vrijednost = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        posalji_nakon_vrijednost = (sada_zagreb() + timedelta(hours=POSALJI_NAKON_SATI)).strftime("%Y-%m-%d %H:%M:%S")
 
     azurirano = 0
     for i, red in enumerate(prijave, start=2):
@@ -668,28 +684,68 @@ def dodaj_instrukciju_termin(
     placeno_oznaka_prof: str,
     napomena_interna: str = "",
     napomena_javna: str = "",
+    predmet: str = "",
+    stupanj_skolovanja: str = "",
+    sifra: str = "",
+    cijena_termina=None,
+    nacin_naplate: str | None = None,
 ) -> str:
     """Dodaje novi termin instrukcija. Poziva ga i instruktor (nastavnik = iz
     logina, ne uređuje se ručno) i admin (nastavnik bira sam iz padajućeg popisa).
     'uplata_potvrdjena_admin' UVIJEK kreće prazno ('Ne') — to polje smije
-    mijenjati isključivo admin preko azuriraj_instrukciju(), nikad ovaj poziv."""
+    mijenjati isključivo admin preko azuriraj_instrukciju(), nikad ovaj poziv.
+
+    23.9.2026.: piše po NAZIVU stupca (ne pozicijski), pa radi i prije i poslije
+    dodavanja naplatnih stupaca (osiguraj_stupce_instrukcije_naplata). Naplatna polja:
+      - sifra / cijena_termina: ako nisu zadani, računaju se (odredi_sifru_instrukcije,
+        izracunaj_cijenu_termina iz Cjenika). Ako Cjenik još ne postoji, cijena ostaje
+        prazna — mjesečni obračun je izračuna kasnije.
+      - nacin_naplate: None = naslijedi zadnju vrijednost za tog učenika i predmet
+        (§23.3.2), a ako je nema → "Jednokratno". Instruktor ga NE bira (financijska odluka).
+    """
     ws = sheet.worksheet("Instrukcije_termini")
+    headers = ws.row_values(1)
     termin_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-    ws.append_row([
-        termin_id,
-        str(ucenik_id),
-        str(ime_djeteta),
-        str(nastavnik),
-        str(datum),
-        str(duljina_min),
-        str(oblik),
-        str(broj_ucenika_u_grupi or ""),
-        str(placeno_oznaka_prof),
-        "Ne",
-        str(napomena_interna),
-        str(napomena_javna),
-        SEZONA,
-    ])
+
+    ima_naplatu = "status_obracuna" in headers
+    if ima_naplatu:
+        if not sifra:
+            sifra = odredi_sifru_instrukcije(oblik, predmet)
+        if cijena_termina in (None, ""):
+            try:
+                cijena_termina = izracunaj_cijenu_termina(load_cjenik(sheet), sifra, duljina_min)
+            except Exception:
+                cijena_termina = None
+        if nacin_naplate is None:
+            nacin_naplate = zadnji_nacin_naplate(_load_worksheet_df(ws), ucenik_id, predmet)
+
+    vrijednosti = {
+        "termin_id": termin_id,
+        "ucenik_id": str(ucenik_id),
+        "ime_djeteta": str(ime_djeteta),
+        "nastavnik": str(nastavnik),
+        "datum": str(datum),
+        "duljina_min": str(duljina_min),
+        "oblik": str(oblik),
+        "broj_ucenika_u_grupi": str(broj_ucenika_u_grupi or ""),
+        "placeno_oznaka_prof": str(placeno_oznaka_prof),
+        "uplata_potvrdjena_admin": "Ne",
+        "napomena_interna": str(napomena_interna),
+        "napomena_javna": str(napomena_javna),
+        "sezona": SEZONA,
+        "predmet": str(predmet),
+        "stupanj_skolovanja": str(stupanj_skolovanja),
+        "sifra": str(sifra),
+        "nacin_naplate": str(nacin_naplate or ""),
+        "cijena_termina": "" if cijena_termina is None else float(cijena_termina),
+        "status_obracuna": "Neobračunato",
+        "dokument_id": "",
+    }
+    red = ["" for _ in headers]
+    for naziv, vrijednost in vrijednosti.items():
+        if naziv in headers:
+            red[headers.index(naziv)] = vrijednost
+    ws.append_row(red)
     return termin_id
 
 
@@ -805,6 +861,35 @@ def postavi_solo_racun(sheet, row_number: int, subjekt: str):
     ws.update_cell(row_number, col, subjekt)
 
 
+def posalji_ponudu_odmah(sheet, row_number: int):
+    """Postavlja status_kontakta na 'Potvrdio' i posalji_nakon na sada — postojeći
+    Apps Script trigger (provjeriIPosaljiPonude, svakih ~15 min) automatski pošalje
+    Solo ponudu za taj redak čim ga sljedeći put obradi. Ne duplicira Solo API poziv
+    u Pythonu — samo "gura" redak u istu, već testiranu automatiku."""
+    ws = sheet.worksheet("Prijave")
+    headers = ws.row_values(1)
+    col_status = headers.index("status_kontakta") + 1
+    col_posalji = headers.index("posalji_nakon") + 1
+    ws.update_cell(row_number, col_status, "Potvrdio")
+    ws.update_cell(row_number, col_posalji, sada_zagreb().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def oznaci_placeno_gotovinom(sheet, row_number: int):
+    """Označava redak kao plaćen gotovinom — solo_poslano='Da' trajno preskače
+    automatsko slanje Solo ponude/računa za taj redak, uz zabilješku u napomeni."""
+    ws = sheet.worksheet("Prijave")
+    headers = ws.row_values(1)
+    col_solo_poslano = headers.index("solo_poslano") + 1
+    ws.update_cell(row_number, col_solo_poslano, "Da")
+
+    if "napomena" in headers:
+        col_napomena = headers.index("napomena") + 1
+        trenutna = ws.cell(row_number, col_napomena).value or ""
+        oznaka = f"💵 Plaćeno gotovinom (ručno, {datetime.now().strftime('%d.%m.%Y.')})"
+        nova = f"{trenutna} | {oznaka}" if trenutna else oznaka
+        ws.update_cell(row_number, col_napomena, nova)
+
+
 # ============================================================
 # PDF IZVOZ — reusable helper (koristi ga "Uredi učenika" izvoz,
 # može ga koristiti i bilo koji budući izvoz popisa)
@@ -886,3 +971,671 @@ def izgradi_pdf_izvoza(naslov: str, stupci: list, retci: list) -> bytes:
     ]
     doc.build(elementi)
     return buffer.getvalue()
+
+
+# ============================================================
+# FINANCIJE — Cjenik, Racuni_i_ponude ("financijska kartica"), Instrukcije naplata
+# (§22 / §23.2 / §23.3 MASTER CRM, 23.9.2026.)
+#
+# Podjela posla (namjerno):
+#   Apps Script (CAKI_financije.gs) — sve što ZOVE SOLO: sinkronizacija Cjenika,
+#       slanje odobrenih dokumenata, automatski nacrti (Matura, mjesečne Instrukcije).
+#       Solo tokeni žive samo tamo (Script Properties), nikad u Streamlitu.
+#   Python (ovdje) — sve što radi ČOVJEK u admin panelu: pregled i uređivanje nacrta,
+#       podjela na rate, odobravanje ("Odobreno" → Apps Script šalje u roku ~5 min),
+#       odbacivanje, označavanje plaćenog, jednokratni obračun Instrukcija.
+# ============================================================
+
+CJENIK_TAB = "Cjenik"
+LEDGER_TAB = "Racuni_i_ponude"
+
+STATUSI_DOKUMENTA = ["Nacrt", "Odobreno", "Poslano", "Greška", "Plaćeno", "Otkazano", "Isteklo"]
+NACINI_UPLATE = {1: "Transakcijski račun", 2: "Gotovina", 3: "Kartice", 4: "Ček", 5: "Ostalo"}
+
+NACINI_NAPLATE_INSTRUKCIJA = ["Jednokratno", "Mjesečno"]
+# Fakultet NAMJERNO izostavljen — fakultetske instrukcije parkirane na Cakijev zahtjev (§23.10)
+STUPNJEVI_SKOLOVANJA_INSTR = ["Osnovna škola", "Srednja škola"]
+# Popis predmeta za padajući izbornik — slobodno mijenjati (samo tekst, ne utječe na cijenu,
+# osim stranih jezika i međunarodnih ispita, v. odredi_sifru_instrukcije)
+INSTRUKCIJE_PREDMETI = [
+    "Matematika", "Fizika", "Kemija", "Biologija", "Hrvatski", "Informatika",
+    "Engleski", "Njemački", "Talijanski", "Francuski", "Španjolski",
+    "Međunarodni ispit (SAT/IB/Cambridge…)", "Ostalo",
+]
+INSTRUKCIJE_STRANI_JEZICI = {"Engleski", "Njemački", "Talijanski", "Francuski", "Španjolski"}
+INSTRUKCIJE_SIFRE = {
+    "INSTR-IND": "Individualna",
+    "INSTR-GRU": "Grupna (cijena po učeniku)",
+    "INSTR-STRANI": "Strani jezik",
+    "INSTR-MEDJ": "Međunarodni ispit",
+}
+INSTR_IND_90_FIKSNO = 40.0  # §23.3.1 — koristi se samo ako Cjenik nema upisan iznimka_90min
+INSTRUKCIJE_NAPLATNI_STUPCI = [
+    "predmet", "stupanj_skolovanja", "sifra", "nacin_naplate",
+    "cijena_termina", "status_obracuna", "dokument_id",
+]
+MJESECI_HR = ["siječanj", "veljača", "ožujak", "travanj", "svibanj", "lipanj",
+              "srpanj", "kolovoz", "rujan", "listopad", "studeni", "prosinac"]
+
+
+# --- novac: interno UVIJEK cijeli centi, nikad float zbrajanje ---
+
+def u_cente(v):
+    """7 / 7.5 / "7,00" / "1.234,50" / "1,234.50" / "" → cijeli broj centi ili None."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and math.isnan(v):
+            return None
+        return int(math.floor(v * 100 + 0.5))
+    s = str(v).strip().replace(" ", "").replace("€", "")
+    if not s:
+        return None
+    zarez, tocka = s.rfind(","), s.rfind(".")
+    s = s.replace(".", "").replace(",", ".") if zarez > tocka else s.replace(",", "")
+    try:
+        return int(math.floor(float(s) * 100 + 0.5))
+    except ValueError:
+        return None
+
+
+def centi_u_tekst(c) -> str:
+    """36075 → '360,75' (hrvatski prikaz i Solo format)."""
+    return "" if c is None else f"{c / 100:.2f}".replace(".", ",")
+
+
+def konacna_cijena_centi(bazna_centi, popust_postotak) -> int:
+    """Ista formula kao Apps Script: Math.round(bazna * (1 - popust/100))."""
+    return int(math.floor(bazna_centi * (1 - float(popust_postotak or 0) / 100) + 0.5))
+
+
+# --- učitavanje (opcionalni tabovi: prazan DataFrame dok ih Apps Script ne kreira) ---
+
+def _load_df_neformatirano(ws) -> pd.DataFrame:
+    """Kao _load_worksheet_df, ali brojeve vraća kao brojeve (ne '360,75' ovisno o jeziku Sheeta)."""
+    headers = ws.row_values(1)
+    records = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
+    df = pd.DataFrame(records) if records else pd.DataFrame(columns=headers)
+    df["_row"] = range(2, len(df) + 2)
+    return df
+
+
+def load_cjenik(sheet) -> pd.DataFrame:
+    try:
+        return _load_df_neformatirano(sheet.worksheet(CJENIK_TAB))
+    except gspread.exceptions.WorksheetNotFound:
+        return pd.DataFrame(columns=["subjekt", "sifra", "cijena", "_row"])
+
+
+def load_racuni(sheet) -> pd.DataFrame:
+    try:
+        return _load_df_neformatirano(sheet.worksheet(LEDGER_TAB))
+    except gspread.exceptions.WorksheetNotFound:
+        return pd.DataFrame(columns=["dokument_id", "ucenik_id", "status", "_row"])
+
+
+def _azuriraj_polja(ws, row_number: int, polja: dict, headers: list | None = None):
+    """Više ćelija jednog retka u JEDNOM API pozivu, RAW (Sheets ne 'pametuje' vrijednosti)."""
+    headers = headers or ws.row_values(1)
+    data = []
+    for naziv, vrijednost in polja.items():
+        if naziv not in headers:
+            raise ValueError(f"Stupac '{naziv}' ne postoji u tabu {ws.title}")
+        data.append({
+            "range": gspread.utils.rowcol_to_a1(row_number, headers.index(naziv) + 1),
+            "values": [[vrijednost]],
+        })
+    if data:
+        ws.batch_update(data, raw=True)
+
+
+def _dodaj_red_po_nazivu(ws, vrijednosti: dict, headers: list | None = None):
+    headers = headers or ws.row_values(1)
+    ws.append_row([vrijednosti.get(h, "") for h in headers], value_input_option="RAW")
+
+
+# --- Cjenik i cijena Instrukcija ---
+
+def cijena_iz_cjenika(df_cjenik: pd.DataFrame, sifra: str, subjekt: str = ""):
+    """Redak Cjenika za šifru (prvo istog subjekta, inače bilo kojeg) kao dict, ili None."""
+    if df_cjenik is None or df_cjenik.empty or "sifra" not in df_cjenik.columns:
+        return None
+    kandidati = df_cjenik[df_cjenik["sifra"].astype(str) == str(sifra)]
+    kandidati = kandidati[kandidati["cijena"].apply(lambda v: u_cente(v) is not None)]
+    if kandidati.empty:
+        return None
+    if subjekt and "subjekt" in kandidati.columns and (kandidati["subjekt"] == subjekt).any():
+        kandidati = kandidati[kandidati["subjekt"] == subjekt]
+    return kandidati.iloc[0].to_dict()
+
+
+def odredi_sifru_instrukcije(oblik: str, predmet: str) -> str:
+    """Pravilo za zadanu šifru (admin je može promijeniti po terminu):
+    međunarodni ispit → INSTR-MEDJ; strani jezik → INSTR-STRANI; grupa → INSTR-GRU; inače INSTR-IND."""
+    predmet = str(predmet or "")
+    if predmet.startswith("Međunarodni ispit"):
+        return "INSTR-MEDJ"
+    if predmet in INSTRUKCIJE_STRANI_JEZICI:
+        return "INSTR-STRANI"
+    if str(oblik) == "Grupa":
+        return "INSTR-GRU"
+    return "INSTR-IND"
+
+
+def izracunaj_cijenu_termina(df_cjenik: pd.DataFrame, sifra: str, duljina_min):
+    """§23.3.1: satnica(sifra) × trajanje/60, linearno; iznimka INSTR-IND 90 min = 40 € fiksno.
+    Satnica = Cjenik.cijena_po_satu ako je upisana, inače Cjenik.cijena (Solo stavka za 60 min).
+    Vraća float (eura) ili None ako cijena nije poznata — NIKAD ne nagađa."""
+    try:
+        minuta = int(float(duljina_min))
+    except (TypeError, ValueError):
+        return None
+    red = cijena_iz_cjenika(df_cjenik, sifra)
+    if red is None or minuta <= 0:
+        return None
+    if minuta == 90:
+        iznimka = u_cente(red.get("iznimka_90min"))
+        if iznimka is not None:
+            return iznimka / 100
+        if sifra == "INSTR-IND":
+            return INSTR_IND_90_FIKSNO
+    satnica = u_cente(red.get("cijena_po_satu"))
+    if satnica is None:
+        satnica = u_cente(red.get("cijena"))
+    return int(math.floor(satnica * minuta / 60 + 0.5)) / 100
+
+
+def osiguraj_stupce_instrukcije_naplata(sheet) -> list:
+    """Doda naplatne stupce (§23.3.2) na DESNI kraj Instrukcije_termini headera, ako ih nema.
+    Postojeći retci dobivaju status_obracuna='Neobračunato' i nacin_naplate='Jednokratno'.
+    Vraća popis dodanih stupaca. Sigurno za ponovno pokretanje."""
+    ws = sheet.worksheet("Instrukcije_termini")
+    headers = ws.row_values(1)
+    nedostaju = [h for h in INSTRUKCIJE_NAPLATNI_STUPCI if h not in headers]
+    if not nedostaju:
+        return []
+    if ws.col_count < len(headers) + len(nedostaju):
+        ws.add_cols(len(headers) + len(nedostaju) - ws.col_count)
+    prvi = len(headers) + 1
+    ws.update(
+        range_name=gspread.utils.rowcol_to_a1(1, prvi),
+        values=[nedostaju],
+        value_input_option="RAW",
+    )
+    headers = headers + nedostaju
+    broj_redaka = len(ws.col_values(1))
+    if broj_redaka > 1:
+        zadano = {"status_obracuna": "Neobračunato", "nacin_naplate": "Jednokratno"}
+        data = []
+        for stupac, vrijednost in zadano.items():
+            if stupac in nedostaju:
+                c = headers.index(stupac) + 1
+                data.append({
+                    "range": f"{gspread.utils.rowcol_to_a1(2, c)}:{gspread.utils.rowcol_to_a1(broj_redaka, c)}",
+                    "values": [[vrijednost]] * (broj_redaka - 1),
+                })
+        if data:
+            ws.batch_update(data, raw=True)
+    return nedostaju
+
+
+def zadnji_nacin_naplate(df_instrukcije: pd.DataFrame, ucenik_id: str, predmet: str = "") -> str:
+    """§23.3.2: novi termin nasljeđuje zadnji nacin_naplate za istog učenika (i predmet ako
+    postoji takav termin). Zadano 'Jednokratno'."""
+    if df_instrukcije is None or df_instrukcije.empty or "nacin_naplate" not in df_instrukcije.columns:
+        return "Jednokratno"
+    df = df_instrukcije[df_instrukcije["ucenik_id"] == ucenik_id]
+    df = df[df["nacin_naplate"].isin(NACINI_NAPLATE_INSTRUKCIJA)]
+    if predmet and "predmet" in df.columns and (df["predmet"] == predmet).any():
+        df = df[df["predmet"] == predmet]
+    return df.iloc[-1]["nacin_naplate"] if not df.empty else "Jednokratno"
+
+
+# --- Racuni_i_ponude: stavke, provjere, odobravanje, rate ---
+
+def parsiraj_stavke(tekst) -> list:
+    try:
+        stavke = json.loads(tekst) if tekst else []
+        return stavke if isinstance(stavke, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
+def preracunaj_stavke(stavke: list) -> list:
+    """Iz cijena_bazna + popust_postotak izračuna cijena_konacna (tekst '360,75') za svaku stavku."""
+    rezultat = []
+    for st in stavke:
+        st = dict(st)
+        bazna = u_cente(st.get("cijena_bazna"))
+        popust = float(st.get("popust_postotak") or 0)
+        st["popust_postotak"] = popust
+        st["kolicina"] = st.get("kolicina") or 1
+        st["cijena_bazna"] = centi_u_tekst(bazna) if bazna is not None else ""
+        st["cijena_konacna"] = centi_u_tekst(konacna_cijena_centi(bazna, popust)) if bazna is not None else ""
+        rezultat.append(st)
+    return rezultat
+
+
+def zbroj_stavki_centi(stavke: list) -> int:
+    ukupno = 0
+    for st in stavke:
+        c = u_cente(st.get("cijena_konacna"))
+        if c is not None:
+            ukupno += c * int(float(st.get("kolicina") or 1))
+    return ukupno
+
+
+def provjeri_za_slanje(stavke: list, solo_racun: str, rate: list | None = None) -> list:
+    """Vraća popis grešaka (prazan = smije se poslati). Rate: lista (iznos_centi, date)."""
+    greske = []
+    if solo_racun not in SOLO_SUBJEKTI:
+        greske.append("Odaberi pravni subjekt (Solo račun).")
+    if not stavke:
+        greske.append("Dokument nema nijednu stavku.")
+    for st in stavke:
+        c = u_cente(st.get("cijena_konacna"))
+        if c is None or c <= 0:
+            greske.append(f"Stavka '{st.get('opis', '?')}' nema ispravnu cijenu.")
+        if not str(st.get("opis", "")).strip():
+            greske.append("Svaka stavka mora imati opis.")
+        if not 0 <= float(st.get("popust_postotak") or 0) < 100:
+            greske.append(f"Popust za '{st.get('opis', '?')}' mora biti između 0 i 100 %.")
+    if rate is not None:
+        if len(rate) < 2:
+            greske.append("Plaćanje na rate treba barem 2 rate.")
+        if any(iznos <= 0 for iznos, _ in rate):
+            greske.append("Svaka rata mora biti veća od 0.")
+        if sum(iznos for iznos, _ in rate) != zbroj_stavki_centi(stavke):
+            greske.append(
+                f"Zbroj rata ({centi_u_tekst(sum(i for i, _ in rate))} €) mora biti jednak ukupnom iznosu "
+                f"({centi_u_tekst(zbroj_stavki_centi(stavke))} €)."
+            )
+        rokovi = [r for _, r in rate]
+        if any(r is None for r in rokovi):
+            greske.append("Svaka rata mora imati rok plaćanja.")
+        elif rokovi != sorted(rokovi):
+            greske.append("Rokovi rata moraju ići kronološki.")
+    return greske
+
+
+def predlozi_rate(ukupno_centi: int, broj_rata: int, prvi_rok: date) -> list:
+    """Jednake rate (zadnja preuzima ostatak od zaokruživanja), rok svakih 30 dana."""
+    osnovna = ukupno_centi // broj_rata
+    rate = [osnovna] * broj_rata
+    rate[-1] += ukupno_centi - osnovna * broj_rata
+    return [(iznos, prvi_rok + timedelta(days=30 * k)) for k, iznos in enumerate(rate)]
+
+
+def spremi_nacrt(sheet, row_number: int, stavke: list, solo_racun: str, nacin_uplate: int,
+                 napomena: str, rok_placanja):
+    """Sprema izmjene nacrta BEZ slanja (status ostaje Nacrt)."""
+    stavke = preracunaj_stavke(stavke)
+    ws = sheet.worksheet(LEDGER_TAB)
+    _azuriraj_polja(ws, row_number, {
+        "stavke_snapshot_json": json.dumps(stavke, ensure_ascii=False),
+        "iznos_ukupno": zbroj_stavki_centi(stavke) / 100,
+        "solo_racun": solo_racun if solo_racun in SOLO_SUBJEKTI else "",
+        "nacin_uplate": int(nacin_uplate),
+        "napomena": str(napomena or "")[:1000],
+        "rok_placanja": rok_placanja.strftime("%Y-%m-%d") if rok_placanja else "",
+    })
+
+
+def odobri_dokument(sheet, red: dict, stavke: list, solo_racun: str, nacin_uplate: int,
+                    napomena: str, rok_placanja, rate: list | None = None) -> list:
+    """Admin klikne "✅ Pošalji": dokument (ili više njih, ako su rate) dobiva status
+    'Odobreno'. Stvarno slanje u Solo radi Apps Script posaljiOdobrene() u roku ~5 min.
+    rate = None (jednokratno) ili lista (iznos_centi, rok: date).
+    Vraća listu dokument_id. Baca ValueError s popisom grešaka ako provjera ne prođe."""
+    stavke = preracunaj_stavke(stavke)
+    greske = provjeri_za_slanje(stavke, solo_racun, rate)
+    if greske:
+        raise ValueError(" ".join(greske))
+
+    ws = sheet.worksheet(LEDGER_TAB)
+    headers = ws.row_values(1)
+    row_number = int(red["_row"])
+
+    # Svježa provjera — da nitko u međuvremenu nije već odobrio/odbacio isti dokument
+    trenutni_status = ws.cell(row_number, headers.index("status") + 1).value
+    if trenutni_status not in ("Nacrt", "Greška"):
+        raise ValueError(f"Dokument je u međuvremenu promijenio status u '{trenutni_status}' — osvježi stranicu.")
+
+    zajednicko = {
+        "solo_racun": solo_racun,
+        "nacin_uplate": int(nacin_uplate),
+        "napomena": str(napomena or "")[:1000],
+        "greska_slanja": "",
+    }
+    stavke_json = json.dumps(stavke, ensure_ascii=False)
+
+    if not rate:
+        _azuriraj_polja(ws, row_number, dict(zajednicko, **{
+            "stavke_snapshot_json": stavke_json,
+            "iznos_ukupno": zbroj_stavki_centi(stavke) / 100,
+            "rok_placanja": rok_placanja.strftime("%Y-%m-%d") if rok_placanja else "",
+            "status": "Odobreno",
+        }), headers)
+        return [red["dokument_id"]]
+
+    # --- Rate: svaka rata = zaseban Solo dokument (§22.4), svi odobreni ODJEDNOM ---
+    grupa_id = "G-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    n = len(rate)
+    opis_programa = ", ".join(str(st.get("opis", "")) for st in stavke)
+    program = red.get("program_tip", "")
+    dokumenti = []
+    for k, (iznos, rok) in enumerate(rate, start=1):
+        stavka_rate = [{
+            "sifra": "RATA",
+            "opis": f"{program} — rata {k}/{n} ({opis_programa})"[:500],
+            "kolicina": 1,
+            "cijena_bazna": centi_u_tekst(iznos),
+            "popust_postotak": 0,
+            "cijena_konacna": centi_u_tekst(iznos),
+        }]
+        polja = dict(zajednicko, **{
+            "stavke_snapshot_json": json.dumps(stavka_rate, ensure_ascii=False),
+            "stavke_izvorno_json": stavke_json,
+            "iznos_ukupno": iznos / 100,
+            "rok_placanja": rok.strftime("%Y-%m-%d"),
+            "rata_grupa_id": grupa_id,
+            "rata_broj": k,
+            "rata_ukupno_u_grupi": n,
+            "status": "Odobreno",
+        })
+        if k == 1:
+            # prva rata = postojeći redak (zadržava dokument_id i izvorni_redci)
+            _azuriraj_polja(ws, row_number, polja, headers)
+            dokumenti.append(red["dokument_id"])
+        else:
+            novi_id = f"{red['dokument_id']}-R{k}"
+            _dodaj_red_po_nazivu(ws, dict(polja, **{
+                "dokument_id": novi_id,
+                "ucenik_id": red.get("ucenik_id", ""),
+                "ime_djeteta": red.get("ime_djeteta", ""),
+                "program_tip": program,
+                "tip_dokumenta": red.get("tip_dokumenta", "Ponuda"),
+                "izvorni_redci": "",  # izvorni retci vežu se samo uz 1. ratu (sprječava dvostruko brojanje)
+                "datum_kreiranja": sada_zagreb().strftime("%Y-%m-%d %H:%M:%S"),
+            }), headers)
+            dokumenti.append(novi_id)
+    return dokumenti
+
+
+def ponovi_slanje(sheet, row_number: int):
+    """Dokument u statusu 'Greška' (npr. Solo nije odgovorio) ponovno stavi u red za slanje."""
+    ws = sheet.worksheet(LEDGER_TAB)
+    _azuriraj_polja(ws, row_number, {"status": "Odobreno", "greska_slanja": ""})
+
+
+def _termini_dokumenta(sheet, dokument_id: str):
+    """(ws, headers, [row_number, ...]) Instrukcije termina vezanih uz dokument."""
+    ws = sheet.worksheet("Instrukcije_termini")
+    df = _load_worksheet_df(ws)
+    if df.empty or "dokument_id" not in df.columns:
+        return ws, ws.row_values(1), []
+    return ws, ws.row_values(1), df[df["dokument_id"] == dokument_id]["_row"].tolist()
+
+
+def odbaci_dokument(sheet, red: dict):
+    """"❌ Odbaci": dokument se NE šalje (status Otkazano, ostaje u povijesti).
+    Instrukcije: vezani termini se vraćaju u 'Neobračunato' (mogu se obračunati ponovno).
+    Matura: prijave ostaju "iskorištene" — Assembler ih neće ponovno ubaciti u nacrt
+    (ako roditelj ipak treba ponudu, dodaj predmet ponovno ili je pošalji ručno)."""
+    ws = sheet.worksheet(LEDGER_TAB)
+    _azuriraj_polja(ws, int(red["_row"]), {"status": "Otkazano"})
+    if red.get("program_tip") == "Instrukcije":
+        ws_i, h_i, retci = _termini_dokumenta(sheet, red["dokument_id"])
+        for r in retci:
+            _azuriraj_polja(ws_i, r, {"status_obracuna": "Neobračunato", "dokument_id": ""}, h_i)
+
+
+def oznaci_dokument_placen(sheet, red: dict):
+    """"💶 Plaćeno": status Plaćeno + datum. Za Instrukcije se ujedno potvrđuje uplata
+    (uplata_potvrdjena_admin='Da') na svim terminima tog dokumenta."""
+    ws = sheet.worksheet(LEDGER_TAB)
+    _azuriraj_polja(ws, int(red["_row"]), {
+        "status": "Plaćeno",
+        "datum_placanja": sada_zagreb().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    if red.get("program_tip") == "Instrukcije":
+        ws_i, h_i, retci = _termini_dokumenta(sheet, red["dokument_id"])
+        for r in retci:
+            _azuriraj_polja(ws_i, r, {"uplata_potvrdjena_admin": "Da"}, h_i)
+
+
+def oznaci_dokument_istekao(sheet, row_number: int):
+    _azuriraj_polja(sheet.worksheet(LEDGER_TAB), row_number, {"status": "Isteklo"})
+
+
+def kreiraj_nacrt_instrukcije(sheet, df_odabrani: pd.DataFrame, df_cjenik: pd.DataFrame,
+                              df_racuni: pd.DataFrame) -> str:
+    """Jednokratna naplata (§23.3.4): admin odabere Neobračunate termine JEDNOG učenika →
+    nacrt u Racuni_i_ponude, termini → Obračunato + dokument_id. Ista logika grupiranja
+    (po predmetu) kao mjesečni obračun u Apps Scriptu. Vraća dokument_id."""
+    if df_odabrani.empty:
+        raise ValueError("Nije odabran nijedan termin.")
+    if df_odabrani["ucenik_id"].nunique() != 1:
+        raise ValueError("Jedan nacrt = jedan učenik.")
+    if (df_odabrani.get("status_obracuna", pd.Series(dtype=str)) == "Obračunato").any():
+        raise ValueError("Neki od odabranih termina su već obračunati.")
+
+    ucenik_id = df_odabrani.iloc[0]["ucenik_id"]
+    upozorenja, grupe = [], {}
+    for _, t in df_odabrani.iterrows():
+        sifra = str(t.get("sifra", "") or "")
+        predmet = str(t.get("predmet", "") or "") or "(predmet nije upisan)"
+        centi = u_cente(t.get("cijena_termina"))
+        if centi is None:
+            cij = izracunaj_cijenu_termina(df_cjenik, sifra, t.get("duljina_min"))
+            centi = u_cente(cij)
+        if centi is None:
+            upozorenja.append(f"Termin {t['datum']} ({predmet}): cijena nepoznata — upiši ručno.")
+        g = grupe.setdefault((sifra, predmet), {"centi": 0, "termina": 0, "minuta": 0, "nepoznato": False, "datumi": []})
+        g["termina"] += 1
+        g["minuta"] += int(float(t.get("duljina_min") or 0))
+        g["datumi"].append(str(t["datum"]))
+        if centi is None:
+            g["nepoznato"] = True
+        else:
+            g["centi"] += centi
+
+    stavke = []
+    for (sifra, predmet), g in grupe.items():
+        datumi = ", ".join(sorted(datetime.strptime(d[:10], "%Y-%m-%d").strftime("%d.%m.") for d in g["datumi"])) \
+            if all(len(d) >= 10 for d in g["datumi"]) else ""
+        stavke.append({
+            "sifra": sifra,
+            "opis": f"Instrukcije — {predmet} ({g['termina']}×, {g['minuta']} min{'; ' + datumi if datumi else ''})",
+            "kolicina": 1,
+            "cijena_bazna": "" if g["nepoznato"] else centi_u_tekst(g["centi"]),
+            "popust_postotak": 0,
+            "cijena_konacna": "" if g["nepoznato"] else centi_u_tekst(g["centi"]),
+        })
+
+    # Predloži subjekt po zadnjem Instrukcije dokumentu tog učenika (admin ga može promijeniti)
+    subjekt = ""
+    if not df_racuni.empty and "program_tip" in df_racuni.columns:
+        prethodni = df_racuni[(df_racuni["ucenik_id"] == ucenik_id) & (df_racuni["program_tip"] == "Instrukcije")
+                              & (df_racuni["solo_racun"].astype(str) != "")]
+        if not prethodni.empty:
+            subjekt = prethodni.iloc[-1]["solo_racun"]
+    if not subjekt:
+        upozorenja.append("Odaberi pravni subjekt (solo_racun) prije slanja.")
+
+    dokument_id = "D-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    ws = sheet.worksheet(LEDGER_TAB)
+    _dodaj_red_po_nazivu(ws, {
+        "dokument_id": dokument_id,
+        "ucenik_id": ucenik_id,
+        "ime_djeteta": df_odabrani.iloc[0].get("ime_djeteta", ""),
+        "program_tip": "Instrukcije",
+        "solo_racun": subjekt,
+        "tip_dokumenta": "Ponuda",
+        "status": "Nacrt",
+        "iznos_ukupno": zbroj_stavki_centi(stavke) / 100,
+        "stavke_snapshot_json": json.dumps(stavke, ensure_ascii=False),
+        "izvorni_redci": ",".join("I:" + str(t) for t in df_odabrani["termin_id"]),
+        "nacin_uplate": 1,
+        "datum_kreiranja": sada_zagreb().strftime("%Y-%m-%d %H:%M:%S"),
+        "upozorenja": " | ".join(upozorenja),
+    })
+
+    ws_i = sheet.worksheet("Instrukcije_termini")
+    h_i = ws_i.row_values(1)
+    for r in df_odabrani["_row"]:
+        _azuriraj_polja(ws_i, int(r), {"status_obracuna": "Obračunato", "dokument_id": dokument_id}, h_i)
+    return dokument_id
+
+
+def dug_ucenika(df_racuni: pd.DataFrame, ucenik_id: str) -> int:
+    """§24.4: dug = zbroj iznosa dokumenata u statusu Poslano ili Isteklo (centi)."""
+    if df_racuni.empty:
+        return 0
+    df = df_racuni[(df_racuni["ucenik_id"] == ucenik_id) & (df_racuni["status"].isin(["Poslano", "Isteklo"]))]
+    return sum(u_cente(v) or 0 for v in df["iznos_ukupno"])
+
+
+# ============================================================
+# PORTAL "Moj CAKI" (§12/§24) — samo ČITANJE, pristup po ucenik_id (bez lozinke,
+# svjesna odluka 23.9.2026., §24.5). Funkcije su čiste (DataFrame → DataFrame) radi testiranja.
+# NIKAD ne vraćaju interne podatke: napomena_interna, nacrte (Nacrt/Odobreno/Greška), kontakte.
+# ============================================================
+
+def _load_opcionalno(sheet, naziv: str) -> pd.DataFrame:
+    """Tab koji možda (još) ne postoji → prazan DataFrame umjesto greške."""
+    try:
+        return _load_worksheet_df(sheet.worksheet(naziv))
+    except gspread.exceptions.WorksheetNotFound:
+        return pd.DataFrame()
+
+
+def portal_raspored_grupa(df_rezervacije: pd.DataFrame, df_grupe: pd.DataFrame, ucenik_id: str) -> pd.DataFrame:
+    """§24.2: tjedni raspored grupnih programa (potvrđene + rezervirane, čekaju uplatu)."""
+    if df_rezervacije.empty or df_grupe.empty:
+        return pd.DataFrame()
+    rez = df_rezervacije[(df_rezervacije["ucenik_id"] == ucenik_id)
+                         & (df_rezervacije["status"].isin(["Potvrđeno", "Rezervirano"]))]
+    if rez.empty:
+        return pd.DataFrame()
+    spojeno = rez.merge(df_grupe, on="grupa_id", how="inner", suffixes=("", "_g"))
+    redoslijed = {d: i for i, d in enumerate(DANI_U_TJEDNU)}
+    spojeno["_dan"] = spojeno["dan"].map(redoslijed).fillna(9)
+    spojeno = spojeno.sort_values(["_dan", "vrijeme"])
+    return pd.DataFrame({
+        "Program": spojeno["program"].map(lambda k: KOMPONENTE.get(k, k)),
+        "Dan": spojeno["dan"],
+        "Vrijeme": spojeno["vrijeme"],
+        "Učionica": spojeno["ucionica"],
+        "Status": spojeno["status"].map({"Potvrđeno": "✅ Potvrđeno", "Rezervirano": "🟠 Čeka potvrdu uplate"}),
+    }).reset_index(drop=True)
+
+
+def portal_dolasci(df_dolasci: pd.DataFrame, df_termini: pd.DataFrame, df_grupe: pd.DataFrame, ucenik_id: str):
+    """§24.1: (tablica po datumu, {grupa_labela: postotak}) — uključuje i gostovanja."""
+    if df_dolasci.empty or df_termini.empty:
+        return pd.DataFrame(), {}
+    d = df_dolasci[df_dolasci["ucenik_id"] == ucenik_id]
+    if d.empty:
+        return pd.DataFrame(), {}
+    d = d.merge(df_termini[["termin_id", "datum"]], on="termin_id", how="left")
+    labele = {}
+    if not df_grupe.empty:
+        for _, g in df_grupe.iterrows():
+            labele[g["grupa_id"]] = f"{KOMPONENTE.get(g['program'], g['program'])} · {g['dan']} {g['vrijeme']}"
+    d["Grupa"] = d["grupa_id"].map(lambda gid: labele.get(gid, gid))
+    d["Dolazak"] = d["status"].astype(str).map({"1": "✅ Prisutan", "0": "❌ Odsutan", "2": "💻 Online"}).fillna("?")
+    tablica = d.sort_values("datum", ascending=False)[["datum", "Grupa", "Dolazak"]].rename(columns={"datum": "Datum"})
+    postotci = {}
+    for grupa, g in d.groupby("Grupa"):
+        prisutan = g["status"].astype(str).isin(["1", "2"]).sum()
+        postotci[grupa] = round(100 * prisutan / len(g))
+    return tablica.reset_index(drop=True), postotci
+
+
+_PORTAL_STATUS_DOKUMENTA = {
+    "Poslano": "📄 Poslano — čeka uplatu",
+    "Isteklo": "⚠️ Rok plaćanja istekao",
+    "Plaćeno": "✅ Plaćeno",
+}
+
+
+def portal_instrukcije(df_instrukcije: pd.DataFrame, df_racuni: pd.DataFrame, ucenik_id: str) -> pd.DataFrame:
+    """§24.3: odrađene instrukcije + status naplate (bez interne napomene)."""
+    if df_instrukcije.empty:
+        return pd.DataFrame()
+    t = df_instrukcije[df_instrukcije["ucenik_id"] == ucenik_id]
+    if t.empty:
+        return pd.DataFrame()
+    status_dok = {}
+    if not df_racuni.empty and "dokument_id" in df_racuni.columns:
+        status_dok = dict(zip(df_racuni["dokument_id"], df_racuni["status"]))
+
+    def status(r):
+        if str(r.get("uplata_potvrdjena_admin")) == "Da":
+            return "✅ Plaćeno"
+        dok = str(r.get("dokument_id", "") or "")
+        if dok and status_dok.get(dok) in _PORTAL_STATUS_DOKUMENTA:
+            return _PORTAL_STATUS_DOKUMENTA[status_dok[dok]]
+        if dok:
+            return "🕐 Obračun u pripremi"
+        return "🕐 Još nije obračunato"
+
+    t = t.sort_values("datum", ascending=False)
+    out = pd.DataFrame({
+        "Datum": t["datum"],
+        "Predmet": t["predmet"] if "predmet" in t.columns else "",
+        "Trajanje (min)": t["duljina_min"],
+        "Oblik": t["oblik"],
+        "Cijena (€)": [(u_cente(v) or 0) / 100 if u_cente(v) is not None else None
+                       for v in (t["cijena_termina"] if "cijena_termina" in t.columns else [None] * len(t))],
+        "Naplata": [status(r) for _, r in t.iterrows()],
+        "Napomena": t["napomena_javna"] if "napomena_javna" in t.columns else "",
+    })
+    return out.reset_index(drop=True)
+
+
+def portal_naplata(df_racuni: pd.DataFrame, ucenik_id: str):
+    """§24.4: (tablica poslanih dokumenata, dug u centima). Nacrti/odobreni/greške/otkazani se NE prikazuju."""
+    if df_racuni.empty or "status" not in df_racuni.columns:
+        return pd.DataFrame(), 0
+    r = df_racuni[(df_racuni["ucenik_id"] == ucenik_id) & (df_racuni["status"].isin(list(_PORTAL_STATUS_DOKUMENTA)))]
+    if r.empty:
+        return pd.DataFrame(), 0
+
+    def opis(red):
+        stavke = parsiraj_stavke(red.get("stavke_izvorno_json") or red.get("stavke_snapshot_json"))
+        tekst = ", ".join(str(s.get("opis", "")) for s in stavke)[:120]
+        if str(red.get("rata_broj", "")) not in ("", "nan"):
+            tekst = f"Rata {red['rata_broj']}/{red['rata_ukupno_u_grupi']} — {tekst}"
+        return tekst
+
+    r = r.sort_values("datum_slanja", ascending=False) if "datum_slanja" in r.columns else r
+    out = pd.DataFrame({
+        "Program": r["program_tip"],
+        "Opis": [opis(x) for _, x in r.iterrows()],
+        "Iznos (€)": [(u_cente(v) or 0) / 100 for v in r["iznos_ukupno"]],
+        "Rok plaćanja": r["rok_placanja"] if "rok_placanja" in r.columns else "",
+        "Status": r["status"].map(_PORTAL_STATUS_DOKUMENTA),
+        "Dokument": r["link_pdf"] if "link_pdf" in r.columns else "",
+    })
+    return out.reset_index(drop=True), dug_ucenika(df_racuni, ucenik_id)
+
+
+def portal_rezultati(df_rezultati: pd.DataFrame, ucenik_id: str) -> pd.DataFrame:
+    """§12: tab 'Rezultati' (ucenik_id, program, datum, tip, bodovi, maksimalno_bodova, napomena)."""
+    if df_rezultati.empty or "ucenik_id" not in df_rezultati.columns:
+        return pd.DataFrame()
+    r = df_rezultati[df_rezultati["ucenik_id"] == ucenik_id].copy()
+    if r.empty:
+        return pd.DataFrame()
+
+    def postotak(x):
+        b, m = u_cente(x.get("bodovi")), u_cente(x.get("maksimalno_bodova"))
+        return round(100 * b / m) if b is not None and m else None
+
+    r["Postotak"] = [postotak(x) for _, x in r.iterrows()]
+    return r.sort_values("datum", ascending=False)[
+        [c for c in ["datum", "program", "tip", "bodovi", "maksimalno_bodova", "Postotak", "napomena"] if c in r.columns]
+    ].rename(columns={"datum": "Datum", "program": "Program", "tip": "Vrsta", "bodovi": "Bodovi",
+                      "maksimalno_bodova": "Od", "napomena": "Napomena"}).reset_index(drop=True)

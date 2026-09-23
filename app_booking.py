@@ -60,6 +60,7 @@ if ucenik is None:
     st.stop()
 
 st.success(f"Pozdrav! Biramo termine za: **{ucenik['ime_djeteta']}**")
+st.markdown(f"📘 Raspored, dolasci i uplate na jednom mjestu: [Moj CAKI](./Moj_CAKI?ucenik_id={ucenik_id})")
 
 # Komponente ovog učenika koje su potvrđene (Potvrdio) i koje uopće trebaju booking
 komponente_ucenika = df_prijave[
