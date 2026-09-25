@@ -122,8 +122,7 @@ with tab_naplata:
             "Iznos (€)": st.column_config.NumberColumn(format="%.2f"),
             "Dokument": st.column_config.LinkColumn(display_text="PDF"),
         })
-    st.caption("Ponude za pripreme za upise u srednju školu dosad stižu samo mailom i ovdje se još ne prikazuju. "
-               "Za pitanja o uplatama: +385 95 900 5611.")
+    st.caption("Za pitanja o uplatama: +385 95 900 5611.")
 
 with tab_rezultati:
     rezultati = portal_rezultati(ucitaj("Rezultati"), ucenik_id)

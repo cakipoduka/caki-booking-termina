@@ -9,6 +9,7 @@ import random
 import string
 import json
 import math
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -1044,9 +1045,15 @@ def centi_u_tekst(c) -> str:
     return "" if c is None else f"{c / 100:.2f}".replace(".", ",")
 
 
+def _cijena_s_popustom_tocno(bazna_centi, popust_postotak) -> Decimal:
+    """Točan (necijeli) iznos u centima: bazna × (100 − popust) / 100, bez grešaka decimalnih brojeva."""
+    p = Decimal(str(float(popust_postotak or 0)))
+    return Decimal(int(bazna_centi)) * (Decimal(100) - p) / Decimal(100)
+
+
 def konacna_cijena_centi(bazna_centi, popust_postotak) -> int:
-    """Ista formula kao Apps Script: Math.round(bazna * (1 - popust/100))."""
-    return int(math.floor(bazna_centi * (1 - float(popust_postotak or 0) / 100) + 0.5))
+    """Cijena nakon popusta, zaokružena na cent (0,5 centa ide gore) — kao Solo i Apps Script."""
+    return int(_cijena_s_popustom_tocno(bazna_centi, popust_postotak).quantize(Decimal(1), rounding=ROUND_HALF_UP))
 
 
 # --- učitavanje (opcionalni tabovi: prazan DataFrame dok ih Apps Script ne kreira) ---
@@ -1229,12 +1236,31 @@ def preracunaj_stavke(stavke: list) -> list:
     return rezultat
 
 
+def _kolicina(st) -> Decimal:
+    return Decimal(str(float(st.get("kolicina") or 1)))
+
+
+def _puta_kolicina(centi: int, st) -> int:
+    return int((Decimal(centi) * _kolicina(st)).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+
+
 def zbroj_stavki_centi(stavke: list) -> int:
+    """Ukupno ZA UPLATU (nakon popusta), u centima."""
     ukupno = 0
     for st in stavke:
         c = u_cente(st.get("cijena_konacna"))
         if c is not None:
-            ukupno += c * int(float(st.get("kolicina") or 1))
+            ukupno += _puta_kolicina(c, st)
+    return ukupno
+
+
+def zbroj_osnovica_centi(stavke: list) -> int:
+    """Ukupno PRIJE popusta (originalne cijene × količina), u centima."""
+    ukupno = 0
+    for st in stavke:
+        c = u_cente(st.get("cijena_bazna"))
+        if c is not None:
+            ukupno += _puta_kolicina(c, st)
     return ukupno
 
 
@@ -1254,15 +1280,22 @@ def provjeri_za_slanje(stavke: list, solo_racun: str, rate: list | None = None) 
         if not 0 <= float(st.get("popust_postotak") or 0) < 100:
             greske.append(f"Popust za '{st.get('opis', '?')}' mora biti između 0 i 100 %.")
     if rate is not None:
+        # Rate se zadaju kao OSNOVICA (originalna cijena prije popusta); popust % ide na svaku ratu posebno
         if len(rate) < 2:
             greske.append("Plaćanje na rate treba barem 2 rate.")
         if any(iznos <= 0 for iznos, _ in rate):
             greske.append("Svaka rata mora biti veća od 0.")
-        if sum(iznos for iznos, _ in rate) != zbroj_stavki_centi(stavke):
+        osnovica = zbroj_osnovica_centi(stavke)
+        if sum(iznos for iznos, _ in rate) != osnovica:
             greske.append(
-                f"Zbroj rata ({centi_u_tekst(sum(i for i, _ in rate))} €) mora biti jednak ukupnom iznosu "
-                f"({centi_u_tekst(zbroj_stavki_centi(stavke))} €)."
+                f"Zbroj rata ({centi_u_tekst(sum(i for i, _ in rate))} €) mora biti jednak ukupnoj cijeni "
+                f"prije popusta ({centi_u_tekst(osnovica)} €)."
             )
+        elif not greske:
+            try:
+                raspodjela_rata(stavke, [i for i, _ in rate])
+            except ValueError as e:
+                greske.append(str(e))
         rokovi = [r for _, r in rate]
         if any(r is None for r in rokovi):
             greske.append("Svaka rata mora imati rok plaćanja.")
@@ -1271,12 +1304,154 @@ def provjeri_za_slanje(stavke: list, solo_racun: str, rate: list | None = None) 
     return greske
 
 
-def predlozi_rate(ukupno_centi: int, broj_rata: int, prvi_rok: date) -> list:
-    """Jednake rate (zadnja preuzima ostatak od zaokruživanja), rok svakih 30 dana."""
-    osnovna = ukupno_centi // broj_rata
-    rate = [osnovna] * broj_rata
-    rate[-1] += ukupno_centi - osnovna * broj_rata
-    return [(iznos, prvi_rok + timedelta(days=30 * k)) for k, iznos in enumerate(rate)]
+# --- RATE S POPUSTOM (25.9.2026., Caki): na svakoj rati ORIGINALNA cijena (dio) + popust %, ---
+# --- tako da roditelj na svakoj ponudi vidi da je popust obračunat.                        ---
+# Primjer: 216 € na 4 rate uz 25 % → svaka rata: cijena 54,00 €, popust 25 %, za uplatu 40,50 €.
+
+def _na_pola_centa(bazna_centi: int, popust) -> bool:
+    """True ako iznos nakon popusta pada točno na pola centa (npr. 83,75 − 10 % = 75,375) —
+    takve iznose izbjegavamo jer bi Solo mogao zaokružiti drugačije od nas."""
+    return _cijena_s_popustom_tocno(bazna_centi, popust) % 1 == Decimal("0.5")
+
+
+def _raspodijeli_stavku(osnovica: int, popust, cilj: int, n: int) -> list:
+    """Osnovicu jedne stavke podijeli na n rata tako da:
+    1) zbroj osnovica = originalna cijena (točno),
+    2) zbroj iznosa za uplatu = iznos kao kod jednokratnog plaćanja (točno, ako je moguće),
+    3) nijedna rata ne pada na pola centa, 4) rate su što jednakije."""
+    x = [osnovica // n] * n
+    x[-1] += osnovica - sum(x)
+
+    def ocjena(v):
+        return (abs(cilj - sum(konacna_cijena_centi(c, popust) for c in v)),
+                sum(_na_pola_centa(c, popust) for c in v),
+                max(v) - min(v))
+
+    najbolja = ocjena(x)
+    for _ in range(300):
+        if najbolja == (0, 0, 0) or (najbolja[:2] == (0, 0) and najbolja[2] <= 1):
+            break
+        poboljsano = False
+        for korak in (1, 2, 3):
+            for a in reversed(range(n)):
+                for b in reversed(range(n)):
+                    if a == b or x[b] - korak <= 0:
+                        continue
+                    y = list(x)
+                    y[a] += korak
+                    y[b] -= korak
+                    o = ocjena(y)
+                    if o < najbolja:
+                        x, najbolja, poboljsano = y, o, True
+                        break
+                if poboljsano:
+                    break
+            if poboljsano:
+                break
+        if not poboljsano:
+            break
+    return x
+
+
+def _podaci_stavki(stavke: list) -> list:
+    """(osnovica_centi, popust, za_uplatu_centi) po stavci, za cijelu količinu."""
+    rez = []
+    for st in stavke:
+        b = u_cente(st.get("cijena_bazna")) or 0
+        p = float(st.get("popust_postotak") or 0)
+        rez.append((_puta_kolicina(b, st), p, _puta_kolicina(konacna_cijena_centi(b, p), st)))
+    return rez
+
+
+def _zadana_raspodjela(stavke: list, n: int) -> list:
+    """Matrica [stavka][rata] osnovica u centima — zadani (automatski) prijedlog."""
+    return [_raspodijeli_stavku(B, p, F, n) for B, p, F in _podaci_stavki(stavke)]
+
+
+def raspodjela_rata(stavke: list, osnovice_rata: list) -> list:
+    """Za zadane osnovice po ratama (zbroj = ukupna cijena prije popusta) vrati matricu
+    [stavka][rata] osnovica. Ako su osnovice jednake automatskom prijedlogu, koristi se on;
+    inače (admin je ručno promijenio iznose) svaka se rata dijeli na stavke razmjerno cijeni."""
+    n = len(osnovice_rata)
+    zadana = _zadana_raspodjela(stavke, n)
+    if [sum(r[k] for r in zadana) for k in range(n)] == list(osnovice_rata):
+        return zadana
+    podaci = _podaci_stavki(stavke)
+    ukupno = sum(B for B, _, _ in podaci)
+    if ukupno <= 0 or sum(osnovice_rata) != ukupno:
+        raise ValueError("Zbroj rata mora biti jednak ukupnoj cijeni prije popusta.")
+    m = [[0] * n for _ in podaci]
+    for k in range(n - 1):
+        for i, (B, _, _) in enumerate(podaci[:-1]):
+            m[i][k] = int((Decimal(osnovice_rata[k]) * B / ukupno).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+        m[-1][k] = osnovice_rata[k] - sum(m[i][k] for i in range(len(podaci) - 1))
+    for i, (B, _, _) in enumerate(podaci):
+        m[i][n - 1] = B - sum(m[i][:n - 1])
+    if any(v < 0 for red in m for v in red):
+        raise ValueError("Rate su preneravnomjerne da bi se podijelile po stavkama — ujednačite iznose rata.")
+    return m
+
+
+def stavke_za_rate(stavke: list, osnovice_rata: list) -> list:
+    """Lista (po ratama) stavki koje idu u Solo: svaka stavka zadržava ORIGINALNI naziv iz Sola
+    + "(rata k/N)", cijenu = njezin dio originalne cijene, i ISTI popust % kao na jednokratnoj ponudi."""
+    stavke = preracunaj_stavke(stavke)
+    n = len(osnovice_rata)
+    m = raspodjela_rata(stavke, osnovice_rata)
+    po_ratama = []
+    for k in range(n):
+        linije = []
+        for i, st in enumerate(stavke):
+            bazna = m[i][k]
+            if bazna <= 0:
+                continue
+            p = float(st.get("popust_postotak") or 0)
+            linija = {
+                "sifra": st.get("sifra", ""),
+                "opis": f"{str(st.get('opis', ''))[:480]} (rata {k + 1}/{n})",
+                "kolicina": 1,
+                "cijena_bazna": centi_u_tekst(bazna),
+                "popust_postotak": p,
+                "cijena_konacna": centi_u_tekst(konacna_cijena_centi(bazna, p)),
+            }
+            if st.get("izvor"):
+                linija["izvor"] = st["izvor"]
+            linije.append(linija)
+        po_ratama.append(linije)
+    return po_ratama
+
+
+def pregled_rata(stavke: list, osnovice_rata: list) -> list:
+    """Za prikaz u adminu: po rati osnovica, popust i iznos za uplatu (centi)."""
+    rez = []
+    for linije in stavke_za_rate(stavke, osnovice_rata):
+        popusti = sorted({float(l["popust_postotak"]) for l in linije if float(l["popust_postotak"])})
+        tekst = " / ".join(f"{p:g}".replace(".", ",") for p in popusti)
+        if not popusti:
+            tekst = "—"
+        elif any(not float(l["popust_postotak"]) for l in linije):
+            tekst = f"−{tekst} % (na dio stavki)"
+        else:
+            tekst = f"−{tekst} %"
+        rez.append({
+            "osnovica": sum(u_cente(l["cijena_bazna"]) for l in linije),
+            "popust": tekst,
+            "za_uplatu": sum(u_cente(l["cijena_konacna"]) for l in linije),
+        })
+    return rez
+
+
+def predlozi_rate(stavke, broj_rata: int, prvi_rok: date) -> list:
+    """Prijedlog rata: lista (osnovica_centi, rok) — osnovica = dio ORIGINALNE cijene (prije popusta),
+    rok svakih 30 dana. (Za kompatibilnost: ako se umjesto stavki preda broj centi, dijeli se taj broj.)"""
+    if isinstance(stavke, (int, float)):
+        ukupno = int(stavke)
+        osnovne = [ukupno // broj_rata] * broj_rata
+        osnovne[-1] += ukupno - sum(osnovne)
+    else:
+        m = _zadana_raspodjela(preracunaj_stavke(stavke), broj_rata)
+        osnovne = [sum(r[k] for r in m) for k in range(broj_rata)]
+    return [(iznos, prvi_rok + timedelta(days=30 * k)) for k, iznos in enumerate(osnovne)]
 
 
 def _mail_polja(headers: list, mail_predmet, mail_tekst) -> dict:
@@ -1342,23 +1517,17 @@ def odobri_dokument(sheet, red: dict, stavke: list, solo_racun: str, nacin_uplat
         return [red["dokument_id"]]
 
     # --- Rate: svaka rata = zaseban Solo dokument (§22.4), svi odobreni ODJEDNOM ---
+    # Na svakoj rati: originalni naziv iz Sola + "(rata k/N)", dio ORIGINALNE cijene i popust %
+    # (Solo ga ispisuje na ponudi, pa roditelj vidi da je popust obračunat).
     grupa_id = "G-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
     n = len(rate)
-    opis_programa = ", ".join(str(st.get("opis", "")) for st in stavke)
+    po_ratama = stavke_za_rate(stavke, [i for i, _ in rate])
     program = red.get("program_tip", "")
     dokumenti = []
-    for k, (iznos, rok) in enumerate(rate, start=1):
-        stavka_rate = [{
-            "sifra": "RATA",
-            # Točan naziv iz Sola + oznaka rate (bez vlastitih naziva programa)
-            "opis": f"{opis_programa[:480]} (rata {k}/{n})",
-            "kolicina": 1,
-            "cijena_bazna": centi_u_tekst(iznos),
-            "popust_postotak": 0,
-            "cijena_konacna": centi_u_tekst(iznos),
-        }]
+    for k, ((_, rok), stavke_rate) in enumerate(zip(rate, po_ratama), start=1):
+        iznos = zbroj_stavki_centi(stavke_rate)
         polja = dict(zajednicko, **{
-            "stavke_snapshot_json": json.dumps(stavka_rate, ensure_ascii=False),
+            "stavke_snapshot_json": json.dumps(stavke_rate, ensure_ascii=False),
             "stavke_izvorno_json": stavke_json,
             "iznos_ukupno": iznos / 100,
             "rok_placanja": rok.strftime("%Y-%m-%d"),
@@ -1525,6 +1694,29 @@ def ucitaj_mail_predlozak(sheet, program_tip: str) -> tuple:
         if r.get("kljuc") == kljuc:
             return str(r.get("predmet", "")), str(r.get("tijelo", ""))
     return "", ""
+
+
+def popis_programa_za_mail(stavke: list) -> str:
+    """{popis_programa} u mailu — isto kao Apps Script popisZaMail_(). Popust se vidi i u mailu:
+    "- Naziv — 335,00 € − 10 % = 301,50 €", "- Naziv — 8 × 20,00 € = 160,00 €"."""
+    redovi = []
+    for st in stavke:
+        kol = float(st.get("kolicina") or 1)
+        p = float(st.get("popust_postotak") or 0)
+        bazna = u_cente(st.get("cijena_bazna"))
+        konacna = u_cente(st.get("cijena_konacna"))
+        if bazna is None:
+            bazna = konacna
+        tekst = f"- {st.get('opis', '')} — "
+        if kol != 1:
+            tekst += f"{kol:g}".replace(".", ",") + " × "
+        tekst += f"{centi_u_tekst(bazna)} €"
+        if p:
+            tekst += f" − {p:g}".replace(".", ",") + " %"
+        if p or kol != 1:
+            tekst += f" = {centi_u_tekst(_puta_kolicina(konacna or 0, st))} €"
+        redovi.append(tekst)
+    return "\n".join(redovi)
 
 
 def popuni_mail_pregled(tekst: str, zamjene: dict) -> str:
