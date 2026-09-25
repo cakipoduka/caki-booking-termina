@@ -8,7 +8,15 @@ import json
 
 import streamlit as st
 
-from pipeline_upisi import (
+# Streamlit Cloud nakon git pulla zna zadržati STARU verziju pipeline_upisi.py u memoriji
+# (→ ImportError "cannot import name"). Ako je datoteka novija od učitanog modula, učitaj je ponovno.
+import importlib, os, time  # noqa: E401,E402
+import pipeline_upisi as _pipeline  # noqa: E402
+if os.path.getmtime(_pipeline.__file__) > getattr(_pipeline, "_ucitano_u", 0):
+    importlib.reload(_pipeline)
+    _pipeline._ucitano_u = time.time()
+
+from pipeline_upisi import (  # noqa: E402
     KOMPONENTE,
     KOMPONENTE_ZA_BOOKING,
     REZERVACIJA_ROK_DANA,

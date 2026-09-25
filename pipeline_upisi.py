@@ -989,7 +989,7 @@ def izgradi_pdf_izvoza(naslov: str, stupci: list, retci: list) -> bytes:
 CJENIK_TAB = "Cjenik"
 LEDGER_TAB = "Racuni_i_ponude"
 
-STATUSI_DOKUMENTA = ["Nacrt", "Odobreno", "Poslano", "Greška", "Plaćeno", "Otkazano", "Isteklo"]
+STATUSI_DOKUMENTA = ["Nacrt", "Odobreno", "Šalje se…", "Poslano", "Greška", "Plaćeno", "Otkazano", "Isteklo"]
 NACINI_UPLATE = {1: "Transakcijski račun", 2: "Gotovina", 3: "Kartice", 4: "Ček", 5: "Ostalo"}
 
 NACINI_NAPLATE_INSTRUKCIJA = ["Jednokratno", "Mjesečno"]
@@ -1109,6 +1109,17 @@ def cijena_iz_cjenika(df_cjenik: pd.DataFrame, sifra: str, subjekt: str = ""):
     return kandidati.iloc[0].to_dict()
 
 
+def naziv_iz_sola(df_cjenik: pd.DataFrame, sifra: str, je90: bool = False) -> str:
+    """Točan naziv stavke iz Solo kataloga (Cjenik). Za individualne instrukcije od 90 min koristi
+    stavku sa šifrom INSTR-IND-90 ako postoji u Solu, inače naziv stavke INSTR-IND."""
+    if je90 and sifra == "INSTR-IND":
+        red90 = cijena_iz_cjenika(df_cjenik, "INSTR-IND-90")
+        if red90 and str(red90.get("opis", "")).strip():
+            return str(red90["opis"]).strip()
+    red = cijena_iz_cjenika(df_cjenik, sifra)
+    return str((red or {}).get("opis", "") or "").strip() or "Instrukcije"
+
+
 def odredi_sifru_instrukcije(oblik: str, predmet: str) -> str:
     """Pravilo za zadanu šifru (admin je može promijeniti po terminu):
     međunarodni ispit → INSTR-MEDJ; strani jezik → INSTR-STRANI; grupa → INSTR-GRU; inače INSTR-IND."""
@@ -1202,10 +1213,12 @@ def parsiraj_stavke(tekst) -> list:
 
 
 def preracunaj_stavke(stavke: list) -> list:
-    """Iz cijena_bazna + popust_postotak izračuna cijena_konacna (tekst '360,75') za svaku stavku."""
+    """Iz cijena_bazna + popust_postotak izračuna cijena_konacna (tekst '360,75') za svaku stavku.
+    Popust je UVIJEK postotak po stavci — isto kako ga bilježi Solo."""
     rezultat = []
     for st in stavke:
         st = dict(st)
+        st.pop("popust_iznos", None)
         bazna = u_cente(st.get("cijena_bazna"))
         popust = float(st.get("popust_postotak") or 0)
         st["popust_postotak"] = popust
@@ -1266,23 +1279,32 @@ def predlozi_rate(ukupno_centi: int, broj_rata: int, prvi_rok: date) -> list:
     return [(iznos, prvi_rok + timedelta(days=30 * k)) for k, iznos in enumerate(rate)]
 
 
+def _mail_polja(headers: list, mail_predmet, mail_tekst) -> dict:
+    """Uređeni mail sprema se samo ako tab već ima te stupce (dodaje ih postaviFinancije)."""
+    if mail_tekst is None or "mail_tekst" not in headers:
+        return {}
+    return {"mail_predmet": str(mail_predmet or "")[:250], "mail_tekst": str(mail_tekst or "")}
+
+
 def spremi_nacrt(sheet, row_number: int, stavke: list, solo_racun: str, nacin_uplate: int,
-                 napomena: str, rok_placanja):
+                 napomena: str, rok_placanja, mail_predmet=None, mail_tekst=None):
     """Sprema izmjene nacrta BEZ slanja (status ostaje Nacrt)."""
     stavke = preracunaj_stavke(stavke)
     ws = sheet.worksheet(LEDGER_TAB)
-    _azuriraj_polja(ws, row_number, {
+    headers = ws.row_values(1)
+    _azuriraj_polja(ws, row_number, {**_mail_polja(headers, mail_predmet, mail_tekst), 
         "stavke_snapshot_json": json.dumps(stavke, ensure_ascii=False),
         "iznos_ukupno": zbroj_stavki_centi(stavke) / 100,
         "solo_racun": solo_racun if solo_racun in SOLO_SUBJEKTI else "",
         "nacin_uplate": int(nacin_uplate),
         "napomena": str(napomena or "")[:1000],
         "rok_placanja": rok_placanja.strftime("%Y-%m-%d") if rok_placanja else "",
-    })
+    }, headers)
 
 
 def odobri_dokument(sheet, red: dict, stavke: list, solo_racun: str, nacin_uplate: int,
-                    napomena: str, rok_placanja, rate: list | None = None) -> list:
+                    napomena: str, rok_placanja, rate: list | None = None,
+                    mail_predmet=None, mail_tekst=None) -> list:
     """Admin klikne "✅ Pošalji": dokument (ili više njih, ako su rate) dobiva status
     'Odobreno'. Stvarno slanje u Solo radi Apps Script posaljiOdobrene() u roku ~5 min.
     rate = None (jednokratno) ili lista (iznos_centi, rok: date).
@@ -1302,6 +1324,7 @@ def odobri_dokument(sheet, red: dict, stavke: list, solo_racun: str, nacin_uplat
         raise ValueError(f"Dokument je u međuvremenu promijenio status u '{trenutni_status}' — osvježi stranicu.")
 
     zajednicko = {
+        **_mail_polja(headers, mail_predmet, mail_tekst),
         "solo_racun": solo_racun,
         "nacin_uplate": int(nacin_uplate),
         "napomena": str(napomena or "")[:1000],
@@ -1421,37 +1444,34 @@ def kreiraj_nacrt_instrukcije(sheet, df_odabrani: pd.DataFrame, df_cjenik: pd.Da
         raise ValueError("Neki od odabranih termina su već obračunati.")
 
     ucenik_id = df_odabrani.iloc[0]["ucenik_id"]
-    upozorenja, grupe = [], {}
-    for _, t in df_odabrani.iterrows():
+    upozorenja, grupe, pregled = [], {}, []
+    for _, t in df_odabrani.sort_values("datum").iterrows():
         sifra = str(t.get("sifra", "") or "")
-        predmet = str(t.get("predmet", "") or "") or "(predmet nije upisan)"
+        predmet = str(t.get("predmet", "") or "") or "?"
+        minuta = int(float(t.get("duljina_min") or 0))
         centi = u_cente(t.get("cijena_termina"))
         if centi is None:
-            cij = izracunaj_cijenu_termina(df_cjenik, sifra, t.get("duljina_min"))
-            centi = u_cente(cij)
+            centi = u_cente(izracunaj_cijenu_termina(df_cjenik, sifra, minuta))
         if centi is None:
             upozorenja.append(f"Termin {t['datum']} ({predmet}): cijena nepoznata — upiši ručno.")
-        g = grupe.setdefault((sifra, predmet), {"centi": 0, "termina": 0, "minuta": 0, "nepoznato": False, "datumi": []})
+        datum = str(t["datum"])
+        datum_txt = datetime.strptime(datum[:10], "%Y-%m-%d").strftime("%d.%m.") if len(datum) >= 10 and datum[4] == "-" else datum
+        pregled.append(f"{datum_txt} {predmet} {minuta} min")
+        je90 = minuta == 90
+        g = grupe.setdefault((sifra, centi, je90), {"termina": 0})
         g["termina"] += 1
-        g["minuta"] += int(float(t.get("duljina_min") or 0))
-        g["datumi"].append(str(t["datum"]))
-        if centi is None:
-            g["nepoznato"] = True
-        else:
-            g["centi"] += centi
 
     stavke = []
-    for (sifra, predmet), g in grupe.items():
-        datumi = ", ".join(sorted(datetime.strptime(d[:10], "%Y-%m-%d").strftime("%d.%m.") for d in g["datumi"])) \
-            if all(len(d) >= 10 for d in g["datumi"]) else ""
+    for (sifra, centi, je90), g in grupe.items():
         stavke.append({
             "sifra": sifra,
-            "opis": f"Instrukcije — {predmet} ({g['termina']}×, {g['minuta']} min{'; ' + datumi if datumi else ''})",
-            "kolicina": 1,
-            "cijena_bazna": "" if g["nepoznato"] else centi_u_tekst(g["centi"]),
+            "opis": naziv_iz_sola(df_cjenik, sifra, je90),   # TOČAN naziv iz Sola, bez dodataka
+            "kolicina": g["termina"],
+            "cijena_bazna": "" if centi is None else centi_u_tekst(centi),
             "popust_postotak": 0,
-            "cijena_konacna": "" if g["nepoznato"] else centi_u_tekst(g["centi"]),
+            "cijena_konacna": "" if centi is None else centi_u_tekst(centi),
         })
+    upozorenja.insert(0, "ℹ️ Termini: " + ", ".join(pregled))
 
     # Predloži subjekt po zadnjem Instrukcije dokumentu tog učenika (admin ga može promijeniti)
     subjekt = ""
@@ -1486,6 +1506,31 @@ def kreiraj_nacrt_instrukcije(sheet, df_odabrani: pd.DataFrame, df_cjenik: pd.Da
     for r in df_odabrani["_row"]:
         _azuriraj_polja(ws_i, int(r), {"status_obracuna": "Obračunato", "dokument_id": dokument_id}, h_i)
     return dokument_id
+
+
+MAIL_PREDLOZAK_PO_PROGRAMU = {"Matura": "matura_potvrda", "Instrukcije": "instrukcije_obracun", "Upisi": "upisi_potvrda"}
+
+
+def ucitaj_mail_predlozak(sheet, program_tip: str) -> tuple:
+    """(predmet, tijelo) predloška iz taba Mail_predlosci za dani program, ili ('', '') ako ga nema.
+    Placeholderi {ime_roditelja}, {ime_djeteta}, {popis_programa}, {link_ponuda} ostaju kakvi jesu —
+    popunjava ih Apps Script u trenutku slanja."""
+    try:
+        ws = sheet.worksheet("Mail_predlosci")
+    except gspread.exceptions.WorksheetNotFound:
+        return "", ""
+    kljuc = MAIL_PREDLOZAK_PO_PROGRAMU.get(program_tip, "")
+    for r in ws.get_all_records():
+        if r.get("kljuc") == kljuc:
+            return str(r.get("predmet", "")), str(r.get("tijelo", ""))
+    return "", ""
+
+
+def popuni_mail_pregled(tekst: str, zamjene: dict) -> str:
+    """Isto što radi Apps Script popuniPredlozak — za pregled u admin panelu."""
+    for k, v in zamjene.items():
+        tekst = tekst.replace("{" + k + "}", str(v))
+    return tekst
 
 
 def dug_ucenika(df_racuni: pd.DataFrame, ucenik_id: str) -> int:
