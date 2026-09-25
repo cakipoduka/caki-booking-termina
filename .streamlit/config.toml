@@ -1,0 +1,3 @@
+[client]
+# Jedan portal (portal_ui.py) — bez izbornika stranica u sidebaru
+showSidebarNavigation = false
