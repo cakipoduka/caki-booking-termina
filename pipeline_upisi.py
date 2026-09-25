@@ -7,6 +7,7 @@ import io
 import os
 import random
 import string
+import time
 import json
 import math
 from decimal import Decimal, ROUND_HALF_UP
@@ -97,8 +98,24 @@ def get_credentials(service_account_info: dict):
     return Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 
 
+class PonoviHTTPClient(gspread.http_client.HTTPClient):
+    """Google Sheets povremeno odbije zahtjev: previše čitanja u minuti (greška 429) ili kratki
+    kvar na Googleovoj strani (5xx). Umjesto crvene greške u aplikaciji pričeka 2, 4, pa 8 sekundi
+    i pokuša ponovno. Druge greške (npr. nema pristupa) javlja odmah."""
+
+    def request(self, *args, **kwargs):
+        for cekanje in (2, 4, 8, None):
+            try:
+                return super().request(*args, **kwargs)
+            except gspread.exceptions.APIError as e:
+                kod = int(getattr(e, "code", 0) or 0)
+                if cekanje is None or not (kod in (408, 429) or kod >= 500):
+                    raise
+                time.sleep(cekanje)
+
+
 def get_gspread_client(service_account_info: dict):
-    return gspread.authorize(get_credentials(service_account_info))
+    return gspread.authorize(get_credentials(service_account_info), http_client=PonoviHTTPClient)
 
 
 # --- Učitavanje podataka ---
@@ -990,7 +1007,12 @@ def izgradi_pdf_izvoza(naslov: str, stupci: list, retci: list) -> bytes:
 CJENIK_TAB = "Cjenik"
 LEDGER_TAB = "Racuni_i_ponude"
 
-STATUSI_DOKUMENTA = ["Nacrt", "Odobreno", "Šalje se…", "Poslano", "Greška", "Plaćeno", "Otkazano", "Isteklo"]
+STATUSI_DOKUMENTA = ["Nacrt", "Odobreno", "Šalje se…", "Poslano", "Greška", "Plaćeno", "Otkazano", "Isteklo",
+                     "Za brisanje", "Obrisano", "Brisanje nije uspjelo"]
+# Dokumenti koji postoje u Solu i mogu se tamo obrisati (Apps Script posaljiOdobrene, ~5 min)
+STATUSI_U_SOLU = ("Poslano", "Isteklo", "Brisanje nije uspjelo")
+# Dokumenti koji još NISU u Solu — samo se otkazuju u tablici
+STATUSI_PRIJE_SOLA = ("Nacrt", "Odobreno", "Greška")
 NACINI_UPLATE = {1: "Transakcijski račun", 2: "Gotovina", 3: "Kartice", 4: "Ček", 5: "Ostalo"}
 
 NACINI_NAPLATE_INSTRUKCIJA = ["Jednokratno", "Mjesečno"]
@@ -1601,6 +1623,182 @@ def oznaci_dokument_istekao(sheet, row_number: int):
     _azuriraj_polja(sheet.worksheet(LEDGER_TAB), row_number, {"status": "Isteklo"})
 
 
+# ============================================================
+# BRISANJE POSLANIH PONUDA, ISPRAVAK I ODUSTAJANJE (25.9.2026.)
+# Streamlit NE zove Solo izravno (tokeni su samo u Apps Scriptu): admin označi dokument
+# "Za brisanje", a Apps Script posaljiOdobrene() ga u roku ~5 min obriše u Solu → "Obrisano".
+# Ponuda u Solu nije fiskalizirani dokument, pa se smije obrisati. RAČUN se ne briše (storno u Solu).
+# ============================================================
+
+def _stupac_ako_postoji(headers: list, polja: dict) -> dict:
+    """Izbaci polja za stupce koje tab još nema (dodaje ih postaviFinancije)."""
+    return {k: v for k, v in polja.items() if k in headers}
+
+
+def dokumenti_grupe(df_racuni: pd.DataFrame, red) -> pd.DataFrame:
+    """Sve rate istog dokumenta (isti rata_grupa_id), ili samo taj dokument."""
+    grupa = str(red.get("rata_grupa_id") or "")
+    if grupa and grupa != "nan" and "rata_grupa_id" in df_racuni.columns:
+        return df_racuni[df_racuni["rata_grupa_id"].astype(str) == grupa]
+    return df_racuni[df_racuni["dokument_id"] == red["dokument_id"]]
+
+
+def _termini_vise_dokumenata(sheet, dokument_ids: list):
+    ws = sheet.worksheet("Instrukcije_termini")
+    df = _load_worksheet_df(ws)
+    if df.empty or "dokument_id" not in df.columns:
+        return ws, ws.row_values(1), []
+    return ws, ws.row_values(1), df[df["dokument_id"].isin(dokument_ids)]["_row"].tolist()
+
+
+def zatrazi_brisanje(sheet, dokumenti: list, razlog: str = "", termini: str = "otpisi") -> dict:
+    """Za svaki dokument (dict s _row, dokument_id, program_tip, ...):
+      - Nacrt/Odobreno/Greška (još nije u Solu)  → Otkazano,
+      - Poslano/Isteklo/Brisanje nije uspjelo    → Za brisanje (Apps Script ga briše u Solu),
+      - Plaćeno / Šalje se… / Račun               → preskače se, uz objašnjenje.
+    termini (samo Instrukcije): "otpisi" = termini se više ne naplaćuju (Otpisano),
+    "vrati" = natrag u Neobračunato (ući će u sljedeći obračun), "zadrzi" = ne dirati (ispravak).
+    Vraća {"za_brisanje": n, "otkazano": n, "preskoceno": [tekst, ...]}."""
+    ws = sheet.worksheet(LEDGER_TAB)
+    headers = ws.row_values(1)
+    svjezi_statusi = ws.col_values(headers.index("status") + 1)  # svježe, ne iz cachea
+    rez = {"za_brisanje": 0, "otkazano": 0, "preskoceno": []}
+    instrukcije_ids = []
+    for d in dokumenti:
+        row = int(d["_row"])
+        status = svjezi_statusi[row - 1] if row - 1 < len(svjezi_statusi) else ""
+        oznaka = f"{d.get('ime_djeteta', '')} {d.get('broj_dokumenta') or d.get('dokument_id')}".strip()
+        if status == "Plaćeno":
+            rez["preskoceno"].append(f"{oznaka}: već plaćeno — ostaje (povrat novca riješite ručno).")
+            continue
+        if status == "Šalje se…":
+            rez["preskoceno"].append(f"{oznaka}: upravo se šalje u Solo — pokušajte ponovno za 5 minuta.")
+            continue
+        if str(d.get("tip_dokumenta", "Ponuda") or "Ponuda") not in ("Ponuda", "nan"):
+            rez["preskoceno"].append(f"{oznaka}: račun se ne briše — napravite storno u Solu.")
+            continue
+        polja = _stupac_ako_postoji(headers, {"razlog_brisanja": str(razlog or "")[:500]})
+        if status in STATUSI_PRIJE_SOLA:
+            polja["status"] = "Otkazano"
+            rez["otkazano"] += 1
+        elif status in STATUSI_U_SOLU:
+            polja.update({"status": "Za brisanje", "greska_slanja": ""})
+            rez["za_brisanje"] += 1
+        else:
+            continue  # već Otkazano / Obrisano / Za brisanje
+        _azuriraj_polja(ws, row, polja, headers)
+        if d.get("program_tip") == "Instrukcije":
+            instrukcije_ids.append(d["dokument_id"])
+
+    if instrukcije_ids and termini in ("otpisi", "vrati"):
+        ws_i, h_i, retci = _termini_vise_dokumenata(sheet, instrukcije_ids)
+        for r in retci:
+            _azuriraj_polja(ws_i, r, {"status_obracuna": "Otpisano"} if termini == "otpisi"
+                            else {"status_obracuna": "Neobračunato", "dokument_id": ""}, h_i)
+    return rez
+
+
+def ispravi_dokument(sheet, df_racuni: pd.DataFrame, red) -> tuple:
+    """"✏️ Ispravi": poslana ponuda (sa svim ratama) briše se u Solu, a u Nacrtima nastaje nova
+    s istim stavkama, subjektom, načinom uplate i napomenom — admin je ispravi i pošalje.
+    Vraća (novi_dokument_id, rezultat zatrazi_brisanje)."""
+    grupa = dokumenti_grupe(df_racuni, red).copy()
+    if (grupa["status"] == "Plaćeno").any():
+        raise ValueError("Dio ove ponude (neka rata) je već plaćen — ispravak nije moguć. "
+                         "Obrišite samo neplaćene rate i napravite novu ponudu ručno.")
+    if (grupa["status"] == "Šalje se…").any():
+        raise ValueError("Ponuda se upravo šalje u Solo — pokušajte ponovno za 5 minuta.")
+    grupa["_k"] = pd.to_numeric(grupa.get("rata_broj", 1), errors="coerce").fillna(1)
+    grupa = grupa.sort_values("_k")
+    prvi = grupa.iloc[0].to_dict()
+    stavke = parsiraj_stavke(prvi.get("stavke_izvorno_json") or prvi.get("stavke_snapshot_json"))
+    if not stavke:
+        raise ValueError("Ponuda nema zapisane stavke — napravite novu ručno.")
+    stavke = preracunaj_stavke(stavke)
+    izvorni = next((str(v) for v in grupa.get("izvorni_redci", []) if str(v) not in ("", "nan")), "")
+    brojevi = ", ".join(str(b) for b in grupa.get("broj_dokumenta", []) if str(b) not in ("", "nan")) or prvi["dokument_id"]
+    n_rata = len(grupa)
+
+    rez = zatrazi_brisanje(sheet, [r.to_dict() for _, r in grupa.iterrows()],
+                           razlog="Ispravak — zamijenjeno novom ponudom", termini="zadrzi")
+
+    novi_id = "D-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    ws = sheet.worksheet(LEDGER_TAB)
+    upozorenja = f"✏️ Ispravak ponude {brojevi} (stara se briše u Solu). Promijenite što treba i pošaljite."
+    if n_rata > 1:
+        upozorenja += f" Prije: NA RATE ({n_rata})."
+
+    def _v(k):
+        v = prvi.get(k, "")
+        return "" if v is None or (isinstance(v, float) and math.isnan(v)) else v
+
+    _dodaj_red_po_nazivu(ws, {
+        "dokument_id": novi_id,
+        "ucenik_id": _v("ucenik_id"),
+        "ime_djeteta": _v("ime_djeteta"),
+        "program_tip": _v("program_tip"),
+        "solo_racun": _v("solo_racun"),
+        "tip_dokumenta": _v("tip_dokumenta") or "Ponuda",
+        "status": "Nacrt",
+        "iznos_ukupno": zbroj_stavki_centi(stavke) / 100,
+        "stavke_snapshot_json": json.dumps(stavke, ensure_ascii=False),
+        "izvorni_redci": izvorni,
+        "nacin_uplate": _v("nacin_uplate") or 1,
+        "napomena": _v("napomena"),
+        "datum_kreiranja": sada_zagreb().strftime("%Y-%m-%d %H:%M:%S"),
+        "upozorenja": upozorenja,
+    })
+    if prvi.get("program_tip") == "Instrukcije":
+        ws_i, h_i, retci = _termini_vise_dokumenata(sheet, grupa["dokument_id"].tolist())
+        for r in retci:
+            _azuriraj_polja(ws_i, r, {"dokument_id": novi_id, "status_obracuna": "Obračunato"}, h_i)
+    return novi_id, rez
+
+
+def ponovi_brisanje(sheet, row_number: int):
+    _azuriraj_polja(sheet.worksheet(LEDGER_TAB), row_number, {"status": "Za brisanje", "greska_slanja": ""})
+
+
+def oznaci_obrisano_rucno(sheet, row_number: int):
+    """Admin je ponudu već sam obrisao u Solu (ili je nikad nije bilo) — samo zapiši stanje."""
+    _azuriraj_polja(sheet.worksheet(LEDGER_TAB), row_number, {"status": "Obrisano", "greska_slanja": ""})
+
+
+def odustao_od_programa(sheet, ucenik_id: str, prijave: dict, dokumenti: list,
+                        rezervacije_retci: list, razlog: str = "", autor: str = "") -> dict:
+    """"🚪 Odustao": odabrane prijave → Odustao, rezervacije termina → Otkazano (mjesto u grupi
+    se oslobađa), odabrane ponude → brisanje u Solu / otkazivanje, bilješka u povijesti kontakta.
+    Učenik se NE briše iz tablice — ostaje povijest (i ista šifra ako se vrati).
+    prijave = {redak_id: čitljiv opis}."""
+    opis = []
+    redak_ids = list(prijave)
+    if redak_ids:
+        ws_p = sheet.worksheet("Prijave")
+        df_p = _load_worksheet_df(ws_p)
+        h_p = ws_p.row_values(1)
+        for _, r in df_p[df_p["redak_id"].isin(redak_ids) & (df_p["ucenik_id"] == ucenik_id)].iterrows():
+            _azuriraj_polja(ws_p, int(r["_row"]), {"status_kontakta": "Odustao"}, h_p)
+            opis.append(str(prijave.get(r["redak_id"]) or r["redak_id"]))
+    if rezervacije_retci:
+        ws_r = sheet.worksheet("Rezervacije")
+        h_r = ws_r.row_values(1)
+        for row in rezervacije_retci:
+            _azuriraj_polja(ws_r, int(row), {"status": "Otkazano"}, h_r)
+    rez = zatrazi_brisanje(sheet, dokumenti, razlog=("Odustao: " + razlog).strip(": "), termini="otpisi")
+    rez["prijava"] = len(opis)
+    rez["rezervacija"] = len(rezervacije_retci)
+    try:
+        tekst = "🚪 Odustao" + (f" od: {', '.join(opis)}" if opis else "") + "."
+        if razlog:
+            tekst += f" Razlog: {razlog}."
+        tekst += (f" Ponude: {rez['za_brisanje']} za brisanje u Solu, {rez['otkazano']} otkazano"
+                  f"{', ' + str(len(rez['preskoceno'])) + ' preskočeno' if rez['preskoceno'] else ''}.")
+        dodaj_biljesku(sheet, ucenik_id, autor or "admin", tekst)
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+    return rez
+
+
 def kreiraj_nacrt_instrukcije(sheet, df_odabrani: pd.DataFrame, df_cjenik: pd.DataFrame,
                               df_racuni: pd.DataFrame) -> str:
     """Jednokratna naplata (§23.3.4): admin odabere Neobračunate termine JEDNOG učenika →
@@ -1610,8 +1808,8 @@ def kreiraj_nacrt_instrukcije(sheet, df_odabrani: pd.DataFrame, df_cjenik: pd.Da
         raise ValueError("Nije odabran nijedan termin.")
     if df_odabrani["ucenik_id"].nunique() != 1:
         raise ValueError("Jedan nacrt = jedan učenik.")
-    if (df_odabrani.get("status_obracuna", pd.Series(dtype=str)) == "Obračunato").any():
-        raise ValueError("Neki od odabranih termina su već obračunati.")
+    if df_odabrani.get("status_obracuna", pd.Series(dtype=str)).isin(["Obračunato", "Otpisano"]).any():
+        raise ValueError("Neki od odabranih termina su već obračunati ili otpisani.")
 
     ucenik_id = df_odabrani.iloc[0]["ucenik_id"]
     upozorenja, grupe, pregled = [], {}, []
