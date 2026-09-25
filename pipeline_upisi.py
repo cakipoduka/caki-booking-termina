@@ -1350,7 +1350,8 @@ def odobri_dokument(sheet, red: dict, stavke: list, solo_racun: str, nacin_uplat
     for k, (iznos, rok) in enumerate(rate, start=1):
         stavka_rate = [{
             "sifra": "RATA",
-            "opis": f"{program} — rata {k}/{n} ({opis_programa})"[:500],
+            # Točan naziv iz Sola + oznaka rate (bez vlastitih naziva programa)
+            "opis": f"{opis_programa[:480]} (rata {k}/{n})",
             "kolicina": 1,
             "cijena_bazna": centi_u_tekst(iznos),
             "popust_postotak": 0,
@@ -1531,6 +1532,14 @@ def popuni_mail_pregled(tekst: str, zamjene: dict) -> str:
     for k, v in zamjene.items():
         tekst = tekst.replace("{" + k + "}", str(v))
     return tekst
+
+
+def prikazi_datum(v) -> str:
+    """Datum iz Sheeta za prikaz: tekst ostaje tekst, a Sheets serijski broj (npr. 46290.69)
+    pretvara se u '2026-09-25 16:41'."""
+    if isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v)) and v > 30000:
+        return (datetime(1899, 12, 30) + timedelta(days=float(v))).strftime("%Y-%m-%d %H:%M")
+    return "" if v is None or (isinstance(v, float) and math.isnan(v)) else str(v)
 
 
 def dug_ucenika(df_racuni: pd.DataFrame, ucenik_id: str) -> int:
