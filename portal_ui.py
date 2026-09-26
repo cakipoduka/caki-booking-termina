@@ -57,7 +57,7 @@ def _ucitaj(naziv: str):
 
 
 # Slobodna mjesta moraju biti svježija
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=30)
 def _ucitaj_rezervacije():
     return _load_opcionalno(_init_sheet(), "Rezervacije")
 

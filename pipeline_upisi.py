@@ -101,11 +101,14 @@ def get_credentials(service_account_info: dict):
 
 class PonoviHTTPClient(gspread.http_client.HTTPClient):
     """Google Sheets povremeno odbije zahtjev: previše čitanja u minuti (greška 429) ili kratki
-    kvar na Googleovoj strani (5xx). Umjesto crvene greške u aplikaciji pričeka 2, 4, pa 8 sekundi
-    i pokuša ponovno. Druge greške (npr. nema pristupa) javlja odmah."""
+    kvar na Googleovoj strani (5xx). Umjesto crvene greške u aplikaciji pričeka i pokuša ponovno —
+    ukupno do ~65 s, jer Googleova kvota (60 čitanja u minuti) se obnavlja svake minute.
+    Druge greške (npr. nema pristupa) javlja odmah."""
+
+    CEKANJA = (2, 5, 10, 18, 30, None)
 
     def request(self, *args, **kwargs):
-        for cekanje in (2, 4, 8, None):
+        for cekanje in self.CEKANJA:
             try:
                 return super().request(*args, **kwargs)
             except gspread.exceptions.APIError as e:
@@ -115,18 +118,43 @@ class PonoviHTTPClient(gspread.http_client.HTTPClient):
                 time.sleep(cekanje)
 
 
+TAB_KES_SEKUNDI = 300
+
+
+def kesiraj_tabove(spreadsheet, ttl: int = TAB_KES_SEKUNDI):
+    """sheet.worksheet("Naziv") svaki put pita Google za popis tabova (1 čitanje). Ovdje se
+    rezultat pamti 5 min, pa se broj čitanja po stranici otprilike prepolovi (27.9.2026.)."""
+    izvorni = spreadsheet.worksheet
+    kes = {}
+
+    def worksheet(title):
+        sada = time.time()
+        zapis = kes.get(title)
+        if zapis and sada - zapis[1] < ttl:
+            return zapis[0]
+        ws = izvorni(title)
+        kes[title] = (ws, sada)
+        return ws
+
+    spreadsheet.worksheet = worksheet
+    return spreadsheet
+
+
 def get_gspread_client(service_account_info: dict):
-    return gspread.authorize(get_credentials(service_account_info), http_client=PonoviHTTPClient)
+    klijent = gspread.authorize(get_credentials(service_account_info), http_client=PonoviHTTPClient)
+    izvorni_open = klijent.open_by_key
+    klijent.open_by_key = lambda key: kesiraj_tabove(izvorni_open(key))
+    return klijent
 
 
 # --- Učitavanje podataka ---
 
 def _load_worksheet_df(ws) -> pd.DataFrame:
-    """Robustno učitavanje - radi ispravno i kad tab ima samo header, bez ijednog retka podataka."""
-    headers = ws.row_values(1)
+    """Robustno učitavanje - radi ispravno i kad tab ima samo header, bez ijednog retka podataka.
+    Zaglavlje se posebno čita samo kad tab nema redaka (inače 1 čitanje umjesto 2)."""
     records = ws.get_all_records()
     if not records:
-        df = pd.DataFrame(columns=headers)
+        df = pd.DataFrame(columns=ws.row_values(1))
     else:
         df = pd.DataFrame(records)
     df["_row"] = range(2, len(df) + 2)
@@ -1132,9 +1160,8 @@ def konacna_cijena_centi(bazna_centi, popust_postotak) -> int:
 
 def _load_df_neformatirano(ws) -> pd.DataFrame:
     """Kao _load_worksheet_df, ali brojeve vraća kao brojeve (ne '360,75' ovisno o jeziku Sheeta)."""
-    headers = ws.row_values(1)
     records = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
-    df = pd.DataFrame(records) if records else pd.DataFrame(columns=headers)
+    df = pd.DataFrame(records) if records else pd.DataFrame(columns=ws.row_values(1))
     df["_row"] = range(2, len(df) + 2)
     return df
 
