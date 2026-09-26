@@ -6,6 +6,7 @@ Isti stack kao baza zadataka (get_credentials/get_gspread_client pattern).
 import io
 import os
 import random
+import re
 import string
 import time
 import json
@@ -1976,6 +1977,49 @@ def popis_programa_za_mail(stavke: list) -> str:
     return "\n".join(redovi)
 
 
+def naslov_maila(predmet: str, ime_djeteta: str, ucenik_id: str) -> str:
+    """Isto kao Apps Script naslovMaila_(): kratko + ime i šifra učenika."""
+    p = str(predmet or "").strip()
+    m = re.match(r"^Potvrda prijave i ponuda za uplatu\s*[—–-]\s*(.+)$", p, re.IGNORECASE)
+    if m:
+        p = m.group(1).strip() + " · prijava i ponuda"
+    if ime_djeteta and str(ime_djeteta) not in p:
+        p += f" — {ime_djeteta} ({ucenik_id})"
+    elif ucenik_id not in p:
+        p += f" ({ucenik_id})"
+    return p
+
+
+def tekst_moj_caki(ime_djeteta: str, ucenik_id: str, portal_url: str = "[adresa portala Moj CAKI]") -> str:
+    """Isto kao Apps Script tekstMojCaki_()."""
+    return (f"Učenik: {ime_djeteta} · šifra za pristup: {ucenik_id}\n"
+            f"Moj CAKI — raspored nastave, dolasci, uplate i dokumenti na jednom mjestu:\n"
+            f"{str(portal_url).rstrip('/')}/?ucenik_id={ucenik_id}")
+
+
+# --- R1: račun na firmu (26.9.2026.) — podaci u tabu Učenici; Apps Script ih šalje Solu kao kupca ---
+R1_STUPCI = ["r1_naziv", "r1_oib", "r1_adresa"]
+
+
+def spremi_r1(sheet, row_number: int, naziv: str, oib: str, adresa: str):
+    """Upiše podatke firme za R1 (prazan OIB = ponude idu na roditelja kao i dosad)."""
+    oib = re.sub(r"\s", "", str(oib or ""))
+    if oib and not re.fullmatch(r"\d{11}", oib):
+        raise ValueError("OIB mora imati točno 11 znamenki.")
+    if oib and not str(naziv or "").strip():
+        raise ValueError("Upišite naziv firme.")
+    ws = sheet.worksheet("Učenici")
+    headers = ws.row_values(1)
+    nedostaju = [h for h in R1_STUPCI if h not in headers]
+    if nedostaju:
+        if ws.col_count < len(headers) + len(nedostaju):
+            ws.add_cols(len(headers) + len(nedostaju) - ws.col_count)
+        ws.update(range_name=gspread.utils.rowcol_to_a1(1, len(headers) + 1), values=[nedostaju], value_input_option="RAW")
+        headers = headers + nedostaju
+    _azuriraj_polja(ws, row_number, {"r1_naziv": str(naziv or "").strip()[:100], "r1_oib": oib,
+                                     "r1_adresa": str(adresa or "").strip()[:255]}, headers)
+
+
 def popuni_mail_pregled(tekst: str, zamjene: dict) -> str:
     """Isto što radi Apps Script popuniPredlozak — za pregled u admin panelu."""
     for k, v in zamjene.items():
@@ -2103,6 +2147,10 @@ def portal_naplata(df_racuni: pd.DataFrame, ucenik_id: str):
     if df_racuni.empty or "status" not in df_racuni.columns:
         return pd.DataFrame(), 0
     r = df_racuni[(df_racuni["ucenik_id"] == ucenik_id) & (df_racuni["status"].isin(list(_PORTAL_STATUS_DOKUMENTA)))]
+    # Poslane ponude kojima mail još NIJE ni pokušan (npr. druga rata iste grupe čeka slanje) se ne
+    # prikazuju — roditelj ih vidi tek kad dobije mail sa svim ratama. Plaćene se prikazuju uvijek.
+    if "mail_poslan" in r.columns:
+        r = r[(r["status"] == "Plaćeno") | (r["mail_poslan"].astype(str).str.strip().replace("nan", "") != "")]
     if r.empty:
         return pd.DataFrame(), 0
 
@@ -2122,7 +2170,7 @@ def portal_naplata(df_racuni: pd.DataFrame, ucenik_id: str):
         "Status": r["status"].map(_PORTAL_STATUS_DOKUMENTA),
         "Dokument": r["link_pdf"] if "link_pdf" in r.columns else "",
     })
-    return out.reset_index(drop=True), dug_ucenika(df_racuni, ucenik_id)
+    return out.reset_index(drop=True), dug_ucenika(r, ucenik_id)   # dug samo od prikazanih dokumenata
 
 
 def portal_rezultati(df_rezultati: pd.DataFrame, ucenik_id: str) -> pd.DataFrame:
@@ -2152,7 +2200,10 @@ def portal_rezultati(df_rezultati: pd.DataFrame, ucenik_id: str) -> pd.DataFrame
 
 IZVJESTAJI_TAB = "Izvjestaji_instruktora"
 IZVJESTAJI_HEADERS = ["izvjestaj_id", "nastavnik", "mjesec", "poslano", "broj_instrukcija", "sati_instrukcija",
-                      "broj_grupnih_termina", "status", "napomena_admin", "azurirano"]
+                      "broj_grupnih_termina", "status", "napomena_admin", "azurirano",
+                      "nacin_isplate", "iznos_isplate", "datum_isplate"]
+# Samo admin vidi (portal za profesore prikazuje samo status i napomenu)
+NACINI_ISPLATE = ["Ugovor o djelu", "Autorski ugovor", "Račun (obrt / firma)", "Plaća", "Naknada / ostalo"]
 STATUSI_IZVJESTAJA = ["Čeka provjeru", "Potvrđeno", "Isplaćeno", "Vraćeno na ispravak"]
 
 
@@ -2274,7 +2325,19 @@ def posalji_izvjestaj_instruktora(sheet, izv: dict) -> str:
     return izv_id
 
 
-def azuriraj_izvjestaj(sheet, row_number: int, status: str, napomena: str = ""):
+def azuriraj_izvjestaj(sheet, row_number: int, status: str, napomena: str = "",
+                      nacin_isplate: str = "", iznos_isplate=None):
     ws = sheet.worksheet(IZVJESTAJI_TAB)
-    _azuriraj_polja(ws, row_number, {"status": status, "napomena_admin": str(napomena or "")[:500],
-                                     "azurirano": sada_zagreb().strftime("%Y-%m-%d %H:%M")})
+    headers = ws.row_values(1)
+    nedostaju = [h for h in IZVJESTAJI_HEADERS if h not in headers]
+    if nedostaju:   # tab napravljen prije 26.9. — dodaj nove stupce
+        if ws.col_count < len(headers) + len(nedostaju):
+            ws.add_cols(len(headers) + len(nedostaju) - ws.col_count)
+        ws.update(range_name=gspread.utils.rowcol_to_a1(1, len(headers) + 1), values=[nedostaju], value_input_option="RAW")
+        headers = headers + nedostaju
+    sada = sada_zagreb().strftime("%Y-%m-%d %H:%M")
+    polja = {"status": status, "napomena_admin": str(napomena or "")[:500], "azurirano": sada}
+    if status == "Isplaćeno":
+        polja.update({"nacin_isplate": str(nacin_isplate or ""), "datum_isplate": sada[:10],
+                      "iznos_isplate": "" if iznos_isplate in (None, "") else float(iznos_isplate)})
+    _azuriraj_polja(ws, row_number, polja, headers)
