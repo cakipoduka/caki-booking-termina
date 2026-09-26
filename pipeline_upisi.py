@@ -2090,7 +2090,7 @@ def portal_dolasci(df_dolasci: pd.DataFrame, df_termini: pd.DataFrame, df_grupe:
     if not df_grupe.empty:
         for _, g in df_grupe.iterrows():
             labele[g["grupa_id"]] = f"{KOMPONENTE.get(g['program'], g['program'])} · {g['dan']} {g['vrijeme']}"
-    d["Grupa"] = d["grupa_id"].map(lambda gid: labele.get(gid, gid))
+    d["Grupa"] = d["grupa_id"].map(lambda gid: labele.get(gid, labela_matura_grupe(gid)))
     d["Dolazak"] = d["status"].astype(str).map({"1": "✅ Prisutan", "0": "❌ Odsutan", "2": "💻 Online"}).fillna("?")
     tablica = d.sort_values("datum", ascending=False)[["datum", "Grupa", "Dolazak"]].rename(columns={"datum": "Datum"})
     postotci = {}
@@ -2238,7 +2238,7 @@ def izvjestaj_instruktora(df_instrukcije: pd.DataFrame, df_termini: pd.DataFrame
                 labele[r["grupa_id"]] = f"{KOMPONENTE.get(r['program'], r['program'])} · {r['dan']} {r['vrijeme']}"
         grupni = pd.DataFrame({
             "Datum": [str(v)[:10] for v in g["datum"]],
-            "Grupa": [labele.get(x, x) for x in g["grupa_id"]],
+            "Grupa": [labele.get(x, labela_matura_grupe(x)) for x in g["grupa_id"]],
         }).reset_index(drop=True)
     minute = int(instr["Trajanje (min)"].sum()) if not instr.empty else 0
     return {
@@ -2341,3 +2341,241 @@ def azuriraj_izvjestaj(sheet, row_number: int, status: str, napomena: str = "",
         polja.update({"nacin_isplate": str(nacin_isplate or ""), "datum_isplate": sada[:10],
                       "iznos_isplate": "" if iznos_isplate in (None, "") else float(iznos_isplate)})
     _azuriraj_polja(ws, row_number, polja, headers)
+
+
+# ============================================================
+# MATURA — raspored (tab Raspored_Matura_<sezona>, piše ga admin → 🎓 Raspored Matura) i dolasci
+# (26.9.2026.). Dolasci Mature koriste POSTOJEĆE tabove Termini / Dolasci / Gostovanja i funkciju
+# spremi_cijeli_termin; grupa_id Matura sata je oznaka kante: "MATURA|Subota|1|A".
+# Sve funkcije su čiste (DataFrame → podaci) radi testiranja. v. Claude outputs/CAKI_Matura_Dolasci_Prijedlog.
+# ============================================================
+MATURA_PREFIKS = "MATURA|"
+ROK_PROFESOR_DANA = 14      # profesor smije upisati/ispraviti sat najviše 2 tjedna unatrag (odluka 26.9.2026.)
+
+KRATICE_PREDMETA_MATURA = {
+    "hrvatski": "HRV", "matematika": "MAT", "engleski": "ENG", "fizika": "FIZ", "kemija": "KEM",
+    "biologija": "BIO", "fizika_medicina": "FIZ-MED", "kemija_medicina": "KEM-MED", "biologija_medicina": "BIO-MED",
+}
+# Oznake koje se mogu dodijeliti profesoru (⚙️ Postavke → Nastavnici)
+OZNAKE_PREDMETA_MATURA = ["MAT-A", "MAT-B", "HRV", "ENG-A", "ENG-B", "FIZ", "KEM", "BIO", "FIZ-MED", "KEM-MED", "BIO-MED"]
+
+
+def oznaka_predmeta_matura(predmet, razina="") -> str:
+    """'matematika' + 'A' -> 'MAT-A'; nepoznat predmet ostaje kakav jest (velikim slovima)."""
+    p = str(predmet or "").strip().lower()
+    kratica = KRATICE_PREDMETA_MATURA.get(p, p.upper() or "?")
+    r = str(razina or "").strip().upper()
+    return f"{kratica}-{r}" if r in ("A", "B") else kratica
+
+
+def naziv_taba_rasporeda_mature(sezona: str = SEZONA) -> str:
+    return f"Raspored_Matura_{sezona}"
+
+
+def load_raspored_matura(sheet, sezona: str = SEZONA) -> pd.DataFrame:
+    return _load_opcionalno(sheet, naziv_taba_rasporeda_mature(sezona))
+
+
+def matura_grupa_id(dan: str, termin, ucionica: str) -> str:
+    return f"{MATURA_PREFIKS}{dan}|{int(termin)}|{ucionica}"
+
+
+def je_matura_grupa(grupa_id) -> bool:
+    return str(grupa_id or "").startswith(MATURA_PREFIKS)
+
+
+def labela_matura_grupe(grupa_id, vrijeme: str = "") -> str:
+    """'MATURA|Subota|1|A' -> 'Matura · Subota T1 · Uč. A'. Ostale oznake vraća nepromijenjene."""
+    if not je_matura_grupa(grupa_id):
+        return grupa_id
+    try:
+        _p, dan, t, uc = str(grupa_id).split("|")
+    except ValueError:
+        return grupa_id
+    return f"Matura · {dan} T{t}{(' ' + vrijeme) if vrijeme else ''} · Uč. {uc}"
+
+
+def _je_online(v) -> bool:
+    return "online" in str(v or "").lower()
+
+
+def matura_kante(df_raspored: pd.DataFrame) -> list:
+    """Kante (dan × termin × učionica) iz spremljenog rasporeda Mature, poredane po danu i terminu:
+    [{grupa_id, dan, termin, vrijeme, ucionica, profesor, predmeti: [oznake], ucenici: [{ucenik_id,
+    ime_djeteta, online, predmet}]}]. Retci bez redak_id (kanta samo s profesorom) daju praznu kantu."""
+    if df_raspored is None or df_raspored.empty or "dan" not in df_raspored.columns:
+        return []
+    kante = {}
+    for _, r in df_raspored.iterrows():
+        dan, uc = str(r.get("dan", "")).strip(), str(r.get("ucionica", "")).strip()
+        try:
+            t = int(str(r.get("termin", "")).strip())
+        except ValueError:
+            continue
+        if dan not in DANI_U_TJEDNU or not uc:
+            continue
+        gid = matura_grupa_id(dan, t, uc)
+        k = kante.setdefault(gid, {"grupa_id": gid, "dan": dan, "termin": t, "vrijeme": "", "ucionica": uc,
+                                    "profesor": "", "predmeti": [], "ucenici": []})
+        k["vrijeme"] = k["vrijeme"] or str(r.get("vrijeme", "") or "").strip()
+        k["profesor"] = k["profesor"] or str(r.get("profesor", "") or "").strip()
+        if str(r.get("redak_id", "") or "").strip() and str(r.get("ucenik_id", "") or "").strip():
+            oznaka = oznaka_predmeta_matura(r.get("predmet"), r.get("razina_ispita"))
+            if oznaka not in k["predmeti"]:
+                k["predmeti"].append(oznaka)
+            k["ucenici"].append({"ucenik_id": str(r["ucenik_id"]).strip(), "ime_djeteta": str(r.get("ime_djeteta", "")),
+                                 "online": _je_online(r.get("nacin_pracenja")), "predmet": oznaka})
+    red_dana = {d: i for i, d in enumerate(DANI_U_TJEDNU)}
+    out = sorted(kante.values(), key=lambda k: (red_dana[k["dan"]], k["termin"], k["ucionica"]))
+    for k in out:
+        k["predmeti"].sort()
+        k["ucenici"].sort(key=lambda u: u["ime_djeteta"])
+    return out
+
+
+def labela_kante(k: dict, s_profesorom: bool = False) -> str:
+    return (f"{k['dan']} T{k['termin']} {k['vrijeme']} · Uč. {k['ucionica']} · "
+            f"{' + '.join(k['predmeti']) or '—'} ({len(k['ucenici'])} uč.)"
+            + (f" · {k['profesor'] or 'bez profesora'}" if s_profesorom else ""))
+
+
+def predmeti_nastavnika(df_nastavnici: pd.DataFrame, ime: str) -> list:
+    """Predmeti Mature koje profesor predaje (stupac Nastavnici.predmeti, npr. 'MAT-A, MAT-B').
+    Prazna lista = nije upisano → profesor vidi sve (da ništa ne pukne prije nego se popuni)."""
+    if df_nastavnici is None or df_nastavnici.empty or "predmeti" not in df_nastavnici.columns:
+        return []
+    red = df_nastavnici[df_nastavnici["ime"] == ime]
+    if red.empty:
+        return []
+    return [p.strip().upper() for p in re.split(r"[,;]", str(red.iloc[0]["predmeti"] or "")) if p.strip()]
+
+
+def postavi_predmete_nastavnika(sheet, row_number: int, predmeti: list):
+    """Admin: predmeti koje nastavnik predaje (stupac 'predmeti' se doda ako ga nema)."""
+    ws = sheet.worksheet("Nastavnici")
+    headers = ws.row_values(1)
+    if "predmeti" not in headers:
+        if ws.col_count < len(headers) + 1:
+            ws.add_cols(1)
+        ws.update_cell(1, len(headers) + 1, "predmeti")
+        headers = headers + ["predmeti"]
+    _azuriraj_polja(ws, row_number, {"predmeti": ", ".join(predmeti)}, headers)
+
+
+def predaje_predmet(predmeti_prof: list, oznaka: str) -> bool:
+    """Prazan popis = predaje sve. 'MAT' pokriva MAT-A i MAT-B; 'MAT-A' pokriva samo MAT-A."""
+    if not predmeti_prof:
+        return True
+    o = str(oznaka or "").upper()
+    for p in predmeti_prof:
+        if o == p or o.split("-")[0] == p:
+            return True
+    return False
+
+
+def kante_za_profesora(kante: list, ime: str, predmeti_prof: list):
+    """(moje, ostale): moje = kante gdje je upisan kao profesor; ostale = kante NJEGOVIH predmeta
+    kod drugih profesora (za "Držim sat umjesto kolege"). Kante drugih predmeta ne vidi."""
+    moje = [k for k in kante if k["profesor"] == ime]
+    ostale = [k for k in kante if k["profesor"] != ime
+              and (any(predaje_predmet(predmeti_prof, o) for o in k["predmeti"])
+                   or (not k["predmeti"] and not predmeti_prof))]
+    return moje, ostale
+
+
+def zadnji_datum_dana(dan: str, danas: date) -> date:
+    """Najbliži datum <= danas koji pada na zadani dan u tjednu (zadani datum sata)."""
+    razlika = (danas.weekday() - DANI_U_TJEDNU.index(dan)) % 7
+    return danas - timedelta(days=razlika)
+
+
+def datum_u_roku(datum: date, danas: date, dana: int = ROK_PROFESOR_DANA) -> bool:
+    return danas - timedelta(days=dana) <= datum <= danas
+
+
+def postojeci_dolasci(df_termini: pd.DataFrame, df_dolasci: pd.DataFrame, grupa_id: str, datum: str) -> dict:
+    """{ucenik_id: status} već spremljenog sata (za ispravak), ili {} ako sat još nije zabilježen."""
+    if df_termini is None or df_termini.empty or df_dolasci is None or df_dolasci.empty:
+        return {}
+    t = df_termini[(df_termini["grupa_id"].astype(str) == str(grupa_id))
+                   & (df_termini["datum"].astype(str).str[:10] == str(datum)[:10])]
+    if t.empty:
+        return {}
+    tid = str(t.iloc[0]["termin_id"])
+    d = df_dolasci[df_dolasci["termin_id"].astype(str) == tid]
+    return {str(r["ucenik_id"]): str(r["status"]) for _, r in d.iterrows()}
+
+
+ZNAK_DOLASKA = {"1": "✅", "0": "❌", "2": "💻"}
+
+
+def dolasci_matura(df_termini: pd.DataFrame, df_dolasci: pd.DataFrame) -> pd.DataFrame:
+    """Svi zapisi dolazaka na Matura satove: grupa_id, datum, ucenik_id, ime_djeteta, status, nastavnik_odrzao."""
+    stupci = ["grupa_id", "datum", "ucenik_id", "ime_djeteta", "status", "nastavnik_odrzao"]
+    if df_termini is None or df_termini.empty or df_dolasci is None or df_dolasci.empty:
+        return pd.DataFrame(columns=stupci)
+    d = df_dolasci[df_dolasci["grupa_id"].astype(str).str.startswith(MATURA_PREFIKS)]
+    if d.empty:
+        return pd.DataFrame(columns=stupci)
+    t = df_termini[["termin_id", "datum"] + (["nastavnik_odrzao"] if "nastavnik_odrzao" in df_termini.columns else [])]
+    d = d.merge(t, on="termin_id", how="left")
+    d["datum"] = d["datum"].astype(str).str[:10]
+    d["status"] = d["status"].astype(str)
+    if "nastavnik_odrzao" not in d.columns:
+        d["nastavnik_odrzao"] = ""
+    return d[stupci].reset_index(drop=True)
+
+
+def tablica_dolazaka_kante(d_matura: pd.DataFrame, kanta: dict) -> pd.DataFrame:
+    """Učenik × datum (✅/❌/💻) za jednu kantu + stupac '%' (prisutan ili online / svi zapisi).
+    Uključuje učenike iz rasporeda i one koji su bili zapisani (npr. premješteni kasnije)."""
+    d = d_matura[d_matura["grupa_id"] == kanta["grupa_id"]] if not d_matura.empty else d_matura
+    datumi = sorted(set(d["datum"])) if not d.empty else []
+    imena = {u["ucenik_id"]: u["ime_djeteta"] for u in kanta["ucenici"]}
+    for _, r in d.iterrows():
+        imena.setdefault(str(r["ucenik_id"]), str(r["ime_djeteta"]))
+    retci = []
+    for uid, ime in sorted(imena.items(), key=lambda x: x[1]):
+        du = d[d["ucenik_id"].astype(str) == uid]
+        st_po_datumu = dict(zip(du["datum"], du["status"]))
+        red = {"Učenik": ime}
+        for dt in datumi:
+            red[_kratki_datum(dt)] = ZNAK_DOLASKA.get(st_po_datumu.get(dt, ""), "")
+        red["%"] = f"{round(100 * du['status'].isin(['1', '2']).sum() / len(du))} %" if len(du) else "—"
+        retci.append(red)
+    return pd.DataFrame(retci)
+
+
+def _kratki_datum(iso: str) -> str:
+    try:
+        return datetime.strptime(str(iso)[:10], "%Y-%m-%d").strftime("%d.%m.")
+    except ValueError:
+        return str(iso)
+
+
+def portal_raspored_matura(df_raspored: pd.DataFrame, ucenik_id: str) -> pd.DataFrame:
+    """Moj CAKI: tjedni raspored Mature za jednog učenika (bez imena drugih učenika i bez profesora)."""
+    retci = []
+    for k in matura_kante(df_raspored):
+        for u in k["ucenici"]:
+            if u["ucenik_id"] == str(ucenik_id):
+                retci.append({"Dan": k["dan"], "Vrijeme": k["vrijeme"], "Predmet": u["predmet"],
+                              "Učionica": k["ucionica"] + (" (online)" if u["online"] else "")})
+    return pd.DataFrame(retci)
+
+
+def broj_mobitela_za_whatsapp(broj) -> str:
+    """'091 234 5678' / '+385 91 234 5678' / '00385912345678' -> '385912345678' (za wa.me link)."""
+    b = re.sub(r"\D", "", str(broj or ""))
+    if b.startswith("00"):
+        b = b[2:]
+    if b.startswith("0"):
+        b = "385" + b[1:]
+    return b if len(b) >= 9 else ""
+
+
+def whatsapp_link(tekst: str, broj: str = "") -> str:
+    """Link koji otvori WhatsApp s pripremljenom porukom. Bez broja: WhatsApp pita kome (grupa,
+    zajednica, osoba). S brojem: otvori razgovor s tom osobom. Ništa se ne šalje samo — šalje Caki."""
+    from urllib.parse import quote
+    return f"https://wa.me/{broj_mobitela_za_whatsapp(broj) if broj else ''}?text={quote(tekst)}"

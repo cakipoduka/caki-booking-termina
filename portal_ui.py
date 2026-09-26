@@ -31,6 +31,8 @@ from pipeline_upisi import (
     portal_instrukcije,
     portal_naplata,
     portal_raspored_grupa,
+    portal_raspored_matura,
+    naziv_taba_rasporeda_mature,
     portal_rezultati,
 )
 
@@ -193,6 +195,7 @@ def prikazi_portal():
     komponente = komponente_za_odabir(_ucitaj("Prijave"), ucenik_id)
     bez_termina = treba_odabrati_termin(komponente, df_grupe, df_rez, ucenik_id)
     raspored = portal_raspored_grupa(df_rez, df_grupe, ucenik_id)
+    raspored_matura = portal_raspored_matura(_ucitaj(naziv_taba_rasporeda_mature()), ucenik_id)   # 26.9.2026.
     tablica_dol, postotci = portal_dolasci(_ucitaj("Dolasci"), _ucitaj("Termini"), df_grupe, ucenik_id)
     dokumenti, dug = portal_naplata(df_racuni, ucenik_id)
 
@@ -200,7 +203,8 @@ def prikazi_portal():
     with st.container(border=True):
         st.markdown(f"### 👋 {ucenik['ime_djeteta']}")
         m1, m2, m3 = st.columns(3)
-        m1.metric("📅 Grupa", f"{raspored.iloc[0]['Dan']} {raspored.iloc[0]['Vrijeme']}" if not raspored.empty else "—",
+        prvi = raspored if not raspored.empty else raspored_matura
+        m1.metric("📅 Grupa", f"{prvi.iloc[0]['Dan']} {prvi.iloc[0]['Vrijeme']}" if not prvi.empty else "—",
                   help="Prvi termin u tjednu (svi termini su u kartici Raspored).")
         ukupno_dol = round(sum(postotci.values()) / len(postotci)) if postotci else None
         m2.metric("✅ Dolasci", f"{ukupno_dol} %" if ukupno_dol is not None else "—")
@@ -218,11 +222,16 @@ def prikazi_portal():
             _prikazi_odabir_termina(sheet, ucenik, ucenik_id, komponente, df_grupe, df_rez)
 
     with kartice["🗓️ Raspored"]:
-        st.markdown("#### Grupna nastava")
-        if raspored.empty:
-            st.info("Nema rezerviranih termina grupne nastave.")
-        else:
-            st.dataframe(raspored, hide_index=True, width="stretch")
+        if not raspored_matura.empty:
+            st.markdown("#### Pripreme za Maturu")
+            st.dataframe(raspored_matura, hide_index=True, width="stretch")
+            st.caption("Tjedni raspored po predmetima. Početak nastave razlikuje se po predmetu — javit ćemo vam ga.")
+        if not raspored.empty or raspored_matura.empty:
+            st.markdown("#### Grupna nastava")
+            if raspored.empty:
+                st.info("Nema rezerviranih termina grupne nastave.")
+            else:
+                st.dataframe(raspored, hide_index=True, width="stretch")
         st.markdown("#### Instrukcije")
         instr = portal_instrukcije(_ucitaj("Instrukcije_termini"), df_racuni, ucenik_id)
         if instr.empty:
