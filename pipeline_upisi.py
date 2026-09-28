@@ -670,6 +670,16 @@ def osiguraj_stupac_povezani_ucenici(sheet):
         ws.update_cell(1, len(headers) + 1, "povezani_ucenici")
 
 
+def osiguraj_stupac_skola(sheet):
+    """Dodaje stupac 'skola' na Učenici tab ako ne postoji (na desni kraj headera). 28.9.2026. —
+    naziv škole koju učenik pohađa (bitno za Maturu, npr. grupiranje MIOC učenika u istu smjenu);
+    za OŠ učenike (Upisi program) ostaje prazno dok admin ručno ne dopuni."""
+    ws = sheet.worksheet("Učenici")
+    headers = ws.row_values(1)
+    if "skola" not in headers:
+        ws.update_cell(1, len(headers) + 1, "skola")
+
+
 def poveci_kao_obitelj(sheet, ucenik_id_1: str, ucenik_id_2: str):
     """Povezuje dva zapisa kao braću/sestre (dvosmjerno), bez spajanja u jedan zapis.
     Zahtijeva stupac 'povezani_ucenici' na Učenici tabu (gumb 'Dodaj povezani_ucenici stupac')."""
@@ -2022,6 +2032,29 @@ def tekst_moj_caki(ime_djeteta: str, ucenik_id: str, portal_url: str = "[adresa 
     return (f"Učenik: {ime_djeteta} · šifra za pristup: {ucenik_id}\n"
             f"Moj CAKI — raspored nastave, dolasci, uplate i dokumenti na jednom mjestu:\n"
             f"{str(portal_url).rstrip('/')}/?ucenik_id={ucenik_id}")
+
+
+def tekst_nacin_placanja(ime_djeteta: str, ucenik_id: str, ime_roditelja: str, nacin_placanja: str,
+                         portal_url: str = "[adresa portala Moj CAKI]") -> str:
+    """🆕 28.9.2026. — WhatsApp/mail podsjetnik roditelju: odabrani način plaćanja (Jednokratno/Na rate,
+    iz Prijave.nacin_placanja) + da je ponuda poslana na mail + link na Moj CAKI. NAMJERNO ne ponavlja
+    bankovne podatke (IBAN/poziv na broj) — ti podaci su već na Solo ponudi koju je roditelj dobio
+    mailom, pa nema rizika da se nešto krivo prepiše/zastari u ovoj poruci."""
+    pozdrav = f"Poštovani/a {ime_roditelja}," if str(ime_roditelja or "").strip() else "Poštovani,"
+    nacin_recenica = f" Odabrani način plaćanja: *{nacin_placanja}*." if str(nacin_placanja or "").strip() else ""
+    dijelovi = [
+        pozdrav,
+        "",
+        f"ponuda za {ime_djeteta} poslana je na mail.{nacin_recenica} Molimo provjerite mail i "
+        "uplatite prema uputama na ponudi (rok plaćanja je naveden na njoj).",
+        "",
+        tekst_moj_caki(ime_djeteta, ucenik_id, portal_url),
+        "",
+        "Za sva pitanja slobodno nam se javite.",
+        "",
+        "Lijep pozdrav,\nCAKI centar",
+    ]
+    return "\n".join(dijelovi)
 
 
 # --- R1: račun na firmu (26.9.2026.) — podaci u tabu Učenici; Apps Script ih šalje Solu kao kupca ---
