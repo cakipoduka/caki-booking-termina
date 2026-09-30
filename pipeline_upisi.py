@@ -941,11 +941,12 @@ def azuriraj_nastavnika(sheet, row_number: int, polja: dict):
 
 
 # ============================================================
-# SOLO — dva pravna subjekta, ručan odabir po prijavi (14.9.2026.)
-# "Caki obrt za poduke" (treći subjekt) namjerno izostavljen — nije povezan.
+# SOLO — pravni subjekti, ručan odabir po prijavi (14.9.2026.)
+# 29.9.2026.: dodan treći subjekt "CAKI obrt za poduku (DEDA)" (katalog se postupno puni).
+# Naziv MORA biti isti kao ključ u SOLO_SUBJEKTI u Apps Scriptu (CAKI_solo_ponuda_i_mail.gs).
 # ============================================================
 
-SOLO_SUBJEKTI = ["CAKI centar d.o.o.", "Caki poduka obrt"]
+SOLO_SUBJEKTI = ["CAKI centar d.o.o.", "Caki poduka obrt", "CAKI obrt za poduku (DEDA)"]
 
 
 def postavi_solo_racun(sheet, row_number: int, subjekt: str):
