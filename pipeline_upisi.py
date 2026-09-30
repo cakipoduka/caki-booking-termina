@@ -2640,3 +2640,350 @@ def whatsapp_link(tekst: str, broj: str = "") -> str:
     zajednica, osoba). S brojem: otvori razgovor s tom osobom. Ništa se ne šalje samo — šalje Caki."""
     from urllib.parse import quote
     return f"https://wa.me/{broj_mobitela_za_whatsapp(broj) if broj else ''}?text={quote(tekst)}"
+
+
+# ============================================================
+# 🆕 30.9.2026. — RUČNO SLANJE MAILA (i WhatsApp poruke) IZ KARTICE UČENIKA
+# Tok: admin u kartici odabere program, vrstu i predložak, pregleda tekst i klikne
+# "Pošalji" → redak u tabu Mail_dnevnik sa statusom "Za slanje" → Apps Script
+# CAKI_mail_rucno.gs (svake minute) pošalje mail s info@ i upiše thread i link.
+# Automatskog slanja NEMA: bez klika admina ne odlazi ništa.
+# ============================================================
+
+MAIL_DNEVNIK_TAB = "Mail_dnevnik"
+MAIL_DNEVNIK_HEADERS = [
+    "mail_id", "datum_zahtjeva", "ucenik_id", "ime_djeteta", "program", "vrsta", "predlozak",
+    "nacin", "odgovor_na_thread", "prima", "kopija", "predmet", "tijelo",
+    "status", "datum_slanja", "gmail_thread_id", "gmail_message_id", "gmail_link", "greska", "poslao",
+]
+MAIL_PREDLOSCI_TAB = "Mail_predlosci"
+MAIL_PREDLOSCI_HEADERS = ["kljuc", "program", "vrsta", "predmet", "tijelo"]
+MAIL_VRSTE = ["ponuda", "podsjetnik", "programi/raspored", "promo"]
+MAIL_VRSTE_AKTIVNE = ["ponuda", "podsjetnik", "programi/raspored"]   # promo tek uz GDPR privolu
+MAIL_PROGRAMI = ["Upisi", "Matura"]                                    # Instrukcije naknadno
+MAIL_FAZA_U_NASLOVU = {"ponuda": "ponuda", "podsjetnik": "podsjetnik",
+                       "programi/raspored": "programi i raspored", "promo": "novosti"}
+MAIL_CC = ["info@cakipoduka.com", "matematika@cakipoduka.com"]
+GMAIL_RACUN = "info@cakipoduka.com"
+NACIN_NOVI = "novi"
+NACIN_ODGOVOR = "odgovor"
+THREAD_AUTO = "AUTO"      # Apps Script sam nađe najnoviji razgovor s tim adresama u Gmailu
+STATUS_ZA_SLANJE = "Za slanje"
+STATUSI_U_TIJEKU = ("Za slanje", "Šalje se…")
+
+# Postojeći predlošci (koristi ih 💶 Financije) — kojem programu i vrsti pripadaju
+_VRSTA_POSTOJECIH = {
+    "upisi_potvrda": ("Upisi", "ponuda"),
+    "matura_potvrda": ("Matura", "ponuda"),
+    "instrukcije_obracun": ("Instrukcije", "ponuda"),
+}
+
+_POTPIS = "\n\nZa sva pitanja slobodno nam se javite.\n\nSrdačan pozdrav,\nCAKI centar"
+
+# PRIVREMENI tekstovi — admin ih mijenja na ⚙️ Postavke → ✉️ Mail predlošci (bez novog koda)
+PRIVREMENI_PREDLOSCI = [
+    {"kljuc": "upisi_podsjetnik", "program": "Upisi", "vrsta": "podsjetnik", "predmet": "",
+     "tijelo": "Poštovani/a {ime_roditelja},\n\nljubazno podsjećamo da ponuda za {ime_djeteta} još čeka uplatu:\n\n"
+               "{link_ponuda}\n\nAko ste već uplatili, zanemarite ovu poruku — uplata će biti vidljiva u "
+               "portalu Moj CAKI čim je evidentiramo.\n\n{moj_caki}" + _POTPIS},
+    {"kljuc": "upisi_raspored", "program": "Upisi", "vrsta": "programi/raspored", "predmet": "",
+     "tijelo": "Poštovani/a {ime_roditelja},\n\nšaljemo informacije o programu za {ime_djeteta}:\n\n"
+               "{popis_programa}\n\n{odjeljak_termina}\n\n{moj_caki}" + _POTPIS},
+    {"kljuc": "matura_podsjetnik", "program": "Matura", "vrsta": "podsjetnik", "predmet": "",
+     "tijelo": "Poštovani/a {ime_roditelja},\n\nljubazno podsjećamo da ponuda za pripreme za državnu maturu "
+               "({ime_djeteta}) još čeka uplatu:\n\n{link_ponuda}\n\nAko ste već uplatili, zanemarite ovu poruku — "
+               "uplata će biti vidljiva u portalu Moj CAKI čim je evidentiramo.\n\n{moj_caki}" + _POTPIS},
+    {"kljuc": "matura_raspored", "program": "Matura", "vrsta": "programi/raspored", "predmet": "",
+     "tijelo": "Poštovani/a {ime_roditelja},\n\nšaljemo informacije o pripremama za državnu maturu za "
+               "{ime_djeteta}:\n\n{popis_programa}\n\nRaspored nastave (dan, vrijeme, učionica) vidi se u "
+               "portalu Moj CAKI:\n\n{moj_caki}" + _POTPIS},
+]
+
+OZNAKE_PREDLOZAKA = {
+    "ime_roditelja": "ime roditelja", "ime_djeteta": "ime i prezime djeteta", "sifra": "šifra učenika",
+    "moj_caki": "ime, šifra i osobni link na Moj CAKI (dodaje se sam ako ga nema)",
+    "popis_programa": "stavke ponude s cijenama", "link_ponuda": "link(ovi) na PDF ponude iz Sola (s ratama i rokovima)",
+    "odjeljak_termina": "Upisi: link za odabir termina (ili tekst za online); Matura: prazno",
+}
+
+
+def naslov_rucnog_maila(program: str, ime_djeteta: str, vrsta: str) -> str:
+    """Odluka 30.9.2026.: "Program, Ime Prezime djeteta, faza" — bez predmeta u naslovu."""
+    faza = MAIL_FAZA_U_NASLOVU.get(vrsta, vrsta)
+    return f"{program}, {str(ime_djeteta or '').strip()}, {faza}"
+
+
+def primatelji_maila(ucenik: dict) -> tuple:
+    """(To, Cc): To = dijete + roditelj (bez praznih i duplikata), Cc = info@ i matematika@."""
+    to = []
+    for kljuc in ("email_djeteta", "email_roditelja"):
+        e = str(ucenik.get(kljuc, "") or "").strip()
+        if e and e.lower() not in [x.lower() for x in to]:
+            to.append(e)
+    return to, list(MAIL_CC)
+
+
+def gmail_link(thread_id: str) -> str:
+    """Link koji otvara thread u Gmailu računa info@ (i kad je u pregledniku prijavljeno više računa)."""
+    return f"https://mail.google.com/mail/?authuser={GMAIL_RACUN}#all/{thread_id}" if thread_id else ""
+
+
+def load_mail_predlosci(sheet) -> pd.DataFrame:
+    """Svi predlošci; program/vrsta za stare ključeve popunjavaju se sami ako stupci još ne postoje."""
+    try:
+        df = _load_worksheet_df(sheet.worksheet(MAIL_PREDLOSCI_TAB))
+    except gspread.exceptions.WorksheetNotFound:
+        return pd.DataFrame(columns=MAIL_PREDLOSCI_HEADERS + ["_row"])
+    for h in MAIL_PREDLOSCI_HEADERS:
+        if h not in df.columns:
+            df[h] = ""
+        df[h] = df[h].astype(str).replace("nan", "")
+    for i, r in df.iterrows():
+        prog, vrsta = _VRSTA_POSTOJECIH.get(r["kljuc"], ("", ""))
+        if not r["program"] and prog:
+            df.at[i, "program"] = prog
+        if not r["vrsta"] and vrsta:
+            df.at[i, "vrsta"] = vrsta
+    return df
+
+
+def predlosci_za(df_predlosci: pd.DataFrame, program: str, vrsta: str) -> pd.DataFrame:
+    if df_predlosci.empty:
+        return df_predlosci
+    return df_predlosci[(df_predlosci["program"] == program) & (df_predlosci["vrsta"] == vrsta)]
+
+
+def osiguraj_mail_predloske(sheet) -> dict:
+    """Jednokratno (sigurno ponoviti): tab Mail_predlosci dobiva stupce program i vrsta, stari ključevi
+    dobivaju vrstu, a nedostajući PRIVREMENI predlošci se dodaju. Postojeći tekstovi se NE diraju."""
+    rez = {"dodani_stupci": [], "dodani_predlosci": [], "popunjena_vrsta": []}
+    try:
+        ws = sheet.worksheet(MAIL_PREDLOSCI_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=MAIL_PREDLOSCI_TAB, rows=100, cols=len(MAIL_PREDLOSCI_HEADERS))
+        ws.append_row(MAIL_PREDLOSCI_HEADERS)
+        rez["dodani_stupci"] = list(MAIL_PREDLOSCI_HEADERS)
+    headers = ws.row_values(1)
+    for h in MAIL_PREDLOSCI_HEADERS:
+        if h not in headers:
+            ws.update_cell(1, len(headers) + 1, h)
+            headers.append(h)
+            rez["dodani_stupci"].append(h)
+    zapisi = ws.get_all_records()
+    for i, r in enumerate(zapisi, start=2):
+        prog, vrsta = _VRSTA_POSTOJECIH.get(r.get("kljuc", ""), ("", ""))
+        polja = {}
+        if prog and not str(r.get("program", "")).strip():
+            polja["program"] = prog
+        if vrsta and not str(r.get("vrsta", "")).strip():
+            polja["vrsta"] = vrsta
+        if polja:
+            _azuriraj_polja(ws, i, polja, headers)
+            rez["popunjena_vrsta"].append(r.get("kljuc", ""))
+    postojeci = {str(r.get("kljuc", "")) for r in zapisi}
+    for p in PRIVREMENI_PREDLOSCI:
+        if p["kljuc"] not in postojeci:
+            _dodaj_red_po_nazivu(ws, p, headers)
+            rez["dodani_predlosci"].append(p["kljuc"])
+    return rez
+
+
+def spremi_mail_predlozak(sheet, kljuc: str, program: str, vrsta: str, predmet: str, tijelo: str) -> str:
+    """Upis ili izmjena predloška po ključu. Vraća 'novi' ili 'izmijenjen'."""
+    kljuc = re.sub(r"[^a-z0-9_]", "_", str(kljuc or "").strip().lower())
+    if not kljuc:
+        raise ValueError("Ključ predloška ne smije biti prazan.")
+    if vrsta not in MAIL_VRSTE:
+        raise ValueError(f"Nepoznata vrsta '{vrsta}'.")
+    if not str(tijelo or "").strip():
+        raise ValueError("Tekst predloška ne smije biti prazan.")
+    ws = sheet.worksheet(MAIL_PREDLOSCI_TAB)
+    headers = ws.row_values(1)
+    nedostaju = [h for h in MAIL_PREDLOSCI_HEADERS if h not in headers]
+    if nedostaju:
+        raise ValueError("Tab Mail_predlosci nema stupce " + ", ".join(nedostaju) +
+                         " — klikni prvo '🔧 Pripremi predloške'.")
+    polja = {"kljuc": kljuc, "program": program, "vrsta": vrsta, "predmet": predmet, "tijelo": tijelo}
+    for i, r in enumerate(ws.get_all_records(), start=2):
+        if r.get("kljuc") == kljuc:
+            _azuriraj_polja(ws, i, polja, headers)
+            return "izmijenjen"
+    _dodaj_red_po_nazivu(ws, polja, headers)
+    return "novi"
+
+
+def postavi_tab_mail_dnevnik(sheet) -> bool:
+    """Kreira tab Mail_dnevnik ako ne postoji. Vraća True ako je kreiran."""
+    if MAIL_DNEVNIK_TAB in [ws.title for ws in sheet.worksheets()]:
+        return False
+    ws = sheet.add_worksheet(title=MAIL_DNEVNIK_TAB, rows=1000, cols=len(MAIL_DNEVNIK_HEADERS))
+    ws.append_row(MAIL_DNEVNIK_HEADERS)
+    return True
+
+
+def load_mail_dnevnik(sheet) -> pd.DataFrame:
+    try:
+        df = _load_worksheet_df(sheet.worksheet(MAIL_DNEVNIK_TAB))
+    except gspread.exceptions.WorksheetNotFound:
+        return pd.DataFrame(columns=MAIL_DNEVNIK_HEADERS + ["_row"])
+    for h in MAIL_DNEVNIK_HEADERS:
+        if h not in df.columns:
+            df[h] = ""
+        df[h] = df[h].astype(str).replace("nan", "")
+    return df
+
+
+def threadovi_ucenika(df_dnevnik: pd.DataFrame, ucenik_id: str) -> list:
+    """Razgovori (threadovi) koje je CRM već poslao ovom učeniku — najnoviji prvi, svaki jednom."""
+    if df_dnevnik.empty:
+        return []
+    df = df_dnevnik[(df_dnevnik["ucenik_id"] == ucenik_id) & (df_dnevnik["status"] == "Poslano")
+                    & (df_dnevnik["gmail_thread_id"] != "")]
+    df = df.sort_values("datum_slanja", ascending=False)
+    out, vidjeni = [], set()
+    for _, r in df.iterrows():
+        if r["gmail_thread_id"] in vidjeni:
+            continue
+        vidjeni.add(r["gmail_thread_id"])
+        out.append({"thread_id": r["gmail_thread_id"], "predmet": r["predmet"], "datum": r["datum_slanja"],
+                    "vrsta": r["vrsta"], "link": r["gmail_link"] or gmail_link(r["gmail_thread_id"])})
+    return out
+
+
+def _datum_kratko(v) -> str:
+    d = pd.to_datetime(prikazi_datum(v) or None, errors="coerce")
+    return "" if pd.isna(d) else f"{d.day}.{d.month}.{d.year}."
+
+
+def zamjene_za_rucni_mail(ucenik: dict, df_racuni: pd.DataFrame, program: str,
+                          portal_url: str, online: bool = False) -> dict:
+    """Vrijednosti za {oznake} u ručnom mailu. link_ponuda/popis_programa dolaze iz poslanih a neplaćenih
+    ponuda (status Poslano ili Isteklo) tog programa u Racuni_i_ponude — isti oblik kao automatski mail."""
+    uid = str(ucenik.get("ucenik_id", ""))
+    ime = str(ucenik.get("ime_djeteta", "") or "")
+    z = {
+        "ime_roditelja": str(ucenik.get("ime_roditelja", "") or ""),
+        "ime_djeteta": ime, "sifra": uid,
+        "moj_caki": tekst_moj_caki(ime, uid, portal_url),
+        "popis_programa": "", "link_ponuda": "", "odjeljak_termina": "",
+    }
+    if program == "Upisi":
+        if online:
+            z["odjeljak_termina"] = ("Budući da pratite nastavu isključivo online, ne trebate birati termin — "
+                                     "možete se pridružiti bilo kojem terminu grupe koja vam odgovara.")
+        else:
+            z["odjeljak_termina"] = (f"Termin nastave birate ovdje (link je personaliziran za {ime}):\n"
+                                     f"{str(portal_url).rstrip('/')}/?ucenik_id={uid}\n\n"
+                                     f"Rezervaciju termina potrebno je potvrditi uplatom u roku od "
+                                     f"{REZERVACIJA_ROK_DANA} dana, nakon čega mjesto može biti ponuđeno "
+                                     f"sljedećem djetetu na listi čekanja.")
+    if df_racuni is None or df_racuni.empty or "status" not in df_racuni.columns:
+        return z
+    dok = df_racuni[(df_racuni["ucenik_id"].astype(str) == uid)
+                    & (df_racuni.get("program_tip", "").astype(str) == program)
+                    & (df_racuni["status"].isin(["Poslano", "Isteklo"]))]
+    if dok.empty:
+        return z
+    grupe = {}
+    for _, r in dok.iterrows():
+        g = str(r.get("rata_grupa_id", "") or "").strip()
+        g = r["dokument_id"] if g in ("", "nan") else g
+        grupe.setdefault(g, []).append(r)
+    linkovi, popisi = [], []
+    for g, retci in grupe.items():
+        retci.sort(key=lambda r: float(r.get("rata_broj") or 0) if str(r.get("rata_broj", "")) not in ("", "nan") else 0)
+        prvi = retci[0]
+        izvorne = parsiraj_stavke(prvi.get("stavke_izvorno_json", "")) or parsiraj_stavke(prvi.get("stavke_snapshot_json", ""))
+        if izvorne:
+            popisi.append(popis_programa_za_mail(izvorne))
+        for r in retci:
+            link = str(r.get("link_pdf", "") or "")
+            ukupno = str(r.get("rata_ukupno_u_grupi", "") or "")
+            if ukupno not in ("", "nan", "0", "1", "1.0") and len(retci) > 1:
+                rok = _datum_kratko(r.get("rok_placanja", ""))
+                broj = str(r.get("rata_broj", "")).replace(".0", "")
+                linkovi.append(f"Rata {broj}/{ukupno.replace('.0', '')} — za uplatu "
+                               f"{centi_u_tekst(u_cente(r.get('iznos_ukupno')) or 0)} €"
+                               + (f" (rok {rok})" if rok else "") + f":\n{link}")
+            else:
+                linkovi.append(link)
+    z["link_ponuda"] = "\n\n".join(l for l in linkovi if l)
+    z["popis_programa"] = "\n".join(p for p in popisi if p)
+    return z
+
+
+def popuni_rucni_mail(tijelo: str, zamjene: dict, vrsta: str = "") -> str:
+    """Tekst maila spreman za slanje. Ime, šifra i Moj CAKI uvijek su u mailu (pravilo 27.9.2026.);
+    kod ponude i podsjetnika link na ponudu se doda na kraj ako je {link_ponuda} obrisan."""
+    t = str(tijelo or "")
+    if vrsta in ("ponuda", "podsjetnik") and "{link_ponuda}" not in t and zamjene.get("link_ponuda"):
+        t += "\n\nPonuda za uplatu:\n{link_ponuda}"
+    if "{moj_caki}" not in t:
+        t += "\n\n{moj_caki}"
+    t = popuni_mail_pregled(t, zamjene)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
+def provjeri_rucni_mail(to: list, predmet: str, tijelo: str, nacin: str, thread: str, vrsta: str = "",
+                        ima_ponudu: bool = True) -> list:
+    """Popis prepreka slanju (prazan = smije se poslati)."""
+    greske = []
+    if not to:
+        greske.append("Nema email adrese djeteta ni roditelja (upiši je gore i spremi).")
+    for e in to:
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", e):
+            greske.append(f"Neispravna email adresa: {e}")
+    if nacin == NACIN_NOVI and not str(predmet or "").strip():
+        greske.append("Naslov maila je prazan.")
+    if not str(tijelo or "").strip():
+        greske.append("Tekst maila je prazan.")
+    ostaci = re.findall(r"\{[a-z_]+\}", str(tijelo or ""))
+    if ostaci:
+        greske.append("U tekstu su ostale nepopunjene oznake: " + ", ".join(sorted(set(ostaci))))
+    if nacin == NACIN_ODGOVOR and not str(thread or "").strip():
+        greske.append("Odaberi razgovor (thread) na koji se odgovara.")
+    if vrsta in ("ponuda", "podsjetnik") and not ima_ponudu:
+        greske.append("U mailu nema linka na ponudu — ovaj učenik nema poslanu (neplaćenu) ponudu u 💶 Financije "
+                      "za odabrani program. Pošalji ponudu u Solo ili odaberi drugu vrstu maila.")
+    return greske
+
+
+def zatrazi_slanje_maila(sheet, ucenik: dict, program: str, vrsta: str, predlozak: str, nacin: str,
+                         thread: str, predmet: str, tijelo: str, poslao: str = "", ima_ponudu: bool = True) -> str:
+    """Upisuje zahtjev u Mail_dnevnik (status 'Za slanje'); šalje ga Apps Script u roku ~1 min.
+    Zaštita od dvostrukog klika: isti tekst istom učeniku koji još čeka slanje se ne upisuje ponovno."""
+    to, cc = primatelji_maila(ucenik)
+    greske = provjeri_rucni_mail(to, predmet, tijelo, nacin, thread, vrsta, ima_ponudu)
+    if greske:
+        raise ValueError(" ".join(greske))
+    postavi_tab_mail_dnevnik(sheet)
+    ws = sheet.worksheet(MAIL_DNEVNIK_TAB)
+    headers = ws.row_values(1)
+    uid = str(ucenik.get("ucenik_id", ""))
+    for r in ws.get_all_records():
+        if (str(r.get("ucenik_id")) == uid and r.get("status") in STATUSI_U_TIJEKU
+                and str(r.get("tijelo", "")).strip() == str(tijelo).strip()):
+            raise ValueError("Isti mail ovom učeniku već čeka slanje (dvostruki klik?) — pričekaj minutu.")
+    mail_id = "M-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    _dodaj_red_po_nazivu(ws, {
+        "mail_id": mail_id, "datum_zahtjeva": sada_zagreb().strftime("%Y-%m-%d %H:%M:%S"),
+        "ucenik_id": uid, "ime_djeteta": str(ucenik.get("ime_djeteta", "")), "program": program,
+        "vrsta": vrsta, "predlozak": predlozak, "nacin": nacin,
+        "odgovor_na_thread": thread if nacin == NACIN_ODGOVOR else "",
+        "prima": ", ".join(to), "kopija": ", ".join(cc), "predmet": str(predmet or "").strip(),
+        "tijelo": str(tijelo), "status": STATUS_ZA_SLANJE, "poslao": poslao,
+    }, headers)
+    return mail_id
+
+
+def otkazi_zahtjev_maila(sheet, mail_id: str) -> bool:
+    """Zahtjev koji još čeka ('Za slanje') → 'Otkazano'. Već poslani mail se ne može opozvati."""
+    ws = sheet.worksheet(MAIL_DNEVNIK_TAB)
+    headers = ws.row_values(1)
+    for i, r in enumerate(ws.get_all_records(), start=2):
+        if r.get("mail_id") == mail_id:
+            if r.get("status") != STATUS_ZA_SLANJE:
+                return False
+            _azuriraj_polja(ws, i, {"status": "Otkazano"}, headers)
+            return True
+    return False
