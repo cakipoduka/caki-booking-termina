@@ -3415,6 +3415,9 @@ def stanje_predmeta(red, dok_po_retku: dict) -> dict:
     prof = vanjski_profesor(red)
     if prof:
         return {"kod": "vanjski", "oznaka": f"🧪 {prof} — bez ponude (0 €)", "uredivo": False}
+    if str(red.get("program_tip", "") or "").strip() == "Instrukcije" and status not in ("Čeka poziv", "Čeka"):
+        # 2.10.2026.: instrukcije nemaju ponudu iz prijave — naplata ide po održanim terminima (📝 Instrukcije)
+        return {"kod": "instrukcije", "oznaka": "📝 Instrukcije — naplata po održanim terminima", "uredivo": False}
     dok = dok_po_retku.get(rid) if rid else None
     if dok:
         s, broj = dok["status"], dok["broj_dokumenta"]
@@ -3512,6 +3515,9 @@ def posalji_predmete_u_financije(sheet, redak_ids: list, subjekt: str) -> int:
         broj, red = retci[rid]
         if not stanje_predmeta(red, dok)["uredivo"] or red.get("status_kontakta") == "Otkazano":
             preskoceno.append(rid)
+            continue
+        if str(red.get("program_tip", "") or "").strip() == "Instrukcije":
+            izmjene[broj] = {"status_kontakta": "Potvrdio"}   # 2.10.2026.: samo potvrda, bez nacrta ponude
             continue
         izmjene[broj] = {"status_kontakta": "Potvrdio", "solo_racun": subjekt, "posalji_nakon": sada}
     if not izmjene:
@@ -3780,3 +3786,75 @@ def provjeri_whatsapp(tekst: str) -> list:
         upoz.append("U poruci je još „[OVDJE ZALIJEPI LINK …]” — zalijepi pravi link (najbolje trajno u "
                     "⚙️ Postavke → 📲 WhatsApp predlošci).")
     return upoz
+
+
+# ============================================================
+# 💬 PORUKA IZ PRIJAVNICE ("Vaše pitanje ili poruka za nas.") — 2.10.2026.
+# ============================================================
+# Matura: onFormSubmit upisuje poruku u Prijave.napomena kao "💬 …" (od 2.10.; stare dopunjava
+# ▶ dopuniPorukeIzForme). Upisi: poruka je u tabu "Form responses 1" (Upisi forma piše u CRM Sheet)
+# → povezuje se s učenikom po imenu djeteta (+ email roditelja ako ima više istih imena).
+FORM_UPISI_TAB = "Form responses 1"
+PORUKA_ZNAK = "💬"
+
+
+def _norm(t) -> str:
+    return re.sub(r"\s+", " ", str(t or "")).strip().lower()
+
+
+def load_form_upisi(sheet) -> pd.DataFrame:
+    """Odgovori Upisi forme iz CRM Sheeta (samo čitanje). Prazno ako taba nema."""
+    try:
+        v = sheet.worksheet(FORM_UPISI_TAB).get_all_values()
+    except gspread.exceptions.WorksheetNotFound:
+        return pd.DataFrame()
+    if not v:
+        return pd.DataFrame()
+    h = [str(x).strip() for x in v[0]]
+    return pd.DataFrame([list(r) + [""] * (len(h) - len(r)) for r in v[1:]], columns=h)
+
+
+def _stupac_koji_sadrzi(df: pd.DataFrame, *dijelovi) -> str:
+    for c in df.columns:
+        if all(d in _norm(c) for d in dijelovi):
+            return c
+    return ""
+
+
+def poruke_ucenika(df_prijave: pd.DataFrame, df_form: pd.DataFrame, df_ucenici: pd.DataFrame) -> dict:
+    """ucenik_id → popis poruka iz prijavnice (bez duplikata, redom kako su stigle)."""
+    out = {}
+
+    def dodaj(uid, tekst):
+        tekst = str(tekst or "").strip()
+        if uid and tekst and tekst not in out.setdefault(uid, []):
+            out[uid].append(tekst)
+
+    if df_prijave is not None and not df_prijave.empty and "napomena" in df_prijave.columns:
+        for _, r in df_prijave.iterrows():
+            for dio in str(r.get("napomena", "") or "").split(" | "):
+                dio = dio.strip()
+                if dio.startswith(PORUKA_ZNAK):
+                    dodaj(str(r["ucenik_id"]), dio[len(PORUKA_ZNAK):].strip())
+    if df_form is None or df_form.empty or df_ucenici is None or df_ucenici.empty:
+        return out
+    c_por = _stupac_koji_sadrzi(df_form, "pitanje ili poruka")
+    c_ime = _stupac_koji_sadrzi(df_form, "ime i prezime djeteta")
+    c_mail = _stupac_koji_sadrzi(df_form, "e-mail", "roditelja")
+    if not c_por or not c_ime:
+        return out
+    po_imenu = {}
+    for _, u in df_ucenici.iterrows():
+        po_imenu.setdefault(_norm(u.get("ime_djeteta", "")), []).append(u)
+    for _, f in df_form.iterrows():
+        poruka = str(f.get(c_por, "") or "").strip()
+        if not poruka:
+            continue
+        kandidati = po_imenu.get(_norm(f.get(c_ime, "")), [])
+        if len(kandidati) > 1 and c_mail:
+            mail = _norm(f.get(c_mail, ""))
+            uz_mail = [u for u in kandidati if _norm(u.get("email_roditelja", "")) == mail]
+            kandidati = uz_mail or kandidati
+        if len(kandidati) == 1:
+            dodaj(str(kandidati[0]["ucenik_id"]), poruka)
+    return out
