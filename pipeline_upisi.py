@@ -54,7 +54,7 @@ REZERVACIJA_ROK_DANA = 5
 # Koliko sati nakon telefonske potvrde ("Potvrdio") ponuda smije krenuti (§23.6: jedinstveno 36h
 # za sve programe, odluka 22.9.2026.). Mijenja se samo ovdje.
 # 1.10.2026.: 0 (bilo 36) — ponuda ionako ne ide u Solo bez pregleda i klika u 💶 Financije,
-# pa nema razloga čekati; nacrt se pojavi u roku ~1 min nakon "Potvrdio".
+# pa nema razloga čekati; nacrt se pojavi u roku ~5 min nakon "Potvrdio" (trigger sastaviNacrte).
 POSALJI_NAKON_SATI = 0
 
 # Streamlit Cloud radi u UTC vremenu, a Apps Script u zagrebačkom — sva vremena koja
@@ -964,7 +964,7 @@ def postavi_solo_racun(sheet, row_number: int, subjekt: str):
 
 def posalji_ponudu_odmah(sheet, row_number: int):
     """Postavlja status_kontakta na 'Potvrdio' i posalji_nakon na sada — Apps Script
-    sastaviNacrte (svake minute) od toga napravi NACRT u 💶 Financije. Ništa ne ide u Solo
+    sastaviNacrte (svakih 5 min) od toga napravi NACRT u 💶 Financije. Ništa ne ide u Solo
     bez admin pregleda i klika "✅ Pošalji"."""
     ws = sheet.worksheet("Prijave")
     headers = ws.row_values(1)
@@ -3017,3 +3017,198 @@ def otkazi_zahtjev_maila(sheet, mail_id: str) -> bool:
             _azuriraj_polja(ws, i, {"status": "Otkazano"}, headers)
             return True
     return False
+
+
+# ============================================================
+# 🆕 1.10.2026. — A) ♻️ VRATI U NACRT  ·  B) DODAJ/UKLONI PREDMET IZRAVNO U NACRTU
+# Cilj: ispravak tijekom razgovora s roditeljem bez ponovnog prolaska kroz
+# "dodaj komponentu → Potvrdio → Pošalji ponudu".
+# ============================================================
+
+STATUSI_ZA_VRACANJE = ("Otkazano", "Obrisano")
+OZNAKA_VRACENO = "♻️ Vraćeno iz"
+
+# Šifra iz Solo kataloga → Matura predmet i razina (obrnuto od MATURA_SIFRA_PREDMETA u CAKI_financije.gs)
+MATURA_SIFRA_U_PREDMET = {
+    "MATURA-HRV": ("hrvatski", ""),
+    "MATURA-MAT-A": ("matematika", "A"), "MATURA-MAT-B": ("matematika", "B"),
+    "MATURA-ENG-A": ("engleski", "A"), "MATURA-ENG-B": ("engleski", "B"),
+    "MATURA-FIZ": ("fizika", ""), "MATURA-FIZ-MED": ("fizika_medicina", ""),
+}
+
+
+def _cisto(v) -> str:
+    return "" if v is None or (isinstance(v, float) and math.isnan(v)) or str(v) == "nan" else str(v)
+
+
+def vec_vraceno(df_racuni: pd.DataFrame, dokument_id: str) -> bool:
+    """Je li iz ovog (otkazanog/obrisanog) dokumenta već napravljen novi nacrt?"""
+    if df_racuni.empty or "upozorenja" not in df_racuni.columns:
+        return False
+    return df_racuni["upozorenja"].astype(str).str.contains(f"{OZNAKA_VRACENO} {dokument_id}", regex=False).any()
+
+
+def dokumenti_za_vracanje(df_racuni: pd.DataFrame) -> pd.DataFrame:
+    """Otkazani/obrisani Upisi i Matura dokumenti (po jedan red po grupi rata) koji još nisu vraćeni.
+    Instrukcije se NE vraćaju ovako (njihovi termini se pri odbacivanju već vraćaju u obračun)."""
+    if df_racuni.empty or "status" not in df_racuni.columns:
+        return df_racuni
+    df = df_racuni[df_racuni["status"].isin(STATUSI_ZA_VRACANJE)
+                   & df_racuni["program_tip"].isin(["Upisi", "Matura"])].copy()
+    if df.empty:
+        return df
+    df["_grupa"] = [(_cisto(g) or d) for g, d in zip(df.get("rata_grupa_id", ""), df["dokument_id"])]
+    df = df.drop_duplicates("_grupa")
+    return df[[not vec_vraceno(df_racuni, d) for d in df["dokument_id"]]]
+
+
+def vrati_u_nacrt(sheet, df_racuni: pd.DataFrame, red) -> str:
+    """A) ♻️ Otkazani/obrisani dokument (sa svim ratama) → NOVI nacrt s istim stavkama, subjektom,
+    načinom uplate i napomenom. Ništa ne ide u Solo; admin ga ispravi i pošalje kao i svaki nacrt.
+    Prijave tih predmeta koje su bile Otkazano/Odustao vraćaju se u Potvrdio. Vraća novi dokument_id."""
+    red = red.to_dict() if hasattr(red, "to_dict") else dict(red)
+    grupa = dokumenti_grupe(df_racuni, pd.Series(red)).copy()
+    if not grupa["status"].isin(STATUSI_ZA_VRACANJE).all():
+        raise ValueError("Vratiti u nacrt mogu se samo Otkazani ili Obrisani dokumenti (sve rate).")
+    if any(vec_vraceno(df_racuni, d) for d in grupa["dokument_id"]):
+        raise ValueError("Ovaj dokument je već vraćen u nacrt — pogledaj tab 🟡 Čeka odobrenje.")
+    grupa["_k"] = pd.to_numeric(grupa.get("rata_broj", 1), errors="coerce").fillna(1)
+    grupa = grupa.sort_values("_k")
+    prvi = grupa.iloc[0].to_dict()
+    stavke = parsiraj_stavke(_cisto(prvi.get("stavke_izvorno_json")) or prvi.get("stavke_snapshot_json"))
+    if not stavke:
+        raise ValueError("Dokument nema zapisane stavke — napravi novu ponudu.")
+    stavke = preracunaj_stavke(stavke)
+    izvori = []
+    for v in grupa.get("izvorni_redci", []):
+        for s_ in sifre_izvora(_cisto(v)):
+            if s_ not in izvori:
+                izvori.append(s_)
+    stari = ", ".join(grupa["dokument_id"])
+    upoz = f"{OZNAKA_VRACENO} {stari}. Provjeri stavke, popust i rate pa pošalji."
+    if len(grupa) > 1:
+        upoz += f" Prije: NA RATE ({len(grupa)})."
+
+    novi_id = "D-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    ws = sheet.worksheet(LEDGER_TAB)
+    _dodaj_red_po_nazivu(ws, {
+        "dokument_id": novi_id, "ucenik_id": _cisto(prvi.get("ucenik_id")), "ime_djeteta": _cisto(prvi.get("ime_djeteta")),
+        "program_tip": _cisto(prvi.get("program_tip")), "solo_racun": _cisto(prvi.get("solo_racun")),
+        "tip_dokumenta": _cisto(prvi.get("tip_dokumenta")) or "Ponuda", "status": "Nacrt",
+        "iznos_ukupno": zbroj_stavki_centi(stavke) / 100,
+        "stavke_snapshot_json": json.dumps(stavke, ensure_ascii=False),
+        "izvorni_redci": ",".join(izvori), "nacin_uplate": _cisto(prvi.get("nacin_uplate")) or 1,
+        "napomena": _cisto(prvi.get("napomena")), "datum_kreiranja": sada_zagreb().strftime("%Y-%m-%d %H:%M:%S"),
+        "upozorenja": upoz,
+    })
+    # Prijave koje su pri otkazivanju označene Otkazano/Odustao → opet Potvrdio
+    rids = [s_[2:] for s_ in izvori if s_.startswith("P:")]
+    if rids:
+        wp = sheet.worksheet("Prijave")
+        hp = wp.row_values(1)
+        for i, r in enumerate(wp.get_all_records(), start=2):
+            if str(r.get("redak_id")) in rids and r.get("status_kontakta") in ("Otkazano", "Odustao"):
+                _azuriraj_polja(wp, i, {"status_kontakta": "Potvrdio"}, hp)
+    return novi_id
+
+
+def sifre_izvora(izvorni_redci: str) -> list:
+    return [s_.strip() for s_ in str(izvorni_redci or "").split(",") if s_.strip()]
+
+
+def stavke_cjenika_za_nacrt(df_cjenik: pd.DataFrame, program: str, subjekt: str = "") -> list:
+    """B) Ponuda za "➕ Dodaj iz Cjenika": stavke tog programa (MATURA-… / UPISI-…), samo one koje su u Solu.
+    Ako je subjekt odabran, prednost imaju njegove cijene. [{sifra, opis, centi}] po šifri, abecedno po nazivu."""
+    if df_cjenik is None or df_cjenik.empty or "sifra" not in df_cjenik.columns:
+        return []
+    pref = {"Matura": "MATURA-", "Upisi": "UPISI-"}.get(program, "")
+    if not pref:
+        return []
+    df = df_cjenik[df_cjenik["sifra"].astype(str).str.startswith(pref)]
+    if "u_solu" in df.columns:
+        df = df[df["u_solu"].astype(str) != "Ne"]
+    out = {}
+    for _, r in df.iterrows():
+        sifra = str(r["sifra"])
+        centi = u_cente(r.get("cijena"))
+        if centi is None:
+            continue
+        zapis = {"sifra": sifra, "opis": _cisto(r.get("opis")).strip() or sifra, "centi": centi}
+        if sifra not in out or (subjekt and r.get("subjekt") == subjekt):
+            out[sifra] = zapis
+    return sorted(out.values(), key=lambda z: z["opis"].lower())
+
+
+def dodaj_stavku_u_nacrt(sheet, red: dict, sifra: str, opis: str, centi: int, popust: float = 0) -> str:
+    """B) ➕ Predmet/komponenta izravno u nacrt. Za poznate šifre nastaje i redak u Prijave (Potvrdio),
+    da predmet postoji i za raspored/dolazke — i odmah je vezan uz OVAJ nacrt, pa ga Assembler ne
+    ubacuje u novi. Vraća redak_id nove prijave ili '' (stavka bez prijave, npr. simulacija)."""
+    red = red.to_dict() if hasattr(red, "to_dict") else dict(red)
+    if red.get("status") not in ("Nacrt", "Greška"):
+        raise ValueError("Stavke se mogu dodavati samo u nacrt.")
+    program = red.get("program_tip")
+    redak_id = ""
+    prijava = {}
+    if program == "Matura" and sifra in MATURA_SIFRA_U_PREDMET:
+        predmet, razina = MATURA_SIFRA_U_PREDMET[sifra]
+        prijava = {"program_tip": "Matura", "predmet": predmet, "razina_ispita": razina,
+                   "stupanj_skolovanja": "Srednja škola"}
+    elif program == "Upisi" and sifra.startswith("UPISI-") and sifra != "UPISI-SIM":
+        prijava = {"program_tip": "Upisi", "komponenta": sifra[len("UPISI-"):]}
+    if prijava:
+        redak_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+
+    ws = sheet.worksheet(LEDGER_TAB)
+    headers = ws.row_values(1)
+    stavke = parsiraj_stavke(red.get("stavke_snapshot_json"))
+    stavke.append({"sifra": sifra, "opis": opis, "kolicina": 1, "cijena_bazna": centi_u_tekst(centi),
+                   "popust_postotak": float(popust or 0), "izvor": f"P:{redak_id}" if redak_id else ""})
+    stavke = preracunaj_stavke(stavke)
+    izvori = sifre_izvora(_cisto(red.get("izvorni_redci")))
+    if redak_id:
+        izvori.append(f"P:{redak_id}")
+    # PRVO nacrt (izvorni_redci), PA prijava — tako je Assembler nikad ne vidi kao "slobodnu"
+    _azuriraj_polja(ws, int(red["_row"]), {
+        "stavke_snapshot_json": json.dumps(stavke, ensure_ascii=False),
+        "iznos_ukupno": zbroj_stavki_centi(stavke) / 100,
+        "izvorni_redci": ",".join(izvori),
+    }, headers)
+    if redak_id:
+        wp = sheet.worksheet("Prijave")
+        sada = sada_zagreb().strftime("%Y-%m-%d %H:%M:%S")
+        _dodaj_red_po_nazivu(wp, {
+            "redak_id": redak_id, "ucenik_id": _cisto(red.get("ucenik_id")), "ime_djeteta": _cisto(red.get("ime_djeteta")),
+            "status_kontakta": "Potvrdio", "rani_ispit": "Ne", "timestamp_prijave": sada, "posalji_nakon": sada,
+            "sezona": SEZONA, "solo_racun": _cisto(red.get("solo_racun")),
+            "napomena": f"➕ dodano izravno u nacrt {red.get('dokument_id')}", **prijava,
+        })
+    return redak_id
+
+
+def uklonjeni_izvori(red: dict, nove_stavke: list) -> list:
+    """B) Prijave (redak_id) koje su bile u nacrtu, a admin je njihovu stavku obrisao u tablici."""
+    red = red.to_dict() if hasattr(red, "to_dict") else dict(red)
+    u_nacrtu = [s_[2:] for s_ in sifre_izvora(_cisto(red.get("izvorni_redci"))) if s_.startswith("P:")]
+    ostale = {str(s_.get("izvor", ""))[2:] for s_ in nove_stavke if str(s_.get("izvor", "")).startswith("P:")}
+    # Samo ako je stavka TOG izvora i prije postojala u nacrtu (stari nacrti nemaju izvor po stavci)
+    prije = {str(s_.get("izvor", ""))[2:] for s_ in parsiraj_stavke(red.get("stavke_snapshot_json"))
+             if str(s_.get("izvor", "")).startswith("P:")}
+    return [r for r in u_nacrtu if r in prije and r not in ostale]
+
+
+def otkazi_uklonjene_prijave(sheet, redak_ids: list, dokument_id: str) -> int:
+    """B) Prijava čiju je stavku admin uklonio iz nacrta → Otkazano (ostaje vezana uz nacrt, pa se ne vraća sama)."""
+    if not redak_ids:
+        return 0
+    wp = sheet.worksheet("Prijave")
+    hp = wp.row_values(1)
+    n = 0
+    for i, r in enumerate(wp.get_all_records(), start=2):
+        if str(r.get("redak_id")) in redak_ids and r.get("status_kontakta") not in ("Otkazano", "Odustao"):
+            polja = {"status_kontakta": "Otkazano"}
+            if "napomena" in hp:
+                stara = str(r.get("napomena", "") or "")
+                polja["napomena"] = (stara + " | " if stara else "") + f"uklonjeno iz nacrta {dokument_id}"
+            _azuriraj_polja(wp, i, polja, hp)
+            n += 1
+    return n
