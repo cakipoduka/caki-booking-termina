@@ -1192,6 +1192,117 @@ def load_racuni(sheet) -> pd.DataFrame:
         return pd.DataFrame(columns=["dokument_id", "ucenik_id", "status", "_row"])
 
 
+# ============================================================
+# PDV PRAG (1.10.2026.) — koliko je računa izdano po subjektu u kalendarskoj godini
+# ============================================================
+# Tab PDV_prag puni Apps Script CAKI_pdv_prag.gs (svaki sat, samo čita Solo): jedan red po
+# subjekt × godina × mjesec (iznos u centima) + red mjesec=0 za tekuću godinu (znak da je provjereno).
+# Ovdje je samo izračun za prikaz — bez poziva Sola.
+PDV_PRAG_TAB = "PDV_prag"
+PDV_PRAG_CENTI = 60_000_00          # prag za ulazak u sustav PDV-a (od 1.1.2025.)
+PDV_ZUTO_CENTI = 50_000_00          # Cakijeva odluka 1.10.2026.: žuto od 50.000 €
+PDV_CRVENO_CENTI = 57_000_00        # crveno od 57.000 €
+PDV_SUBJEKTI_BEZ_PRAGA: list = []   # subjekt koji JE u sustavu PDV-a: samo promet, bez limita
+_PDV_STUPCI = ["subjekt", "godina", "mjesec", "broj_racuna", "iznos_centi", "zadnji_racun", "osvjezeno", "greska"]
+
+
+def load_pdv_prag(sheet) -> pd.DataFrame:
+    try:
+        return _load_df_neformatirano(sheet.worksheet(PDV_PRAG_TAB))
+    except gspread.exceptions.WorksheetNotFound:
+        return pd.DataFrame(columns=_PDV_STUPCI)
+
+
+def _int0(v) -> int:
+    try:
+        if v is None or (isinstance(v, float) and math.isnan(v)) or str(v).strip() == "":
+            return 0
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def pdv_razina(ukupno_centi: int) -> str:
+    if ukupno_centi > PDV_PRAG_CENTI:
+        return "prekoračeno"
+    if ukupno_centi >= PDV_CRVENO_CENTI:
+        return "crveno"
+    if ukupno_centi >= PDV_ZUTO_CENTI:
+        return "žuto"
+    return "zeleno"
+
+
+def izracunaj_pdv_prag(df: pd.DataFrame, danas: date, subjekti: list | None = None) -> list:
+    """Po subjektu: izdano ove godine, preostalo do praga, razina upozorenja i procjena do 31.12.
+
+    Procjena: ako postoje računi iz prošle godine → ovogodišnje + ono što je prošle godine izdano
+    od današnjeg dana do kraja godine (poduka je sezonska, pa je to točnije od prosjeka);
+    inače linearno (prosjek po danu × dana u godini), tek nakon 30 dana u godini."""
+    import calendar
+    subjekti = subjekti if subjekti is not None else SOLO_SUBJEKTI
+    g = danas.year
+    dan_u_godini = danas.timetuple().tm_yday
+    dana_u_godini = 366 if calendar.isleap(g) else 365
+    dana_u_mjesecu = calendar.monthrange(g, danas.month)[1]
+
+    if df is None or df.empty or "subjekt" not in df.columns:
+        df = pd.DataFrame(columns=_PDV_STUPCI)
+    d = df.copy()
+    for k in _PDV_STUPCI:
+        if k not in d.columns:
+            d[k] = ""
+    d["_g"] = d["godina"].apply(_int0)
+    d["_m"] = d["mjesec"].apply(_int0)
+    d["_c"] = d["iznos_centi"].apply(_int0)
+    d["_n"] = d["broj_racuna"].apply(_int0)
+
+    def _tekstovi(serija):
+        return [str(x).strip() for x in serija.fillna("") if str(x).strip() not in ("", "nan")]
+
+    rez = []
+    for s in subjekti:
+        ds = d[d["subjekt"].astype(str).str.strip() == s]
+        provjereno = not ds[(ds["_g"] == g) & pd.to_numeric(ds["mjesec"], errors="coerce").notna()].empty
+        tek = ds[(ds["_g"] == g) & ds["_m"].between(1, 12)]
+        pro = ds[(ds["_g"] == g - 1) & ds["_m"].between(1, 12)]
+        ukupno = int(tek["_c"].sum())
+        mjesecno = {m: int(tek.loc[tek["_m"] == m, "_c"].sum()) for m in range(1, 13)}
+        pro_mj = {m: int(pro.loc[pro["_m"] == m, "_c"].sum()) for m in range(1, 13)}
+        proslo_ukupno = int(pro["_c"].sum())
+
+        if proslo_ukupno > 0:
+            ostatak = sum(pro_mj[m] for m in range(danas.month + 1, 13))
+            ostatak += pro_mj[danas.month] * (1 - danas.day / dana_u_mjesecu)
+            procjena, nacin = int(round(ukupno + ostatak)), "po prošlogodišnjem ritmu"
+        elif dan_u_godini >= 30 and ukupno > 0:
+            procjena, nacin = int(round(ukupno / dan_u_godini * dana_u_godini)), "prosjek po danu"
+        else:
+            procjena, nacin = None, ""
+
+        bez_praga = s in PDV_SUBJEKTI_BEZ_PRAGA
+        zadnji = _tekstovi(tek["zadnji_racun"])
+        osv = _tekstovi(ds["osvjezeno"])
+        rez.append({
+            "subjekt": s,
+            "provjereno": provjereno,
+            "greska": "; ".join(dict.fromkeys(_tekstovi(ds["greska"]))),
+            "ukupno_centi": ukupno,
+            "broj_racuna": int(tek["_n"].sum()),
+            "preostalo_centi": max(PDV_PRAG_CENTI - ukupno, 0),
+            "postotak": min(max(ukupno, 0) / PDV_PRAG_CENTI, 1.0),
+            "razina": "bez praga" if bez_praga else pdv_razina(ukupno),
+            "procjena_centi": procjena,
+            "procjena_nacin": nacin,
+            "procjena_preko": procjena is not None and procjena > PDV_PRAG_CENTI and not bez_praga,
+            "proslo_ukupno_centi": proslo_ukupno,
+            "proslo_preko": proslo_ukupno > PDV_PRAG_CENTI and not bez_praga,
+            "mjesecno_centi": mjesecno,
+            "zadnji_racun": max(zadnji) if zadnji else "",
+            "osvjezeno": max(osv) if osv else "",
+        })
+    return rez
+
+
 def _azuriraj_polja(ws, row_number: int, polja: dict, headers: list | None = None):
     """Više ćelija jednog retka u JEDNOM API pozivu, RAW (Sheets ne 'pametuje' vrijednosti)."""
     headers = headers or ws.row_values(1)
@@ -3239,3 +3350,273 @@ def otkazi_uklonjene_prijave(sheet, redak_ids: list, dokument_id: str) -> int:
             _azuriraj_polja(wp, i, polja, hp)
             n += 1
     return n
+
+
+# ============================================================
+# PREDMETI NA KARTICI UČENIKA — "jedna kartica, jedan klik" (2.10.2026.)
+# ============================================================
+# Stranice Prijave i Učenici su spojene: predmeti se potvrđuju/otkazuju na kartici učenika i
+# odabrani se JEDNIM upisom šalju u 💶 Financije (Apps Script sastaviNacrte od toga napravi
+# JEDAN nacrt po subjektu). Svaki zapis prvo svježe pročita Sheet — dvostruki klik ne može
+# poslati isti predmet dvaput, a predmet koji je već u Financijama više se ne može mijenjati ovdje.
+# Kemija / biologija (i medicinske) za Maturu predaju i naplaćuju vanjski profesori:
+# bez Solo ponude (0 €), ne smetaju na kartici, a admin im šalje popis učenika.
+
+VANJSKI_PREDMETI = {
+    "kemija": "Ivica", "kemija_medicina": "Ivica",
+    "biologija": "Mirela", "biologija_medicina": "Mirela",
+}
+VANJSKI_PROFESORI = ["Ivica", "Mirela"]
+STATUSI_PREDMETA = ["Čeka poziv", "Čeka", "Potvrdio", "Otkazano"]
+OZNAKE_STATUSA_PREDMETA = {"Čeka poziv": "📞 Čeka poziv", "Čeka": "⏳ Čeka", "Potvrdio": "✅ Potvrdio",
+                           "Otkazano": "❌ Otkazao"}
+STATUSI_NEAKTIVNI = ["Otkazano", "Odustao"]
+_DOK_U_FINANCIJAMA = ["Nacrt", "Odobreno", "Šalje se…", "Greška"]
+_DOK_POSLAN = ["Poslano", "Isteklo"]
+_DOK_UGASEN = ["Za brisanje", "Obrisano", "Brisanje nije uspjelo", "Otkazano"]
+
+
+def vanjski_profesor(red) -> str:
+    """'Ivica' / 'Mirela' za Matura kemiju/biologiju (i medicinske), inače ''."""
+    if str(red.get("program_tip", "") or "").strip() != "Matura":
+        return ""
+    return VANJSKI_PREDMETI.get(str(red.get("predmet", "") or "").strip(), "")
+
+
+def je_ceka_poziv(red) -> bool:
+    """Redak koji stvarno čeka poziv (vanjski predmeti se ne broje — njih ne zovemo radi ponude)."""
+    return str(red.get("status_kontakta", "")).strip() == "Čeka poziv" and not vanjski_profesor(red)
+
+
+def dokumenti_po_retku(df_racuni: pd.DataFrame) -> dict:
+    """redak_id Prijave → najnoviji dokument koji ga sadrži: {status, broj_dokumenta, dokument_id}."""
+    out = {}
+    if df_racuni is None or df_racuni.empty or "izvorni_redci" not in df_racuni.columns:
+        return out
+    df = df_racuni
+    if "datum_kreiranja" in df.columns:
+        df = df.assign(_d=df["datum_kreiranja"].astype(str)).sort_values("_d", kind="stable")
+    for _, r in df.iterrows():
+        for s in str(r.get("izvorni_redci", "") or "").split(","):
+            s = s.strip()
+            if s.startswith("P:") and len(s) > 2:
+                out[s[2:]] = {"status": str(r.get("status", "") or ""), "dokument_id": str(r.get("dokument_id", "")),
+                              "broj_dokumenta": str(r.get("broj_dokumenta", "") or "").replace("nan", "")}
+    return out
+
+
+def stanje_predmeta(red, dok_po_retku: dict) -> dict:
+    """Oznaka i smije li se predmet još mijenjati na kartici.
+    kod: neaktivan / vanjski / financije / greska / poslano / placeno / ugasen / gotovina / ide / uredi"""
+    status = str(red.get("status_kontakta", "") or "").strip()
+    rid = str(red.get("redak_id", "") or "").strip()
+    if status in STATUSI_NEAKTIVNI:
+        return {"kod": "neaktivan", "oznaka": f"🗄️ {status}", "uredivo": False}
+    prof = vanjski_profesor(red)
+    if prof:
+        return {"kod": "vanjski", "oznaka": f"🧪 {prof} — bez ponude (0 €)", "uredivo": False}
+    dok = dok_po_retku.get(rid) if rid else None
+    if dok:
+        s, broj = dok["status"], dok["broj_dokumenta"]
+        if s == "Greška":
+            return {"kod": "greska", "oznaka": "⚠️ Greška slanja — vidi 💶 Financije", "uredivo": False}
+        if s in _DOK_U_FINANCIJAMA:
+            return {"kod": "financije", "oznaka": "🟡 Nacrt u 💶 Financijama", "uredivo": False}
+        if s in _DOK_POSLAN:
+            return {"kod": "poslano", "oznaka": "📤 Ponuda poslana" + (f" ({broj})" if broj else "")
+                    + (" — rok istekao" if s == "Isteklo" else ""), "uredivo": False}
+        if s == "Plaćeno":
+            return {"kod": "placeno", "oznaka": "✅ Plaćeno" + (f" ({broj})" if broj else ""), "uredivo": False}
+        if s in _DOK_UGASEN:
+            return {"kod": "ugasen", "oznaka": f"🗑️ Ponuda {s.lower()} — novu napravi u 💶 Financije (✏️ Ispravi)",
+                    "uredivo": False}
+    if str(red.get("solo_poslano", "") or "").strip():
+        gotovina = "gotovin" in str(red.get("napomena", "") or "").lower()
+        return {"kod": "gotovina", "oznaka": "💵 Plaćeno gotovinom" if gotovina else "📤 Ponuda poslana (stari tok)",
+                "uredivo": False}
+    if status == "Potvrdio" and str(red.get("posalji_nakon", "") or "").strip():
+        return {"kod": "ide", "oznaka": "🕓 Ide u 💶 Financije (nacrt za ≤ 5 min)", "uredivo": False}
+    if status == "Potvrdio":
+        return {"kod": "uredi", "oznaka": "✅ Potvrdio — spremno za ponudu", "uredivo": True}
+    return {"kod": "uredi", "oznaka": OZNAKE_STATUSA_PREDMETA.get(status, status or "—"), "uredivo": True}
+
+
+def _svjeze_prijave(sheet):
+    """(ws, headers, {redak_id: (broj_retka, dict)}) — svježe iz Sheeta, jednim čitanjem."""
+    ws = sheet.worksheet("Prijave")
+    vrijednosti = ws.get_all_values()
+    h = [str(x).strip() for x in (vrijednosti[0] if vrijednosti else [])]
+    retci = {}
+    for i, r in enumerate(vrijednosti[1:], start=2):
+        r = list(r) + [""] * (len(h) - len(r))
+        d = dict(zip(h, r))
+        rid = str(d.get("redak_id", "")).strip()
+        if rid:
+            retci[rid] = (i, d)
+    return ws, h, retci
+
+
+def _upisi_prijave(ws, h, izmjene: dict):
+    """izmjene = {broj_retka: {stupac: vrijednost}} → JEDAN batch poziv prema Googleu."""
+    data = []
+    for broj, polja in izmjene.items():
+        for naziv, v in polja.items():
+            if naziv not in h:
+                raise ValueError(f"Stupac '{naziv}' ne postoji u tabu Prijave")
+            data.append({"range": gspread.utils.rowcol_to_a1(broj, h.index(naziv) + 1), "values": [[v]]})
+    if data:
+        ws.batch_update(data, raw=True)
+
+
+def spremi_statuse_predmeta(sheet, statusi: dict, subjekt: str = "") -> int:
+    """statusi = {redak_id: 'Čeka poziv'|'Čeka'|'Potvrdio'|'Otkazano'}. Mijenja samo predmete koji su
+    još uredivi (nisu u Financijama, poslani, vanjski...). 'Potvrdio' ovdje NE šalje u Financije.
+    Ako je zadan subjekt, upiše ga potvrđenima (za kasnije 📤 Pošalji sve). Vraća broj izmijenjenih."""
+    if subjekt and subjekt not in SOLO_SUBJEKTI:
+        raise ValueError("Nepoznat pravni subjekt.")
+    ws, h, retci = _svjeze_prijave(sheet)
+    dok = dokumenti_po_retku(load_racuni(sheet))
+    izmjene = {}
+    for rid, novi in statusi.items():
+        if novi not in STATUSI_PREDMETA or rid not in retci:
+            continue
+        broj, red = retci[rid]
+        if not stanje_predmeta(red, dok)["uredivo"]:
+            continue
+        polja = {}
+        if red.get("status_kontakta", "") != novi:
+            polja["status_kontakta"] = novi
+        if subjekt and novi == "Potvrdio" and "solo_racun" in h and red.get("solo_racun", "") != subjekt:
+            polja["solo_racun"] = subjekt
+        if polja:
+            izmjene[broj] = polja
+    _upisi_prijave(ws, h, izmjene)
+    return len(izmjene)
+
+
+def posalji_predmete_u_financije(sheet, redak_ids: list, subjekt: str) -> int:
+    """📤 Odabrani predmeti → status Potvrdio + solo_racun + posalji_nakon = sada, JEDNIM upisom.
+    Apps Script (svakih 5 min) od svih predmeta istog učenika i subjekta napravi JEDAN nacrt."""
+    if subjekt not in SOLO_SUBJEKTI:
+        raise ValueError("Odaberi pravni subjekt (Solo račun) za ovu ponudu.")
+    if not redak_ids:
+        raise ValueError("Nijedan predmet nije označen za slanje.")
+    ws, h, retci = _svjeze_prijave(sheet)
+    dok = dokumenti_po_retku(load_racuni(sheet))
+    sada = sada_zagreb().strftime("%Y-%m-%d %H:%M:%S")
+    izmjene, preskoceno = {}, []
+    for rid in redak_ids:
+        if rid not in retci:
+            preskoceno.append(rid)
+            continue
+        broj, red = retci[rid]
+        if not stanje_predmeta(red, dok)["uredivo"] or red.get("status_kontakta") == "Otkazano":
+            preskoceno.append(rid)
+            continue
+        izmjene[broj] = {"status_kontakta": "Potvrdio", "solo_racun": subjekt, "posalji_nakon": sada}
+    if not izmjene:
+        raise ValueError("Odabrani predmeti su već poslani u Financije (ili otkazani) — osvježi stranicu.")
+    _upisi_prijave(ws, h, izmjene)
+    return len(izmjene)
+
+
+def oznaci_predmete_gotovinom(sheet, redak_ids: list) -> int:
+    """💵 Odabrani predmeti plaćeni gotovinom: solo_poslano='Da' (ne ide u ponudu) + zabilješka, jednim upisom."""
+    ws, h, retci = _svjeze_prijave(sheet)
+    dok = dokumenti_po_retku(load_racuni(sheet))
+    oznaka = f"💵 Plaćeno gotovinom (ručno, {sada_zagreb().strftime('%d.%m.%Y.')})"
+    izmjene = {}
+    for rid in redak_ids:
+        if rid in retci and stanje_predmeta(retci[rid][1], dok)["uredivo"]:
+            broj, red = retci[rid]
+            stara = str(red.get("napomena", "") or "")
+            izmjene[broj] = {"solo_poslano": "Da", "napomena": f"{stara} | {oznaka}" if stara else oznaka}
+    _upisi_prijave(ws, h, izmjene)
+    return len(izmjene)
+
+
+def kandidati_za_slanje(df_prijave: pd.DataFrame, df_racuni: pd.DataFrame) -> tuple:
+    """Za 📤 Pošalji sve: (potvrđeni predmeti spremni za ponudu S odabranim subjektom, broj potvrđenih BEZ subjekta)."""
+    if df_prijave is None or df_prijave.empty:
+        return pd.DataFrame(), 0
+    dok = dokumenti_po_retku(df_racuni)
+    maska = df_prijave.apply(lambda r: str(r.get("status_kontakta", "")) == "Potvrdio"
+                             and stanje_predmeta(r, dok)["kod"] == "uredi", axis=1)
+    spremni = df_prijave[maska]
+    if spremni.empty:
+        return spremni, 0
+    sa_subjektom = spremni["solo_racun"].astype(str).isin(SOLO_SUBJEKTI) if "solo_racun" in spremni.columns \
+        else pd.Series(False, index=spremni.index)
+    return spremni[sa_subjektom], int((~sa_subjektom).sum())
+
+
+def posalji_sve_u_financije(sheet) -> tuple:
+    """📤 Pošalji sve: svi potvrđeni predmeti s odabranim subjektom idu u Financije jednim upisom.
+    Svježe čita Sheet. Vraća (broj učenika, broj predmeta)."""
+    df_p = load_prijave(sheet)
+    spremni, _ = kandidati_za_slanje(df_p, load_racuni(sheet))
+    if spremni.empty:
+        return 0, 0
+    ws, h, retci = _svjeze_prijave(sheet)
+    sada = sada_zagreb().strftime("%Y-%m-%d %H:%M:%S")
+    izmjene = {retci[str(r)][0]: {"posalji_nakon": sada} for r in spremni["redak_id"] if str(r) in retci}
+    _upisi_prijave(ws, h, izmjene)
+    return int(spremni["ucenik_id"].nunique()), len(izmjene)
+
+
+def popis_za_vanjskog(df_prijave: pd.DataFrame, df_ucenici: pd.DataFrame, profesor: str,
+                      samo_novi: bool = True) -> pd.DataFrame:
+    """🧪 Popis učenika za Ivicu / Mirelu (oni sami izdaju račune). Bez otkazanih."""
+    stupci = ["redak_id", "Ime djeteta", "Šifra", "Predmet", "Način praćenja", "Roditelj", "Mobitel roditelja",
+              "Email roditelja", "Email djeteta", "Mobitel djeteta", "Prijava", "Poslano profesoru"]
+    if df_prijave is None or df_prijave.empty:
+        return pd.DataFrame(columns=stupci)
+    p = df_prijave[df_prijave.apply(lambda r: vanjski_profesor(r) == profesor
+                                    and str(r.get("status_kontakta", "")) not in STATUSI_NEAKTIVNI, axis=1)]
+    if samo_novi and "vanjski_poslano" in p.columns:
+        p = p[p["vanjski_poslano"].astype(str).str.strip().replace("nan", "") == ""]
+    if p.empty:
+        return pd.DataFrame(columns=stupci)
+    uc = {str(r["ucenik_id"]): r for _, r in df_ucenici.iterrows()} if df_ucenici is not None and not df_ucenici.empty else {}
+    retci = []
+    for _, r in p.iterrows():
+        u = uc.get(str(r["ucenik_id"]), {})
+        g = lambda k: str(u.get(k, "") or "") if len(u) else ""  # noqa: E731
+        retci.append({
+            "redak_id": r.get("redak_id", ""), "Ime djeteta": g("ime_djeteta") or r.get("ime_djeteta", ""),
+            "Šifra": r["ucenik_id"], "Predmet": PREDMETI_MATURA.get(r.get("predmet", ""), r.get("predmet", "")),
+            "Način praćenja": r.get("nacin_pracenja", ""), "Roditelj": g("ime_roditelja"),
+            "Mobitel roditelja": g("mobitel_roditelja"), "Email roditelja": g("email_roditelja"),
+            "Email djeteta": g("email_djeteta"), "Mobitel djeteta": g("mobitel_djeteta"),
+            "Prijava": str(r.get("timestamp_prijave", ""))[:10],
+            "Poslano profesoru": str(r.get("vanjski_poslano", "") or "").replace("nan", ""),
+        })
+    return pd.DataFrame(retci, columns=stupci).sort_values("Ime djeteta", key=lambda s: s.str.lower()).reset_index(drop=True)
+
+
+def tekst_popisa_za_vanjskog(df: pd.DataFrame, profesor: str) -> str:
+    """Tekst za kopiranje u mail / WhatsApp profesoru."""
+    if df is None or df.empty:
+        return ""
+    redovi = [f"Pozdrav {profesor}, popis učenika prijavljenih na CAKI Maturu ({len(df)}):", ""]
+    for i, r in enumerate(df.itertuples(index=False), start=1):
+        d = dict(zip(df.columns, list(r)))
+        kontakt = ", ".join(x for x in [d["Roditelj"], d["Mobitel roditelja"], d["Email roditelja"]] if x)
+        redovi.append(f"{i}. {d['Ime djeteta']} — {d['Predmet']}"
+                      + (f" ({d['Način praćenja']})" if d["Način praćenja"] else "")
+                      + (f" — roditelj: {kontakt}" if kontakt else ""))
+    return "\n".join(redovi)
+
+
+def oznaci_vanjske_poslane(sheet, redak_ids: list) -> int:
+    """Upiše datum slanja popisa profesoru (stupac vanjski_poslano; doda ga ako ne postoji)."""
+    ws, h, retci = _svjeze_prijave(sheet)
+    if "vanjski_poslano" not in h:
+        if ws.col_count < len(h) + 1:
+            ws.add_cols(1)
+        ws.update_cell(1, len(h) + 1, "vanjski_poslano")
+        h = h + ["vanjski_poslano"]
+    danas = sada_zagreb().strftime("%Y-%m-%d")
+    izmjene = {retci[r][0]: {"vanjski_poslano": danas} for r in redak_ids if r in retci}
+    _upisi_prijave(ws, h, izmjene)
+    return len(izmjene)
