@@ -3620,3 +3620,163 @@ def oznaci_vanjske_poslane(sheet, redak_ids: list) -> int:
     izmjene = {retci[r][0]: {"vanjski_poslano": danas} for r in redak_ids if r in retci}
     _upisi_prijave(ws, h, izmjene)
     return len(izmjene)
+
+
+# ============================================================
+# 2.10.2026. (b) — PDV: procjena s poslanim ponudama · oznaka ponude po učeniku · WhatsApp predlošci
+# ============================================================
+
+def _godina_roka(v):
+    """Godina iz rok_placanja (tekst 'YYYY-MM-DD', 'd.M.yyyy.' ili Sheets serijski broj) ili None."""
+    t = prikazi_datum(v).strip()
+    m = re.search(r"(20\d{2})", t)
+    return int(m.group(1)) if m else None
+
+
+def ponude_za_pdv(df_racuni: pd.DataFrame, godina: int) -> dict:
+    """Po subjektu: poslane a neplaćene ponude (Poslano/Isteklo) koje će — kad se plate — postati računi.
+    {subjekt: {"ove_godine": c, "kasnije": c, "nacrti": c, "broj": n}}. Rok u sljedećoj godini → 'kasnije'
+    (ne ulazi u limit ove godine). Plaćene se ne broje (račun je već u Solu, tj. u 'Izdano')."""
+    out = {}
+    if df_racuni is None or df_racuni.empty or "status" not in df_racuni.columns:
+        return out
+    for _, r in df_racuni.iterrows():
+        s = str(r.get("solo_racun", "") or "").strip()
+        st_ = str(r.get("status", ""))
+        if not s or (st_ not in ("Poslano", "Isteklo", "Nacrt", "Odobreno", "Šalje se…")):
+            continue
+        if str(r.get("tip_dokumenta", "Ponuda") or "Ponuda") not in ("Ponuda", "nan"):
+            continue
+        c = u_cente(r.get("iznos_ukupno")) or 0
+        d = out.setdefault(s, {"ove_godine": 0, "kasnije": 0, "nacrti": 0, "broj": 0})
+        if st_ in ("Poslano", "Isteklo"):
+            g = _godina_roka(r.get("rok_placanja", ""))
+            if g is not None and g > godina:
+                d["kasnije"] += c
+            else:
+                d["ove_godine"] += c
+            d["broj"] += 1
+        else:
+            d["nacrti"] += c
+    return out
+
+
+OZNAKE_PONUDE_UCENIKA = {"placeno": "✅", "poslano": "📤", "nacrt": "🟡"}
+
+
+def ponude_po_uceniku(df_racuni: pd.DataFrame) -> dict:
+    """ucenik_id → 'poslano' (ima poslanu neplaćenu ponudu) / 'placeno' (sve plaćeno) / 'nacrt' (samo u
+    pripremi). Obrisane/otkazane ponude se ne broje. Učenik bez ponude nije u rječniku."""
+    out = {}
+    if df_racuni is None or df_racuni.empty or "status" not in df_racuni.columns:
+        return out
+    for uid, g in df_racuni.groupby(df_racuni["ucenik_id"].astype(str)):
+        s = set(g["status"].astype(str)) - set(_DOK_UGASEN)
+        if s & set(_DOK_POSLAN):
+            out[uid] = "poslano"
+        elif s and s <= {"Plaćeno"}:
+            out[uid] = "placeno"
+        elif s & {"Plaćeno"}:
+            out[uid] = "placeno" if not (s & set(_DOK_U_FINANCIJAMA)) else "nacrt"
+        elif s & set(_DOK_U_FINANCIJAMA):
+            out[uid] = "nacrt"
+    return out
+
+
+# --- 📲 WhatsApp predlošci (tab WhatsApp_predlosci; uređuju se u ⚙️ Postavke) ---
+WA_PREDLOSCI_TAB = "WhatsApp_predlosci"
+WA_PREDLOSCI_HEADERS = ["kljuc", "naziv", "program", "tijelo"]
+WA_PROGRAMI = ["Svi", "Upisi", "Matura", "Instrukcije"]
+WA_LINK_OZNAKA = "[OVDJE ZALIJEPI LINK"
+WA_POCETNI = [
+    {"kljuc": "pridruzivanje_grupi", "naziv": "Pridruživanje WhatsApp grupi za nastavu", "program": "Svi",
+     "tijelo": "Poštovani/a {ime_roditelja},\n\n{ime_djeteta} je upisan/a u CAKI {program} {skolska_godina}. "
+               "Molimo da se pridružite WhatsApp grupi za nastavu — tamo objavljujemo raspored, obavijesti i "
+               "promjene termina:\n[OVDJE ZALIJEPI LINK GRUPE]\n\n{moj_caki}\n\nLijep pozdrav,\nCAKI centar"},
+    {"kljuc": "pridruzivanje_zajednici", "naziv": "Pridruživanje CAKI WhatsApp zajednici", "program": "Svi",
+     "tijelo": "Poštovani/a {ime_roditelja},\n\nPozivamo vas u CAKI WhatsApp zajednicu — sve važne obavijesti "
+               "na jednom mjestu:\n[OVDJE ZALIJEPI LINK ZAJEDNICE]\n\nLijep pozdrav,\nCAKI centar"},
+]
+
+
+def load_whatsapp_predlosci(sheet) -> pd.DataFrame:
+    try:
+        df = _load_worksheet_df(sheet.worksheet(WA_PREDLOSCI_TAB))
+    except gspread.exceptions.WorksheetNotFound:
+        return pd.DataFrame(columns=WA_PREDLOSCI_HEADERS + ["_row"])
+    for h in WA_PREDLOSCI_HEADERS:
+        if h not in df.columns:
+            df[h] = ""
+        df[h] = df[h].astype(str).replace("nan", "")
+    return df
+
+
+def _ws_whatsapp(sheet):
+    try:
+        return sheet.worksheet(WA_PREDLOSCI_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=WA_PREDLOSCI_TAB, rows=100, cols=len(WA_PREDLOSCI_HEADERS))
+        ws.append_row(WA_PREDLOSCI_HEADERS)
+        return ws
+
+
+def osiguraj_whatsapp_predloske(sheet) -> list:
+    """Kreira tab (ako ga nema) i doda POČETNE predloške koji nedostaju. Postojeći tekstovi se ne diraju."""
+    ws = _ws_whatsapp(sheet)
+    headers = ws.row_values(1)
+    postojeci = {str(r.get("kljuc", "")) for r in ws.get_all_records()}
+    dodani = []
+    for p in WA_POCETNI:
+        if p["kljuc"] not in postojeci:
+            _dodaj_red_po_nazivu(ws, p, headers)
+            dodani.append(p["kljuc"])
+    return dodani
+
+
+def spremi_whatsapp_predlozak(sheet, kljuc: str, naziv: str, program: str, tijelo: str) -> str:
+    """Upis ili izmjena po ključu → 'novi' / 'izmijenjen'."""
+    kljuc = re.sub(r"[^a-z0-9_]", "_", str(kljuc or "").strip().lower()).strip("_")
+    if not kljuc:
+        raise ValueError("Ključ predloška ne smije biti prazan.")
+    if program not in WA_PROGRAMI:
+        raise ValueError(f"Nepoznat program '{program}'.")
+    if not str(tijelo or "").strip():
+        raise ValueError("Tekst poruke ne smije biti prazan.")
+    ws = _ws_whatsapp(sheet)
+    headers = ws.row_values(1)
+    polja = {"kljuc": kljuc, "naziv": str(naziv or kljuc).strip(), "program": program, "tijelo": str(tijelo)}
+    for i, r in enumerate(ws.get_all_records(), start=2):
+        if r.get("kljuc") == kljuc:
+            _azuriraj_polja(ws, i, polja, headers)
+            return "izmijenjen"
+    _dodaj_red_po_nazivu(ws, polja, headers)
+    return "novi"
+
+
+def whatsapp_predlosci_za(df: pd.DataFrame, program: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=WA_PREDLOSCI_HEADERS)
+    return df[df["program"].isin([program, "Svi", ""])]
+
+
+def popuni_whatsapp(tijelo: str, ucenik: dict, program: str, portal_url: str) -> str:
+    """Tekst WhatsApp poruke: iste oznake kao u mailu ({ime_roditelja}, {ime_djeteta}, {sifra}, {moj_caki},
+    {program}, {program_veliko}, {skolska_godina})."""
+    uid = str(ucenik.get("ucenik_id", ""))
+    ime = str(ucenik.get("ime_djeteta", "") or "")
+    zamjene = {"ime_roditelja": str(ucenik.get("ime_roditelja", "") or ""), "ime_djeteta": ime, "sifra": uid,
+               "moj_caki": tekst_moj_caki(ime, uid, portal_url), "program": program,
+               "program_veliko": str(program).upper(), "skolska_godina": skolska_godina()}
+    return popuni_mail_pregled(str(tijelo or ""), zamjene).strip()
+
+
+def provjeri_whatsapp(tekst: str) -> list:
+    """Upozorenja prije slanja: nepopunjene oznake ili link koji nije zalijepljen u predložak."""
+    upoz = []
+    ostaci = sorted(set(re.findall(r"\{[a-z_]+\}", str(tekst or ""))))
+    if ostaci:
+        upoz.append("Nepopunjene oznake: " + ", ".join(ostaci))
+    if WA_LINK_OZNAKA in str(tekst or ""):
+        upoz.append("U poruci je još „[OVDJE ZALIJEPI LINK …]” — zalijepi pravi link (najbolje trajno u "
+                    "⚙️ Postavke → 📲 WhatsApp predlošci).")
+    return upoz
