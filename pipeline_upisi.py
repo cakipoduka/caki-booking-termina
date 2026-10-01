@@ -53,7 +53,9 @@ REZERVACIJA_ROK_DANA = 5
 
 # Koliko sati nakon telefonske potvrde ("Potvrdio") ponuda smije krenuti (§23.6: jedinstveno 36h
 # za sve programe, odluka 22.9.2026.). Mijenja se samo ovdje.
-POSALJI_NAKON_SATI = 36
+# 1.10.2026.: 0 (bilo 36) — ponuda ionako ne ide u Solo bez pregleda i klika u 💶 Financije,
+# pa nema razloga čekati; nacrt se pojavi u roku ~1 min nakon "Potvrdio".
+POSALJI_NAKON_SATI = 0
 
 # Streamlit Cloud radi u UTC vremenu, a Apps Script u zagrebačkom — sva vremena koja
 # Apps Script čita (posalji_nakon) moraju biti zagrebačka, inače se ponuda šalje 1-2 h ranije.
@@ -208,7 +210,7 @@ def spoji_ucenike(sheet, primarni_id: str, duplikat_id: str):
 
 def postavi_status_poziva(sheet, ucenik_id: str, novi_status: str):
     """Postavlja status_kontakta na sve 'Čeka poziv' retke tog učenika.
-    Ako je novi_status == 'Potvrdio', upisuje i posalji_nakon = sada + POSALJI_NAKON_SATI (36h)."""
+    Ako je novi_status == 'Potvrdio', upisuje i posalji_nakon = sada + POSALJI_NAKON_SATI (0 h od 1.10.2026.)."""
     ws = sheet.worksheet("Prijave")
     prijave = ws.get_all_records()
     headers = ws.row_values(1)
@@ -961,10 +963,9 @@ def postavi_solo_racun(sheet, row_number: int, subjekt: str):
 
 
 def posalji_ponudu_odmah(sheet, row_number: int):
-    """Postavlja status_kontakta na 'Potvrdio' i posalji_nakon na sada — postojeći
-    Apps Script trigger (provjeriIPosaljiPonude, svakih ~15 min) automatski pošalje
-    Solo ponudu za taj redak čim ga sljedeći put obradi. Ne duplicira Solo API poziv
-    u Pythonu — samo "gura" redak u istu, već testiranu automatiku."""
+    """Postavlja status_kontakta na 'Potvrdio' i posalji_nakon na sada — Apps Script
+    sastaviNacrte (svake minute) od toga napravi NACRT u 💶 Financije. Ništa ne ide u Solo
+    bez admin pregleda i klika "✅ Pošalji"."""
     ws = sheet.worksheet("Prijave")
     headers = ws.row_values(1)
     col_status = headers.index("status_kontakta") + 1
