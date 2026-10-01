@@ -3003,7 +3003,34 @@ def zatrazi_slanje_maila(sheet, ucenik: dict, program: str, vrsta: str, predloza
         "prima": ", ".join(to), "kopija": ", ".join(cc), "predmet": str(predmet or "").strip(),
         "tijelo": str(tijelo), "status": STATUS_ZA_SLANJE, "poslao": poslao,
     }, headers)
+    if vrsta == "ponuda":
+        oznaci_ponude_poslane_mailom(sheet, uid, program)
     return mail_id
+
+def oznaci_ponude_poslane_mailom(sheet, ucenik_id: str, program: str) -> int:
+    """1.10.2026.: automatski mail nakon Solo ponude je isključen — ponudu roditelju šalje admin ručnim
+    mailom (vrsta "ponuda"). Tada se poslane, neplaćene ponude tog učenika i programa (iste one čiji je link
+    u mailu) označe mail_poslan = "Da", kao što je prije radio automatski mail. Bez toga ih portal Moj CAKI
+    skriva (pravilo za rate: roditelj vidi ponudu tek kad dobije mail). Vraća broj označenih dokumenata."""
+    try:
+        ws = sheet.worksheet(LEDGER_TAB)
+    except Exception:
+        return 0
+    vrijednosti = ws.get_all_values()
+    if not vrijednosti:
+        return 0
+    h = [str(x).strip() for x in vrijednosti[0]]
+    if not all(k in h for k in ("ucenik_id", "program_tip", "status", "mail_poslan")):
+        return 0
+    i_u, i_p, i_s, i_m = (h.index(k) for k in ("ucenik_id", "program_tip", "status", "mail_poslan"))
+    oznaceno = 0
+    for broj_retka, r in enumerate(vrijednosti[1:], start=2):
+        r = list(r) + [""] * (len(h) - len(r))
+        if (str(r[i_u]).strip() == str(ucenik_id) and str(r[i_p]).strip() == program
+                and str(r[i_s]).strip() in ("Poslano", "Isteklo") and not str(r[i_m]).strip()):
+            _azuriraj_polja(ws, broj_retka, {"mail_poslan": "Da"}, h)
+            oznaceno += 1
+    return oznaceno
 
 
 def otkazi_zahtjev_maila(sheet, mail_id: str) -> bool:
