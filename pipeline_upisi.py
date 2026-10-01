@@ -2682,18 +2682,22 @@ _POTPIS = "\n\nZa sva pitanja slobodno nam se javite.\n\nSrdačan pozdrav,\nCAKI
 
 # PRIVREMENI tekstovi — admin ih mijenja na ⚙️ Postavke → ✉️ Mail predlošci (bez novog koda)
 PRIVREMENI_PREDLOSCI = [
-    {"kljuc": "upisi_podsjetnik", "program": "Upisi", "vrsta": "podsjetnik", "predmet": "",
+    {"kljuc": "upisi_podsjetnik", "program": "Upisi", "vrsta": "podsjetnik",
+     "predmet": "UPISI {skolska_godina}g. - {ime_djeteta} - podsjetnik",
      "tijelo": "Poštovani/a {ime_roditelja},\n\nljubazno podsjećamo da ponuda za {ime_djeteta} još čeka uplatu:\n\n"
                "{link_ponuda}\n\nAko ste već uplatili, zanemarite ovu poruku — uplata će biti vidljiva u "
                "portalu Moj CAKI čim je evidentiramo.\n\n{moj_caki}" + _POTPIS},
-    {"kljuc": "upisi_raspored", "program": "Upisi", "vrsta": "programi/raspored", "predmet": "",
+    {"kljuc": "upisi_raspored", "program": "Upisi", "vrsta": "programi/raspored",
+     "predmet": "UPISI {skolska_godina}g. - {ime_djeteta} - program i raspored",
      "tijelo": "Poštovani/a {ime_roditelja},\n\nšaljemo informacije o programu za {ime_djeteta}:\n\n"
                "{popis_programa}\n\n{odjeljak_termina}\n\n{moj_caki}" + _POTPIS},
-    {"kljuc": "matura_podsjetnik", "program": "Matura", "vrsta": "podsjetnik", "predmet": "",
+    {"kljuc": "matura_podsjetnik", "program": "Matura", "vrsta": "podsjetnik",
+     "predmet": "MATURA {skolska_godina}g. - {ime_djeteta} - podsjetnik",
      "tijelo": "Poštovani/a {ime_roditelja},\n\nljubazno podsjećamo da ponuda za pripreme za državnu maturu "
                "({ime_djeteta}) još čeka uplatu:\n\n{link_ponuda}\n\nAko ste već uplatili, zanemarite ovu poruku — "
                "uplata će biti vidljiva u portalu Moj CAKI čim je evidentiramo.\n\n{moj_caki}" + _POTPIS},
-    {"kljuc": "matura_raspored", "program": "Matura", "vrsta": "programi/raspored", "predmet": "",
+    {"kljuc": "matura_raspored", "program": "Matura", "vrsta": "programi/raspored",
+     "predmet": "MATURA {skolska_godina}g. - {ime_djeteta} - program i raspored",
      "tijelo": "Poštovani/a {ime_roditelja},\n\nšaljemo informacije o pripremama za državnu maturu za "
                "{ime_djeteta}:\n\n{popis_programa}\n\nRaspored nastave (dan, vrijeme, učionica) vidi se u "
                "portalu Moj CAKI:\n\n{moj_caki}" + _POTPIS},
@@ -2701,10 +2705,30 @@ PRIVREMENI_PREDLOSCI = [
 
 OZNAKE_PREDLOZAKA = {
     "ime_roditelja": "ime roditelja", "ime_djeteta": "ime i prezime djeteta", "sifra": "šifra učenika",
+    "program": "Upisi / Matura", "program_veliko": "UPISI / MATURA",
+    "skolska_godina": "školska godina iz sezone, npr. 2026.-2027. (u naslov dopiši sam npr. 'g.')",
+    "faza": "ponuda / podsjetnik / programi i raspored",
     "moj_caki": "ime, šifra i osobni link na Moj CAKI (dodaje se sam ako ga nema)",
     "popis_programa": "stavke ponude s cijenama", "link_ponuda": "link(ovi) na PDF ponude iz Sola (s ratama i rokovima)",
     "odjeljak_termina": "Upisi: link za odabir termina (ili tekst za online); Matura: prazno",
 }
+
+
+def skolska_godina(sezona: str = "") -> str:
+    """'2026/27' → '2026.-2027.' (za naslove, npr. 'MATURA 2026.-2027.g. - Dora Trstenjak')."""
+    m = re.match(r"^\s*(\d{4})\s*/\s*(\d{2,4})\s*$", str(sezona or SEZONA))
+    if not m:
+        return str(sezona or SEZONA)
+    g1 = int(m.group(1))
+    return f"{g1}.-{g1 + 1}."
+
+
+def naslov_iz_predloska(predmet_predloska: str, zamjene: dict, program: str, ime_djeteta: str, vrsta: str) -> str:
+    """Naslov ručnog maila: iz predloška (s popunjenim oznakama) ili, ako je prazan, "Program, Ime, faza"."""
+    p = str(predmet_predloska or "").strip()
+    if not p or p.lower() == "nan":
+        return naslov_rucnog_maila(program, ime_djeteta, vrsta)
+    return re.sub(r"\s{2,}", " ", popuni_mail_pregled(p, zamjene)).strip()
 
 
 def naslov_rucnog_maila(program: str, ime_djeteta: str, vrsta: str) -> str:
@@ -2856,7 +2880,7 @@ def _datum_kratko(v) -> str:
 
 
 def zamjene_za_rucni_mail(ucenik: dict, df_racuni: pd.DataFrame, program: str,
-                          portal_url: str, online: bool = False) -> dict:
+                          portal_url: str, online: bool = False, vrsta: str = "") -> dict:
     """Vrijednosti za {oznake} u ručnom mailu. link_ponuda/popis_programa dolaze iz poslanih a neplaćenih
     ponuda (status Poslano ili Isteklo) tog programa u Racuni_i_ponude — isti oblik kao automatski mail."""
     uid = str(ucenik.get("ucenik_id", ""))
@@ -2866,6 +2890,8 @@ def zamjene_za_rucni_mail(ucenik: dict, df_racuni: pd.DataFrame, program: str,
         "ime_djeteta": ime, "sifra": uid,
         "moj_caki": tekst_moj_caki(ime, uid, portal_url),
         "popis_programa": "", "link_ponuda": "", "odjeljak_termina": "",
+        "program": program, "program_veliko": str(program).upper(), "skolska_godina": skolska_godina(),
+        "faza": MAIL_FAZA_U_NASLOVU.get(vrsta, vrsta),
     }
     if program == "Upisi":
         if online:
@@ -2935,6 +2961,9 @@ def provjeri_rucni_mail(to: list, predmet: str, tijelo: str, nacin: str, thread:
             greske.append(f"Neispravna email adresa: {e}")
     if nacin == NACIN_NOVI and not str(predmet or "").strip():
         greske.append("Naslov maila je prazan.")
+    if nacin == NACIN_NOVI and re.findall(r"\{[a-z_]+\}", str(predmet or "")):
+        greske.append("U naslovu su ostale nepopunjene oznake: " +
+                      ", ".join(sorted(set(re.findall(r"\{[a-z_]+\}", str(predmet or ""))))))
     if not str(tijelo or "").strip():
         greske.append("Tekst maila je prazan.")
     ostaci = re.findall(r"\{[a-z_]+\}", str(tijelo or ""))
