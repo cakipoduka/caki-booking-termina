@@ -321,13 +321,20 @@ def load_rezervacije(sheet) -> pd.DataFrame:
     return _load_worksheet_df(sheet.worksheet("Rezervacije"))
 
 
-def kreiraj_grupu(sheet, program, dan, vrijeme, ucionica, kapacitet, tip, aktivna=True, redovni_nastavnik=""):
+def kreiraj_grupu(sheet, program, dan, vrijeme, ucionica, kapacitet, tip, aktivna=True, redovni_nastavnik="",
+                  datum_od=None, datum_do=None):
+    """2.10.2026.: redak se slaže PO ZAGLAVLJU (ne po redoslijedu stupaca) i ima razdoblje datum_od/datum_do."""
+    headers = osiguraj_stupce_grupa(sheet)
     ws = sheet.worksheet("Grupe")
     grupa_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    ws.append_row([
-        grupa_id, program, dan, vrijeme, ucionica,
-        kapacitet, tip, "da" if aktivna else "ne", 0, str(redovni_nastavnik), SEZONA
-    ])
+    od, do = u_datum(datum_od), u_datum(datum_do)
+    vrijednosti = {
+        "grupa_id": grupa_id, "program": program, "dan": dan, "vrijeme": vrijeme, "ucionica": ucionica,
+        "kapacitet": kapacitet, "tip": tip, "aktivna": "da" if aktivna else "ne", "admin_rezervirano": 0,
+        "redovni_nastavnik": str(redovni_nastavnik), "sezona": SEZONA,
+        "datum_od": od.isoformat() if od else "", "datum_do": do.isoformat() if do else "",
+    }
+    ws.append_row([vrijednosti.get(h, "") for h in headers])
     return grupa_id
 
 
@@ -3858,3 +3865,349 @@ def poruke_ucenika(df_prijave: pd.DataFrame, df_form: pd.DataFrame, df_ucenici: 
         if len(kandidati) == 1:
             dodaj(str(kandidati[0]["ucenik_id"]), poruka)
     return out
+
+
+# ============================================================
+# ZAUZETOST UČIONICA — Matura + Upisi zajedno (2.10.2026.)
+# Ista prostorija ima dva naziva: u Rasporedu Mature A/B/C, u Grupama (Upisi) "Učionica 1/2/3".
+# Odluka 2.10.2026.: A = Učionica 1 (6), B = Učionica 2 (6), C = Učionica 3 (12); drugih prostorija nema.
+# Dvije grupe ne smiju biti u istoj učionici u isto vrijeme ako im se RAZDOBLJA (datum_od–datum_do)
+# preklapaju — tako se u lipnju može unaprijed složiti Upisi kratki u učionici gdje su do tada Upisi dugi.
+# Online grupe ne zauzimaju učionicu. Sve funkcije su čiste (bez Streamlita) radi testiranja.
+# ============================================================
+UCIONICE_CENTRA = [("A", "Učionica 1", 6), ("B", "Učionica 2", 6), ("C", "Učionica 3", 12)]
+UCIONICE_UPISI_OPCIJE = ["Učionica 1 (6)", "Učionica 2 (6)", "Učionica 3 (12)", "Online"]
+GRUPA_ARHIVA = "arhiva"            # Grupe.aktivna = "arhiva": skrivena svima, ne zauzima učionicu
+STUPCI_RAZDOBLJA_GRUPE = ["datum_od", "datum_do"]
+RAZDOBLJA_TAB = "Razdoblja_programa"
+STUPCI_RAZDOBLJA = ["program", "datum_od", "datum_do", "zadnje_azurirano"]
+TRAJANJE_BEZ_KRAJA_MIN = 90        # "17:00" bez završetka → pretpostavi 90 min
+
+
+def oznaka_ucionice(tekst) -> str:
+    """'Učionica 1 (6)' / 'A' / 'Uč. A' / 'U1' -> 'A'; 'Online' ili nepoznato -> ''."""
+    t = str(tekst or "").strip().lower()
+    if not t or "online" in t:
+        return ""
+    if t in ("a", "b", "c"):
+        return t.upper()
+    m = re.search(r"(?:u[čc]ionica|u[čc]\.?|^u)\s*([abc123])\b", t)
+    if not m:
+        return ""
+    z = m.group(1)
+    return {"1": "A", "2": "B", "3": "C"}.get(z, z.upper())
+
+
+def kapacitet_ucionice_centra(oznaka: str) -> int:
+    return {o: k for o, _n, k in UCIONICE_CENTRA}.get(oznaka, 0)
+
+
+def naziv_ucionice_centra(oznaka: str) -> str:
+    """'A' -> 'Učionica 1 / A (6)'."""
+    for o, n, k in UCIONICE_CENTRA:
+        if o == oznaka:
+            return f"{n} / {o} ({k})"
+    return oznaka or "Online"
+
+
+def opcija_ucionice_upisi(oznaka: str) -> str:
+    """'A' -> 'Učionica 1 (6)' (vrijednost koju pišemo u Grupe.ucionica); '' -> 'Online'."""
+    for o, n, k in UCIONICE_CENTRA:
+        if o == oznaka:
+            return f"{n} ({k})"
+    return "Online"
+
+
+def vrijeme_u_minute(tekst):
+    """'15:00-16:30' / '15.00 – 16.30' -> (900, 990); '17:00' -> (1020, 1110); neispravno -> None."""
+    nadjeno = re.findall(r"(\d{1,2})[:.](\d{2})", str(tekst or ""))
+    if not nadjeno:
+        return None
+    minute = [int(h) * 60 + int(m) for h, m in nadjeno if int(h) < 24 and int(m) < 60]
+    if not minute:
+        return None
+    od = minute[0]
+    do = minute[1] if len(minute) > 1 and minute[1] > od else od + TRAJANJE_BEZ_KRAJA_MIN
+    return od, do
+
+
+def je_ispravno_vrijeme(tekst) -> bool:
+    """Za unos termina: traži se početak I kraj (npr. 15:00-16:30)."""
+    return len(re.findall(r"(\d{1,2})[:.](\d{2})", str(tekst or ""))) >= 2 and vrijeme_u_minute(tekst) is not None
+
+
+def lijepo_vrijeme(tekst) -> str:
+    v = vrijeme_u_minute(tekst)
+    if not v:
+        return str(tekst or "").strip()
+    return f"{v[0] // 60:02d}:{v[0] % 60:02d}–{v[1] // 60:02d}:{v[1] % 60:02d}"
+
+
+def vremena_se_preklapaju(a, b) -> bool:
+    return bool(a and b and a[0] < b[1] and b[0] < a[1])
+
+
+def u_datum(v):
+    """'2026-10-31' / '31.10.2026.' / date -> date; prazno/neispravno -> None (= bez ograničenja)."""
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    t = str(v or "").strip().rstrip(".")
+    if not t:
+        return None
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d. %m. %Y"):
+        try:
+            return datetime.strptime(t, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def razdoblja_se_preklapaju(od1, do1, od2, do2) -> bool:
+    """Prazan datum = otvoreno (od početka / do kraja sezone)."""
+    od1, do1, od2, do2 = u_datum(od1), u_datum(do1), u_datum(od2), u_datum(do2)
+    if do1 and od2 and do1 < od2:
+        return False
+    if do2 and od1 and do2 < od1:
+        return False
+    return True
+
+
+def ponedjeljak_tjedna(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+
+def blok_aktivan_u_tjednu(blok: dict, ponedjeljak: date) -> bool:
+    return razdoblja_se_preklapaju(blok.get("datum_od"), blok.get("datum_do"), ponedjeljak, ponedjeljak + timedelta(days=6))
+
+
+def blok_aktivan_na_datum(blok: dict, d: date) -> bool:
+    return razdoblja_se_preklapaju(blok.get("datum_od"), blok.get("datum_do"), d, d)
+
+
+def tekst_razdoblja(od, do) -> str:
+    od, do = u_datum(od), u_datum(do)
+    if not od and not do:
+        return "cijela sezona"
+    f = lambda x: x.strftime("%d.%m.%Y.")  # noqa: E731
+    return f"{f(od) if od else '…'} – {f(do) if do else '…'}"
+
+
+def ucitaj_razdoblja(sheet) -> dict:
+    """{program: (datum_od, datum_do)} iz taba Razdoblja_programa (npr. 'MATURA'). Nema taba -> {}."""
+    df = _load_opcionalno(sheet, RAZDOBLJA_TAB)
+    out = {}
+    if df is None or df.empty or "program" not in df.columns:
+        return out
+    for _, r in df.iterrows():
+        p = str(r.get("program", "")).strip().upper()
+        if p:
+            out[p] = (u_datum(r.get("datum_od")), u_datum(r.get("datum_do")))
+    return out
+
+
+def spremi_razdoblje(sheet, program: str, datum_od, datum_do) -> None:
+    """Upiše/ažurira jedan redak u Razdoblja_programa (tab se stvori ako ne postoji)."""
+    try:
+        ws = sheet.worksheet(RAZDOBLJA_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=RAZDOBLJA_TAB, rows=50, cols=len(STUPCI_RAZDOBLJA))
+        ws.update(range_name="A1", values=[STUPCI_RAZDOBLJA], value_input_option="RAW")
+    program = str(program).strip().upper()
+    od, do = u_datum(datum_od), u_datum(datum_do)
+    vrijednosti = [program, od.isoformat() if od else "", do.isoformat() if do else "",
+                   sada_zagreb().strftime("%Y-%m-%d %H:%M:%S")]
+    programi = [str(p).strip().upper() for p in ws.col_values(1)]
+    if program in programi[1:]:
+        red = programi.index(program) + 1
+    else:
+        red = max(len(programi), 1) + 1
+    ws.update(range_name=f"A{red}", values=[vrijednosti], value_input_option="RAW")
+
+
+def blokovi_zauzetosti(df_grupe, df_raspored_matura=None, razdoblja: dict | None = None) -> list:
+    """Svi termini koji zauzimaju učionicu: grupe Upisa (osim arhiviranih i online) + kante Mature.
+    [{izvor 'UPISI'/'MATURA', id, dan, vrijeme, minute (od, do), ucionica 'A'/'B'/'C', kapacitet,
+      oznaka, profesor, datum_od, datum_do, broj_ucenika}]"""
+    razdoblja = razdoblja or {}
+    out = []
+    if df_grupe is not None and not getattr(df_grupe, "empty", True):
+        for _, g in df_grupe.iterrows():
+            if str(g.get("aktivna", "")).strip().lower() == GRUPA_ARHIVA:
+                continue
+            uc = oznaka_ucionice(g.get("ucionica"))
+            if not uc:
+                continue
+            out.append({"izvor": "UPISI", "id": str(g.get("grupa_id", "")), "dan": str(g.get("dan", "")).strip(),
+                        "vrijeme": lijepo_vrijeme(g.get("vrijeme")), "minute": vrijeme_u_minute(g.get("vrijeme")),
+                        "ucionica": uc, "kapacitet": kapacitet_ucionice_centra(uc),
+                        "oznaka": str(g.get("program", "")).strip(),
+                        "profesor": str(g.get("redovni_nastavnik", "") or "").strip(),
+                        "datum_od": u_datum(g.get("datum_od")), "datum_do": u_datum(g.get("datum_do")),
+                        "broj_ucenika": None})
+    mat_od, mat_do = razdoblja.get("MATURA", (None, None))
+    for k in matura_kante(df_raspored_matura):
+        uc = oznaka_ucionice(k["ucionica"])
+        if not uc:
+            continue
+        out.append({"izvor": "MATURA", "id": k["grupa_id"], "dan": k["dan"], "vrijeme": lijepo_vrijeme(k["vrijeme"]),
+                    "minute": vrijeme_u_minute(k["vrijeme"]), "ucionica": uc, "kapacitet": kapacitet_ucionice_centra(uc),
+                    "oznaka": " + ".join(k["predmeti"]) or "MATURA", "profesor": k["profesor"],
+                    "datum_od": mat_od, "datum_do": mat_do, "broj_ucenika": len(k["ucenici"])})
+    return out
+
+
+def sukobi_bloka(blok: dict, blokovi: list) -> list:
+    """Blokovi koji su u ISTOJ učionici, ISTI dan, vrijeme se preklapa i razdoblje se preklapa."""
+    out = []
+    for b in blokovi:
+        if (b["izvor"], b["id"]) == (blok.get("izvor"), blok.get("id")):
+            continue
+        if b["dan"] != blok.get("dan") or b["ucionica"] != blok.get("ucionica"):
+            continue
+        if not vremena_se_preklapaju(b["minute"], blok.get("minute")):
+            continue
+        if not razdoblja_se_preklapaju(b["datum_od"], b["datum_do"], blok.get("datum_od"), blok.get("datum_do")):
+            continue
+        out.append(b)
+    return out
+
+
+def svi_sukobi(blokovi: list) -> list:
+    """[(blok1, blok2), ...] — svaki par jednom."""
+    out, vidjeno = [], set()
+    for b in blokovi:
+        for d in sukobi_bloka(b, blokovi):
+            par = tuple(sorted([(b["izvor"], b["id"]), (d["izvor"], d["id"])]))
+            if par not in vidjeno:
+                vidjeno.add(par)
+                out.append((b, d))
+    return out
+
+
+def opis_bloka(b: dict, javno: bool = False) -> str:
+    """Admin: '15:00–16:30 MATURA BIO (6) · Mirela'. Javno (portal profesora): '15:00–16:30 ZAUZETO – MATURA'."""
+    if javno:
+        return f"{b['vrijeme']} ZAUZETO – {b['izvor']}"
+    return (f"{b['vrijeme']} {b['izvor']} {b['oznaka']} ({b['kapacitet']})"
+            + (f" · {b['profesor']}" if b["profesor"] else ""))
+
+
+def tekst_sukoba(b: dict) -> str:
+    return (f"{naziv_ucionice_centra(b['ucionica'])} je {b['dan'].lower()} {b['vrijeme']} zauzeta: "
+            f"{b['izvor']} {b['oznaka']}" + (f" · {b['profesor']}" if b["profesor"] else "")
+            + f" ({tekst_razdoblja(b['datum_od'], b['datum_do'])})")
+
+
+def tjedna_mreza(blokovi: list, ponedjeljak: date | None = None) -> dict:
+    """{ucionica: {dan: [blokovi po vremenu]}} za tjedan koji počinje 'ponedjeljak' (None = svi blokovi)."""
+    mreza = {o: {d: [] for d in DANI_U_TJEDNU} for o, _n, _k in UCIONICE_CENTRA}
+    for b in blokovi:
+        if b["ucionica"] not in mreza or b["dan"] not in DANI_U_TJEDNU:
+            continue
+        if ponedjeljak and not blok_aktivan_u_tjednu(b, ponedjeljak):
+            continue
+        mreza[b["ucionica"]][b["dan"]].append(b)
+    for po_danu in mreza.values():
+        for lista in po_danu.values():
+            lista.sort(key=lambda x: ((x["minute"] or (9999, 0))[0], x["izvor"]))
+    return mreza
+
+
+def html_tjedne_mreze(blokovi: list, ponedjeljak: date | None = None, javno: bool = False) -> str:
+    """HTML tablica: stupci = dani (pon–ned), retci = učionice; sukobi crveno obrubljeni."""
+    import html
+    mreza = tjedna_mreza(blokovi, ponedjeljak)
+    aktivni = [b for po in mreza.values() for lista in po.values() for b in lista]
+    u_sukobu = {(b["izvor"], b["id"]) for par in svi_sukobi(aktivni) for b in par}
+    boje = {"MATURA": "#dbeafe", "UPISI": "#dcfce7"}
+    kratko = {"Ponedjeljak": "Pon", "Utorak": "Uto", "Srijeda": "Sri", "Četvrtak": "Čet", "Petak": "Pet",
+              "Subota": "Sub", "Nedjelja": "Ned"}
+    th = "padding:4px;border:1px solid #ccc;background:#f3f4f6;color:#111;font-size:0.8rem"
+    redovi = ["<div style='overflow-x:auto'><table style='border-collapse:collapse;width:100%;table-layout:fixed'>",
+              f"<tr><th style='{th};width:90px'>Učionica</th>"
+              + "".join(f"<th style='{th}'>{kratko[d]}</th>" for d in DANI_U_TJEDNU) + "</tr>"]
+    for o, n, k in UCIONICE_CENTRA:
+        celije = []
+        for d in DANI_U_TJEDNU:
+            kartice = []
+            for b in mreza[o][d]:
+                sukob = (b["izvor"], b["id"]) in u_sukobu and not javno
+                tekst = html.escape(opis_bloka(b, javno))
+                kartice.append(f"<div style='background:{'#f3f4f6' if javno else boje[b['izvor']]};"
+                               f"border:{'2px solid #dc2626' if sukob else '1px solid #bbb'};border-radius:4px;"
+                               f"padding:2px 4px;margin:2px 0;font-size:0.72rem;line-height:1.25;color:#111'>"
+                               f"{'⛔ ' if sukob else ''}{tekst}</div>")
+            celije.append(f"<td style='vertical-align:top;border:1px solid #ccc;padding:2px'>{''.join(kartice)}</td>")
+        redovi.append(f"<tr><td style='{th};font-weight:600'>{html.escape(n)}<br>{o} ({k})</td>{''.join(celije)}</tr>")
+    redovi.append("</table></div>")
+    return "".join(redovi)
+
+
+def blok_iz_unosa_grupe(grupa_id, dan, vrijeme, ucionica, program="", profesor="", datum_od=None, datum_do=None) -> dict:
+    """Blok za provjeru PRIJE spremanja nove/izmijenjene grupe Upisa."""
+    uc = oznaka_ucionice(ucionica)
+    return {"izvor": "UPISI", "id": str(grupa_id or "__nova__"), "dan": dan, "vrijeme": lijepo_vrijeme(vrijeme),
+            "minute": vrijeme_u_minute(vrijeme), "ucionica": uc, "kapacitet": kapacitet_ucionice_centra(uc),
+            "oznaka": program, "profesor": profesor, "datum_od": u_datum(datum_od), "datum_do": u_datum(datum_do),
+            "broj_ucenika": None}
+
+
+def provjeri_grupu_upisa(blok: dict, blokovi: list) -> list:
+    """Popis tekstova sukoba ([] = smije se spremiti). Online grupa nikad nema sukob."""
+    if not blok.get("ucionica"):
+        return []
+    return [tekst_sukoba(b) for b in sukobi_bloka(blok, blokovi)]
+
+
+def osiguraj_stupce_grupa(sheet) -> list:
+    """Doda stupce datum_od / datum_do u tab Grupe ako ih nema. Vraća zaglavlje."""
+    ws = sheet.worksheet("Grupe")
+    headers = ws.row_values(1)
+    nedostaje = [s for s in STUPCI_RAZDOBLJA_GRUPE if s not in headers]
+    if nedostaje:
+        if ws.col_count < len(headers) + len(nedostaje):
+            ws.add_cols(len(headers) + len(nedostaje) - ws.col_count)
+        for i, s in enumerate(nedostaje):
+            ws.update_cell(1, len(headers) + i + 1, s)
+        headers = headers + nedostaje
+    return headers
+
+
+def _red_grupe(ws, grupa_id: str) -> int:
+    """Broj retka grupe u tabu (čita se svježe — ne oslanja se na stari _row)."""
+    ids = [str(v).strip() for v in ws.col_values(1)]
+    if str(grupa_id) not in ids[1:]:
+        raise ValueError(f"Grupa {grupa_id} nije pronađena u tabu Grupe (možda je već obrisana).")
+    return ids.index(str(grupa_id)) + 1
+
+
+def uredi_grupu(sheet, grupa_id: str, polja: dict) -> None:
+    """Promjena dana/vremena/učionice/kapaciteta/profesora/razdoblja postojeće grupe (po grupa_id)."""
+    headers = osiguraj_stupce_grupa(sheet)
+    ws = sheet.worksheet("Grupe")
+    red = _red_grupe(ws, grupa_id)
+    polja = {k: (v.isoformat() if isinstance(v, date) else ("" if v is None else v)) for k, v in polja.items()}
+    _azuriraj_polja(ws, red, polja, headers)
+
+
+def brisanje_grupe_dozvoljeno(grupa_id: str, df_rezervacije, df_termini) -> tuple:
+    """(True, '') ako grupa nema aktivnih rezervacija ni održanih (evidentiranih) termina;
+    inače (False, razlog) — tada se grupa arhivira umjesto brisanja, da se ne izgubi povijest."""
+    razlozi = []
+    if df_rezervacije is not None and not df_rezervacije.empty and "grupa_id" in df_rezervacije.columns:
+        r = df_rezervacije[(df_rezervacije["grupa_id"].astype(str) == str(grupa_id))
+                           & (df_rezervacije["status"].astype(str) != "Otkazano")]
+        if len(r):
+            razlozi.append(f"{len(r)} učenika s rezervacijom (otkaži ih ili premjesti termin)")
+    if df_termini is not None and not df_termini.empty and "grupa_id" in df_termini.columns:
+        t = df_termini[df_termini["grupa_id"].astype(str) == str(grupa_id)]
+        if len(t):
+            razlozi.append(f"{len(t)} održanih termina s evidencijom dolazaka")
+    return (not razlozi), "; ".join(razlozi)
+
+
+def obrisi_grupu(sheet, grupa_id: str) -> None:
+    ws = sheet.worksheet("Grupe")
+    ws.delete_rows(_red_grupe(ws, grupa_id))
