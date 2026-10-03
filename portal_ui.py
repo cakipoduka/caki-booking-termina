@@ -29,6 +29,8 @@ from pipeline_upisi import (
     load_ucenici,
     portal_dolasci,
     portal_instrukcije,
+    portal_paketi,
+    PAKETI_TAB,
     portal_naplata,
     portal_raspored_grupa,
     portal_raspored_matura,
@@ -233,12 +235,19 @@ def prikazi_portal():
             else:
                 st.dataframe(raspored, hide_index=True, width="stretch")
         st.markdown("#### Instrukcije")
-        instr = portal_instrukcije(_ucitaj("Instrukcije_termini"), df_racuni, ucenik_id)
+        df_instr_p = _ucitaj("Instrukcije_termini")
+        instr = portal_instrukcije(df_instr_p, df_racuni, ucenik_id)
         if instr.empty:
             st.info("Nema evidentiranih instrukcija.")
         else:
             st.dataframe(instr, hide_index=True, width="stretch",
                          column_config={"Cijena (€)": st.column_config.NumberColumn(format="%.2f")})
+            st.caption("📒 Bilješku sa sata piše profesor (što se radilo, domaća zadaća). Termin otkažite najkasnije "
+                       "24 sata ranije — kasnije otkazivanje i nedolazak se naplaćuju.")
+        paketi = portal_paketi(_ucitaj(PAKETI_TAB), df_instr_p, ucenik_id)
+        if not paketi.empty:
+            st.markdown("#### 📦 Paket sati")
+            st.dataframe(paketi, hide_index=True, width="stretch")
 
     with kartice["✅ Dolasci"]:
         if tablica_dol.empty:

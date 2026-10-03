@@ -752,6 +752,8 @@ def dodaj_instrukciju_termin(
     sifra: str = "",
     cijena_termina=None,
     nacin_naplate: str | None = None,
+    status_termina: str = "Održan",
+    vrijeme: str = "",
 ) -> str:
     """Dodaje novi termin instrukcija. Poziva ga i instruktor (nastavnik = iz
     logina, ne uređuje se ručno) i admin (nastavnik bira sam iz padajućeg popisa).
@@ -783,8 +785,22 @@ def dodaj_instrukciju_termin(
                 cijena_termina = izracunaj_cijenu_termina(df_cjenik, sifra, duljina_min)
             except Exception:
                 cijena_termina = None
+        auto_nacin = nacin_naplate is None
+        df_postojeci = _load_worksheet_df(ws)
         if nacin_naplate is None:
-            nacin_naplate = zadnji_nacin_naplate(_load_worksheet_df(ws), ucenik_id, predmet)
+            nacin_naplate = zadnji_nacin_naplate(df_postojeci, ucenik_id, predmet)
+
+    # 3.10.2026.: status termina (Zakazan / Otkazan… ne ide u obračun) i paket sati (skida se s paketa)
+    gotovina = placeno_oznaka_prof == PLACENO_GOTOVINOM
+    paket_id = ""
+    if ima_naplatu and "paket_id" in headers and auto_nacin and not gotovina \
+            and status_termina not in STATUSI_BEZ_NAPLATE:
+        try:
+            paket_id = paket_za_termin(load_paketi(sheet), df_postojeci, ucenik_id, predmet, datum, duljina_min)
+        except Exception:
+            paket_id = ""
+        if paket_id:
+            nacin_naplate = "Paket"
 
     vrijednosti = {
         "termin_id": termin_id,
@@ -805,8 +821,11 @@ def dodaj_instrukciju_termin(
         "sifra": str(sifra),
         "nacin_naplate": str(nacin_naplate or ""),
         "cijena_termina": "" if cijena_termina is None else float(cijena_termina),
-        "status_obracuna": STATUS_OBRACUNA_GOTOVINA if placeno_oznaka_prof == PLACENO_GOTOVINOM else "Neobračunato",
+        "status_obracuna": obracun_za_status(status_termina, gotovina, paket_id),
         "dokument_id": "",
+        "status_termina": str(status_termina or "Održan"),
+        "vrijeme": str(vrijeme or ""),
+        "paket_id": paket_id,
     }
     red = ["" for _ in headers]
     for naziv, vrijednost in vrijednosti.items():
@@ -2296,6 +2315,11 @@ def portal_instrukcije(df_instrukcije: pd.DataFrame, df_racuni: pd.DataFrame, uc
         status_dok = dict(zip(df_racuni["dokument_id"], df_racuni["status"]))
 
     def status(r):
+        so = str(r.get("status_obracuna", "") or "")
+        if so == STATUS_OBRACUNA_PAKET:
+            return "📦 Iz paketa sati"
+        if so in STATUSI_BEZ_NAPLATE.values():
+            return "—" if so == "Zakazano" else "Bez naplate"
         if str(r.get("uplata_potvrdjena_admin")) == "Da" or str(r.get("placeno_oznaka_prof")) == PLACENO_GOTOVINOM:
             return "✅ Plaćeno"
         dok = str(r.get("dokument_id", "") or "")
@@ -2314,8 +2338,16 @@ def portal_instrukcije(df_instrukcije: pd.DataFrame, df_racuni: pd.DataFrame, uc
         "Cijena (€)": [(u_cente(v) or 0) / 100 if u_cente(v) is not None else None
                        for v in (t["cijena_termina"] if "cijena_termina" in t.columns else [None] * len(t))],
         "Naplata": [status(r) for _, r in t.iterrows()],
-        "Napomena": t["napomena_javna"] if "napomena_javna" in t.columns else "",
+        "📒 Bilješka sa sata": t["napomena_javna"] if "napomena_javna" in t.columns else "",
     })
+    if "status_termina" in t.columns:
+        out.insert(1, "Termin", [OZNAKE_STATUSA_TERMINA.get(str(v or "Održan"), str(v)).split(" (")[0]
+                                 for v in t["status_termina"]])
+        if "vrijeme" in t.columns:
+            out.insert(1, "Vrijeme", [str(v or "") for v in t["vrijeme"]])
+        bez = t["status_obracuna"].isin(list(STATUSI_BEZ_NAPLATE.values()) + [STATUS_OBRACUNA_PAKET]) \
+            if "status_obracuna" in t.columns else pd.Series(False, index=t.index)
+        out.loc[list(bez.values), "Cijena (€)"] = None
     return out.reset_index(drop=True)
 
 
@@ -2378,7 +2410,7 @@ def portal_rezultati(df_rezultati: pd.DataFrame, ucenik_id: str) -> pd.DataFrame
 IZVJESTAJI_TAB = "Izvjestaji_instruktora"
 IZVJESTAJI_HEADERS = ["izvjestaj_id", "nastavnik", "mjesec", "poslano", "broj_instrukcija", "sati_instrukcija",
                       "broj_grupnih_termina", "status", "napomena_admin", "azurirano",
-                      "nacin_isplate", "iznos_isplate", "datum_isplate"]
+                      "nacin_isplate", "iznos_isplate", "datum_isplate", "honorar_ukupno"]
 # Samo admin vidi (portal za profesore prikazuje samo status i napomenu)
 NACINI_ISPLATE = ["Ugovor o djelu", "Autorski ugovor", "Račun (obrt / firma)", "Plaća", "Naknada / ostalo"]
 STATUSI_IZVJESTAJA = ["Čeka provjeru", "Potvrđeno", "Isplaćeno", "Vraćeno na ispravak"]
@@ -2390,13 +2422,17 @@ def _u_mjesecu(v, godina: int, mjesec: int) -> bool:
 
 
 def izvjestaj_instruktora(df_instrukcije: pd.DataFrame, df_termini: pd.DataFrame, df_grupe: pd.DataFrame,
-                          nastavnik: str, godina: int, mjesec: int) -> dict:
+                          nastavnik: str, godina: int, mjesec: int, df_honorari: pd.DataFrame | None = None) -> dict:
     """Odrađeni termini instruktora u mjesecu: instrukcije + grupni termini koje je održao.
-    NAMJERNO bez cijena i naplate."""
+    NAMJERNO bez cijena klijentu. 3.10.2026.: bez zakazanih i na vrijeme otkazanih termina; uz df_honorari
+    i honorar profesora (njegov iznos — smije ga vidjeti)."""
     instr = pd.DataFrame()
+    hon_ukupno, hon_nepoznat = 0, 0
     if not df_instrukcije.empty and "nastavnik" in df_instrukcije.columns:
         t = df_instrukcije[(df_instrukcije["nastavnik"] == nastavnik)
                            & df_instrukcije["datum"].apply(lambda v: _u_mjesecu(v, godina, mjesec))]
+        if "status_termina" in t.columns:
+            t = t[t["status_termina"].fillna("").isin(STATUSI_TERMINA_ODRADJENI)]
         t = t.sort_values("datum")
         instr = pd.DataFrame({
             "Datum": [str(v)[:10] for v in t["datum"]],
@@ -2405,6 +2441,13 @@ def izvjestaj_instruktora(df_instrukcije: pd.DataFrame, df_termini: pd.DataFrame
             "Trajanje (min)": [int(float(v or 0)) for v in t["duljina_min"]],
             "Oblik": t["oblik"],
         }).reset_index(drop=True)
+        if "status_termina" in t.columns:
+            instr["Status"] = [str(v or "Održan") for v in t["status_termina"]]
+        if df_honorari is not None:
+            hon = [honorar_termina(r, df_honorari) for _, r in t.iterrows()]
+            instr["Honorar (€)"] = [centi_u_tekst(c) if c is not None else "—" for c, _ in hon]
+            hon_ukupno += sum(c for c, _ in hon if c is not None)
+            hon_nepoznat += sum(1 for c, _ in hon if c is None)
     grupni = pd.DataFrame()
     if not df_termini.empty and "nastavnik_odrzao" in df_termini.columns:
         g = df_termini[(df_termini["nastavnik_odrzao"] == nastavnik)
@@ -2417,12 +2460,21 @@ def izvjestaj_instruktora(df_instrukcije: pd.DataFrame, df_termini: pd.DataFrame
             "Datum": [str(v)[:10] for v in g["datum"]],
             "Grupa": [labele.get(x, labela_matura_grupe(x)) for x in g["grupa_id"]],
         }).reset_index(drop=True)
+        if df_honorari is not None:
+            vremena = {} if df_grupe.empty else dict(zip(df_grupe["grupa_id"], df_grupe["vrijeme"]))
+            hon_g = [honorar_grupnog_sata(nastavnik, d, minute_grupnog_sata(vremena.get(x, "")), df_honorari)
+                     for d, x in zip(g["datum"], g["grupa_id"])]
+            grupni["Honorar (€)"] = [centi_u_tekst(c) if c is not None else "—" for c, _ in hon_g]
+            hon_ukupno += sum(c for c, _ in hon_g if c is not None)
+            hon_nepoznat += sum(1 for c, _ in hon_g if c is None)
     minute = int(instr["Trajanje (min)"].sum()) if not instr.empty else 0
     return {
         "nastavnik": nastavnik, "mjesec": f"{godina}-{mjesec:02d}",
         "instrukcije": instr, "grupni": grupni,
         "broj_instrukcija": len(instr), "sati_instrukcija": round(minute / 60, 2),
         "broj_grupnih_termina": len(grupni),
+        "honorar_ukupno_centi": hon_ukupno if df_honorari is not None else None,
+        "honorar_bez_pravila": hon_nepoznat,
     }
 
 
@@ -2458,6 +2510,10 @@ def pdf_izvjestaja_instruktora(izv: dict) -> bytes:
         Paragraph(f"Instruktor/ica: <b>{izv['nastavnik']}</b>", tekst),
         Paragraph(f"Instrukcije: <b>{izv['broj_instrukcija']}</b> termina, ukupno <b>{izv['sati_instrukcija']:g}</b> h"
                   f" · Grupni termini: <b>{izv['broj_grupnih_termina']}</b>", tekst),
+        Paragraph(f"Honorar ukupno: <b>{centi_u_tekst(izv['honorar_ukupno_centi'])} €</b>"
+                  + (f" (+ {izv.get('honorar_bez_pravila')} termina bez pravila — upisuje admin)"
+                     if izv.get("honorar_bez_pravila") else ""), tekst)
+        if izv.get("honorar_ukupno_centi") is not None else Spacer(1, 0),
         Paragraph(f"Generirano: {sada_zagreb().strftime('%d.%m.%Y. %H:%M')}", tekst),
         Spacer(1, 0.4 * cm),
     ]
@@ -2489,6 +2545,8 @@ def posalji_izvjestaj_instruktora(sheet, izv: dict) -> str:
         "poslano": sada, "broj_instrukcija": izv["broj_instrukcija"], "sati_instrukcija": izv["sati_instrukcija"],
         "broj_grupnih_termina": izv["broj_grupnih_termina"], "status": "Čeka provjeru", "azurirano": sada,
     }
+    if izv.get("honorar_ukupno_centi") is not None and "honorar_ukupno" in headers:
+        polja["honorar_ukupno"] = izv["honorar_ukupno_centi"] / 100
     if not df.empty:
         postojeci = df[(df["nastavnik"] == izv["nastavnik"]) & (df["mjesec"].astype(str) == izv["mjesec"])]
         if not postojeci.empty:
@@ -4408,3 +4466,586 @@ def html_trake_statusa(korak: int) -> str:
                         f"white-space:nowrap'>{znak}{naziv}</span>")
     return ("<div style='display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:2px 0 6px 0'>"
             + "<span style='color:#888'>→</span>".join(dijelovi) + "</div>")
+
+
+# ============================================================
+# 👩‍🏫 DODJELE · 💰 HONORARI · 📦 PAKETI SATI · 📅 ZAKAZANI TERMINI I OTKAZIVANJE · 📲 PODSJETNICI
+# (3.10.2026., Cakijeve odluke 2.–3.10.):
+#   - profesor vidi samo učenike koji su mu DODIJELJENI (tab Dodjele) i samo dopuštena polja;
+#     kontakt samo ako admin dopusti (radi prvog dogovora); dodjeljuju samo admini (Caki, Neira)
+#   - bilješka sa sata = Instrukcije_termini.napomena_javna → vidi je i roditelj u Moj CAKI
+#   - honorar profesora po pravilima (tab Honorari: po satu / po terminu / % cijene, vrijedi_od),
+#     admin smije ručno prepisati iznos na terminu (honorar_termina); profesor vidi samo svoj iznos
+#   - paketi sati unaprijed (tab Paketi_sati): termin se skida s paketa umjesto da ide u obračun
+#   - status termina: Zakazan / Održan / Otkazan na vrijeme / Otkazan kasno / Nije došao / Nadoknada
+#   - podsjetnik dan prije (pripremljena WhatsApp poruka — šalje admin)
+# Sve funkcije su čiste (DataFrame → podaci) osim onih koje pišu u Sheet (imaju `sheet` kao 1. argument).
+# ============================================================
+
+DODJELE_TAB = "Dodjele"
+DODJELE_HEADERS = ["dodjela_id", "ucenik_id", "ime_djeteta", "profesor", "predmet", "od", "do",
+                   "kontakt_dopusten", "napomena_za_profesora", "dodijelio", "azurirano"]
+HONORARI_TAB = "Honorari"
+HONORARI_HEADERS = ["honorar_id", "profesor", "vrsta", "nacin", "iznos", "vrijedi_od", "aktivan", "napomena"]
+HONORAR_VRSTE = ["Sve instrukcije", "Individualno", "Grupa", "Online", "Grupni sat (Upisi/Matura)"]
+HONORAR_NACINI = ["Po satu", "Po terminu", "Postotak od cijene"]
+PAKETI_TAB = "Paketi_sati"
+PAKETI_HEADERS = ["paket_id", "ucenik_id", "ime_djeteta", "predmet", "sati", "datum_kupnje", "vrijedi_do",
+                  "cijena", "status", "napomena"]
+INSTRUKCIJE_STUPCI_V2 = ["status_termina", "vrijeme", "paket_id", "honorar_termina"]
+
+STATUSI_TERMINA = ["Održan", "Zakazan", "Otkazan na vrijeme", "Otkazan kasno", "Nije došao", "Nadoknada"]
+OZNAKE_STATUSA_TERMINA = {
+    "Održan": "✅ Održan", "Zakazan": "📅 Zakazan", "Otkazan na vrijeme": "↩️ Otkazan na vrijeme (bez naplate)",
+    "Otkazan kasno": "⏰ Otkazan kasno (< 24 h — naplaćuje se)", "Nije došao": "🚫 Nije došao (naplaćuje se)",
+    "Nadoknada": "🔁 Nadoknada (bez naplate)",
+}
+OTKAZ_SATI = 24   # pravilo otkazivanja: kasnije od toga = naplaćuje se
+# Termini koji se NE naplaćuju — status_obracuna izvan STATUSI_ZA_OBRACUN, pa ih ni Apps Script
+# (mjesečni obračun) ni jednokratni obračun nikad ne uzimaju.
+STATUSI_BEZ_NAPLATE = {
+    "Zakazan": "Zakazano",
+    "Otkazan na vrijeme": "Otkazano – bez naplate",
+    "Nadoknada": "Nadoknada – bez naplate",
+}
+STATUS_OBRACUNA_PAKET = "Iz paketa"
+STATUSI_TERMINA_ODRADJENI = ("", "Održan", "Otkazan kasno", "Nije došao", "Nadoknada")   # ulaze u izvještaj
+STATUSI_TERMINA_S_HONORAROM = ("", "Održan", "Otkazan kasno", "Nije došao", "Nadoknada")
+STATUSI_TERMINA_PRIHOD = ("", "Održan", "Otkazan kasno", "Nije došao")
+GRUPNI_SAT_MIN_ZADANO = 90
+
+
+def _id(prefiks: str) -> str:
+    return prefiks + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+
+
+def _datum(v):
+    """'2026-10-03', '2026-10-03 17:00', date → date ili None."""
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = str(v or "").strip()
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        try:
+            return date(int(m[1]), int(m[2]), int(m[3]))
+        except ValueError:
+            return None
+    m = re.match(r"(\d{1,2})[./](\d{1,2})[./](\d{4})", s)
+    if m:
+        try:
+            return date(int(m[3]), int(m[2]), int(m[1]))
+        except ValueError:
+            return None
+    return None
+
+
+def _broj(v):
+    """'27', '27,5', 27.5 → float ili None."""
+    s = str(v if v is not None else "").strip().replace(",", ".")
+    if s in ("", "nan", "None"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _osiguraj_tab_stupce(sheet, naziv: str, headers: list) -> bool:
+    """Kreira tab s headerom ako ne postoji; postojećem doda stupce koji nedostaju (desni kraj). True = nešto dodano."""
+    try:
+        ws = sheet.worksheet(naziv)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=naziv, rows=500, cols=len(headers))
+        ws.append_row(headers, value_input_option="RAW")
+        return True
+    postojeci = ws.row_values(1)
+    nedostaju = [h for h in headers if h not in postojeci]
+    if not nedostaju:
+        return False
+    if ws.col_count < len(postojeci) + len(nedostaju):
+        ws.add_cols(len(postojeci) + len(nedostaju) - ws.col_count)
+    ws.update(range_name=gspread.utils.rowcol_to_a1(1, len(postojeci) + 1), values=[nedostaju],
+              value_input_option="RAW")
+    return True
+
+
+def postavi_tabove_dodjele(sheet) -> list:
+    """⚙️ Jednokratno (sigurno ponoviti): tabovi Dodjele, Honorari, Paketi_sati + novi stupci instrukcija."""
+    promjene = []
+    for naziv, h in [(DODJELE_TAB, DODJELE_HEADERS), (HONORARI_TAB, HONORARI_HEADERS), (PAKETI_TAB, PAKETI_HEADERS)]:
+        if _osiguraj_tab_stupce(sheet, naziv, h):
+            promjene.append(naziv)
+    try:
+        if _osiguraj_tab_stupce(sheet, "Instrukcije_termini", INSTRUKCIJE_STUPCI_V2):
+            promjene.append("Instrukcije_termini (status_termina, vrijeme, paket_id, honorar_termina)")
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+    return promjene
+
+
+def tabovi_dodjele_postoje(sheet) -> bool:
+    imena = {ws.title for ws in sheet.worksheets()}
+    return {DODJELE_TAB, HONORARI_TAB, PAKETI_TAB} <= imena
+
+
+# ---------------------------------------------------------------- 👩‍🏫 DODJELE
+
+def load_dodjele(sheet) -> pd.DataFrame:
+    return _load_opcionalno(sheet, DODJELE_TAB)
+
+
+def dodjela_aktivna(red, danas: date) -> bool:
+    od, do = _datum(red.get("od")), _datum(red.get("do"))
+    return (od is None or od <= danas) and (do is None or do >= danas)
+
+
+def aktivne_dodjele(df_dodjele: pd.DataFrame, danas: date, profesor: str = "", ucenik_id: str = "") -> pd.DataFrame:
+    if df_dodjele is None or df_dodjele.empty or "profesor" not in df_dodjele.columns:
+        return pd.DataFrame(columns=DODJELE_HEADERS)
+    df = df_dodjele[df_dodjele.apply(lambda r: dodjela_aktivna(r, danas), axis=1)]
+    if profesor:
+        df = df[df["profesor"].astype(str) == profesor]
+    if ucenik_id:
+        df = df[df["ucenik_id"].astype(str) == str(ucenik_id)]
+    return df
+
+
+def dodaj_dodjelu(sheet, ucenik_id: str, ime_djeteta: str, profesor: str, predmet: str = "",
+                  kontakt_dopusten: bool = False, napomena_za_profesora: str = "", od=None, do=None,
+                  dodijelio: str = "admin") -> str:
+    """Novi red u Dodjele. Ista aktivna dodjela (učenik + profesor + predmet) se ne duplicira."""
+    if not str(ucenik_id).strip() or not str(profesor).strip():
+        raise ValueError("Odaberi učenika i profesora.")
+    _osiguraj_tab_stupce(sheet, DODJELE_TAB, DODJELE_HEADERS)
+    ws = sheet.worksheet(DODJELE_TAB)
+    danas = sada_zagreb().date()
+    postojece = aktivne_dodjele(_load_worksheet_df(ws), danas, profesor, ucenik_id)
+    if not postojece.empty and (postojece["predmet"].astype(str).str.lower() == str(predmet).lower()).any():
+        raise ValueError(f"{ime_djeteta} je već dodijeljen/a profesoru {profesor}"
+                         + (f" za {predmet}" if predmet else "") + ".")
+    dodjela_id = _id("DJ-")
+    _dodaj_red_po_nazivu(ws, {
+        "dodjela_id": dodjela_id, "ucenik_id": str(ucenik_id), "ime_djeteta": str(ime_djeteta),
+        "profesor": str(profesor), "predmet": str(predmet or ""),
+        "od": str(od or danas), "do": str(do or ""),
+        "kontakt_dopusten": "Da" if kontakt_dopusten else "Ne",
+        "napomena_za_profesora": str(napomena_za_profesora or "")[:1000],
+        "dodijelio": str(dodijelio), "azurirano": sada_zagreb().strftime("%Y-%m-%d %H:%M"),
+    })
+    return dodjela_id
+
+
+def azuriraj_dodjelu(sheet, dodjela_id: str, polja: dict):
+    """Promjena dopuštenja kontakta, napomene ili kraja dodjele (do = datum)."""
+    ws = sheet.worksheet(DODJELE_TAB)
+    df = _load_worksheet_df(ws)
+    red = df[df["dodjela_id"] == dodjela_id]
+    if red.empty:
+        raise ValueError("Dodjela nije pronađena — osvježi stranicu.")
+    dopusteno = {k: v for k, v in polja.items() if k in ("kontakt_dopusten", "napomena_za_profesora", "do", "predmet")}
+    if "kontakt_dopusten" in dopusteno and not isinstance(dopusteno["kontakt_dopusten"], str):
+        dopusteno["kontakt_dopusten"] = "Da" if dopusteno["kontakt_dopusten"] else "Ne"
+    dopusteno["azurirano"] = sada_zagreb().strftime("%Y-%m-%d %H:%M")
+    _azuriraj_polja(ws, int(red.iloc[0]["_row"]), {k: str(v) for k, v in dopusteno.items()})
+
+
+def zavrsi_dodjelu(sheet, dodjela_id: str):
+    """Dodjela vrijedi do jučer → profesor odmah više ne vidi učenika."""
+    azuriraj_dodjelu(sheet, dodjela_id, {"do": str(sada_zagreb().date() - timedelta(days=1))})
+
+
+POLJA_ZA_PROFESORA = ["ucenik_id", "ime_djeteta", "skola", "predmet", "napomena_za_profesora"]
+POLJA_KONTAKTA = ["ime_roditelja", "mobitel_roditelja", "mobitel_djeteta"]
+
+
+def ucenici_profesora(df_dodjele: pd.DataFrame, df_ucenici: pd.DataFrame, profesor: str, danas: date) -> pd.DataFrame:
+    """Što profesor smije vidjeti: samo dodijeljeni učenici, samo dopuštena polja.
+    Kontakt (roditelj + mobiteli) samo kad je kontakt_dopusten = Da. Nikad mailovi, cijene, financije."""
+    stupci = POLJA_ZA_PROFESORA + ["kontakt_dopusten"] + POLJA_KONTAKTA
+    dod = aktivne_dodjele(df_dodjele, danas, profesor=profesor)
+    if dod.empty:
+        return pd.DataFrame(columns=stupci)
+    uc = {} if df_ucenici is None or df_ucenici.empty else \
+        {str(r["ucenik_id"]): r for _, r in df_ucenici.iterrows()}
+    redovi = {}
+    for _, d in dod.iterrows():
+        uid = str(d["ucenik_id"])
+        u = uc.get(uid, {})
+        r = redovi.setdefault(uid, {
+            "ucenik_id": uid, "ime_djeteta": str(u.get("ime_djeteta", "") or d.get("ime_djeteta", "")),
+            "skola": str(u.get("skola", "") or ""), "predmet": [], "napomena_za_profesora": [],
+            "kontakt_dopusten": "Ne", **{k: "" for k in POLJA_KONTAKTA}})
+        if str(d.get("predmet", "") or "") and d["predmet"] not in r["predmet"]:
+            r["predmet"].append(str(d["predmet"]))
+        if str(d.get("napomena_za_profesora", "") or "").strip():
+            r["napomena_za_profesora"].append(str(d["napomena_za_profesora"]).strip())
+        if str(d.get("kontakt_dopusten", "")) == "Da":
+            r["kontakt_dopusten"] = "Da"
+            for k in POLJA_KONTAKTA:
+                r[k] = str(u.get(k, "") or "")
+    out = pd.DataFrame([dict(r, predmet=", ".join(r["predmet"]),
+                             napomena_za_profesora=" · ".join(r["napomena_za_profesora"])) for r in redovi.values()])
+    return out[stupci].sort_values("ime_djeteta").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------- 🔎 stupanj za filter Učenici
+
+STUPANJ_KRATICE = {"Osnovna škola": "OŠ", "Srednja škola": "SŠ", "Fakultet": "Fakultet"}
+
+
+def najnoviji_stupanj(df_prijave: pd.DataFrame) -> dict:
+    """ucenik_id → 'OŠ' / 'SŠ' / 'Fakultet' iz NAJNOVIJE prijave koja ima stupanj (dijete raste:
+    stara prijava ostaje OŠ, nova je SŠ). Matura i Upisi bez stupnja: Matura = SŠ, Upisi = OŠ."""
+    out = {}
+    if df_prijave is None or df_prijave.empty:
+        return out
+    df = df_prijave.copy()
+    df["_t"] = df.get("timestamp_prijave", pd.Series("", index=df.index)).apply(
+        lambda v: _datum(v) or date(1900, 1, 1))
+    df = df.reset_index(drop=True).reset_index().sort_values(["_t", "index"], kind="stable")
+    for _, r in df.iterrows():
+        st_ = str(r.get("stupanj_skolovanja", "") or "").strip()
+        tip = str(r.get("program_tip", "") or "").strip()
+        if not st_:
+            st_ = "Srednja škola" if tip == "Matura" else ("Osnovna škola" if tip == "Upisi" or r.get("komponenta") else "")
+        if st_:
+            out[str(r["ucenik_id"])] = STUPANJ_KRATICE.get(st_, st_)
+    return out
+
+
+# ---------------------------------------------------------------- 📦 PAKETI SATI
+
+def load_paketi(sheet) -> pd.DataFrame:
+    return _load_opcionalno(sheet, PAKETI_TAB)
+
+
+def dodaj_paket(sheet, ucenik_id: str, ime_djeteta: str, sati, predmet: str = "", datum_kupnje=None,
+                vrijedi_do=None, cijena=None, napomena: str = "") -> str:
+    sati_f = _broj(sati)
+    if not sati_f or sati_f <= 0:
+        raise ValueError("Broj sati paketa mora biti veći od 0.")
+    _osiguraj_tab_stupce(sheet, PAKETI_TAB, PAKETI_HEADERS)
+    paket_id = _id("PK-")
+    _dodaj_red_po_nazivu(sheet.worksheet(PAKETI_TAB), {
+        "paket_id": paket_id, "ucenik_id": str(ucenik_id), "ime_djeteta": str(ime_djeteta),
+        "predmet": str(predmet or ""), "sati": sati_f, "datum_kupnje": str(datum_kupnje or sada_zagreb().date()),
+        "vrijedi_do": str(vrijedi_do or ""), "cijena": "" if cijena in (None, "") else float(cijena),
+        "status": "Aktivan", "napomena": str(napomena or ""),
+    })
+    return paket_id
+
+
+def zatvori_paket(sheet, paket_id: str):
+    ws = sheet.worksheet(PAKETI_TAB)
+    df = _load_worksheet_df(ws)
+    red = df[df["paket_id"] == paket_id]
+    if red.empty:
+        raise ValueError("Paket nije pronađen.")
+    _azuriraj_polja(ws, int(red.iloc[0]["_row"]), {"status": "Zatvoren"})
+
+
+def _iskoristeno_min(df_instr: pd.DataFrame, paket_id: str) -> float:
+    if df_instr is None or df_instr.empty or "paket_id" not in df_instr.columns:
+        return 0.0
+    t = df_instr[(df_instr["paket_id"].astype(str) == paket_id)
+                 & (df_instr.get("status_obracuna", pd.Series("", index=df_instr.index)) == STATUS_OBRACUNA_PAKET)]
+    return float(sum(_broj(v) or 0 for v in t["duljina_min"]))
+
+
+def stanje_paketa(df_paketi: pd.DataFrame, df_instr: pd.DataFrame, ucenik_id: str) -> list:
+    """Paketi učenika s potrošnjom: [{paket_id, predmet, sati, iskoristeno_h, preostalo_h, vrijedi_do, status, datum_kupnje}]."""
+    if df_paketi is None or df_paketi.empty or "ucenik_id" not in df_paketi.columns:
+        return []
+    out = []
+    for _, p in df_paketi[df_paketi["ucenik_id"].astype(str) == str(ucenik_id)].iterrows():
+        sati = _broj(p.get("sati")) or 0
+        isk = round(_iskoristeno_min(df_instr, str(p["paket_id"])) / 60, 2)
+        out.append({"paket_id": str(p["paket_id"]), "predmet": str(p.get("predmet", "") or ""), "sati": sati,
+                    "iskoristeno_h": isk, "preostalo_h": round(sati - isk, 2),
+                    "vrijedi_do": str(p.get("vrijedi_do", "") or ""), "status": str(p.get("status", "") or "Aktivan"),
+                    "datum_kupnje": str(p.get("datum_kupnje", "") or "")})
+    return out
+
+
+def paket_za_termin(df_paketi: pd.DataFrame, df_instr: pd.DataFrame, ucenik_id: str, predmet: str,
+                    datum, duljina_min) -> str:
+    """Aktivan paket koji pokriva termin (predmet prazan = svi predmeti; najstariji prvi). '' = nema."""
+    d = _datum(datum)
+    trebam = _broj(duljina_min) or 0
+    kandidati = []
+    for p in stanje_paketa(df_paketi, df_instr, ucenik_id):
+        if p["status"] != "Aktivan":
+            continue
+        if p["predmet"] and str(p["predmet"]).strip().lower() != str(predmet or "").strip().lower():
+            continue
+        kupljen, vrijedi = _datum(p["datum_kupnje"]), _datum(p["vrijedi_do"])
+        if d and ((kupljen and kupljen > d) or (vrijedi and vrijedi < d)):
+            continue
+        if p["preostalo_h"] * 60 + 1e-9 >= trebam:
+            kandidati.append((kupljen or date(1900, 1, 1), p["paket_id"]))
+    return sorted(kandidati)[0][1] if kandidati else ""
+
+
+def portal_paketi(df_paketi: pd.DataFrame, df_instr: pd.DataFrame, ucenik_id: str) -> pd.DataFrame:
+    stanje = stanje_paketa(df_paketi, df_instr, ucenik_id)
+    if not stanje:
+        return pd.DataFrame()
+    return pd.DataFrame([{
+        "Paket": f"{p['sati']:g} h" + (f" · {p['predmet']}" if p["predmet"] else ""),
+        "Kupljen": prikazi_datum(p["datum_kupnje"]), "Iskorišteno (h)": p["iskoristeno_h"],
+        "Preostalo (h)": p["preostalo_h"], "Vrijedi do": prikazi_datum(p["vrijedi_do"]) if p["vrijedi_do"] else "—",
+        "Status": p["status"]} for p in stanje])
+
+
+# ---------------------------------------------------------------- 📅 STATUS TERMINA
+
+def obracun_za_status(status_termina: str, gotovina: bool = False, paket_id: str = "") -> str:
+    """status_obracuna za novi status termina (prije obračuna)."""
+    if status_termina in STATUSI_BEZ_NAPLATE:
+        return STATUSI_BEZ_NAPLATE[status_termina]
+    if gotovina:
+        return STATUS_OBRACUNA_GOTOVINA
+    if paket_id:
+        return STATUS_OBRACUNA_PAKET
+    return "Neobračunato"
+
+
+def promijeni_status_termina(sheet, termin_id: str, novi_status: str, biljeska: str | None = None,
+                             nastavnik: str = "") -> str:
+    """Zakazan → Održan / Otkazan… (ili ispravak statusa). Obračunati termin se ne mijenja.
+    Kad termin postaje naplativ, prvo pokuša skinuti s paketa. nastavnik = samo svoj termin."""
+    if novi_status not in STATUSI_TERMINA:
+        raise ValueError("Nepoznat status termina.")
+    ws = sheet.worksheet("Instrukcije_termini")
+    headers = ws.row_values(1)
+    df = _load_worksheet_df(ws)
+    red = df[df["termin_id"] == termin_id]
+    if red.empty:
+        raise ValueError("Termin nije pronađen — osvježi stranicu.")
+    r = red.iloc[0]
+    if nastavnik and str(r["nastavnik"]) != nastavnik:
+        raise ValueError("Možete mijenjati samo svoje termine.")
+    if str(r.get("status_obracuna", "")) in ("Obračunato", "Otpisano"):
+        raise ValueError("Termin je već obračunat — promjenu radi admin u 💶 Financije.")
+    if novi_status not in ("Zakazan", "Otkazan na vrijeme") and (_datum(r["datum"]) or date.max) > sada_zagreb().date():
+        raise ValueError("Termin je u budućnosti — može biti samo Zakazan ili Otkazan na vrijeme.")
+    polja = {"status_termina": novi_status}
+    gotovina = str(r.get("placeno_oznaka_prof", "")) == PLACENO_GOTOVINOM
+    paket_id = ""
+    if novi_status not in STATUSI_BEZ_NAPLATE and not gotovina:
+        paket_id = str(r.get("paket_id", "") or "")
+        if not paket_id:
+            paket_id = paket_za_termin(load_paketi(sheet), df, r["ucenik_id"], r.get("predmet", ""),
+                                       r["datum"], r["duljina_min"])
+    if "status_obracuna" in headers:
+        polja["status_obracuna"] = obracun_za_status(novi_status, gotovina, paket_id)
+    if "paket_id" in headers:
+        polja["paket_id"] = paket_id if novi_status not in STATUSI_BEZ_NAPLATE else ""
+    if paket_id and "nacin_naplate" in headers:
+        polja["nacin_naplate"] = "Paket"
+    elif "nacin_naplate" in headers and str(r.get("nacin_naplate", "")) == "Paket":
+        polja["nacin_naplate"] = zadnji_nacin_naplate(df, r["ucenik_id"], r.get("predmet", ""))
+    if biljeska is not None:
+        polja["napomena_javna"] = str(biljeska)[:1000]
+    _azuriraj_polja(ws, int(r["_row"]), {k: v for k, v in polja.items() if k in headers}, headers)
+    return novi_status
+
+
+def uredi_biljesku_sata(sheet, termin_id: str, javna: str, interna: str | None = None, nastavnik: str = "",
+                        rok_dana: int | None = None):
+    """📒 Bilješka sa sata (javna — vidi roditelj) i interna napomena. Profesor: samo svoj termin, u roku."""
+    ws = sheet.worksheet("Instrukcije_termini")
+    headers = ws.row_values(1)
+    df = _load_worksheet_df(ws)
+    red = df[df["termin_id"] == termin_id]
+    if red.empty:
+        raise ValueError("Termin nije pronađen — osvježi stranicu.")
+    r = red.iloc[0]
+    if nastavnik and str(r["nastavnik"]) != nastavnik:
+        raise ValueError("Možete uređivati samo svoje termine.")
+    if rok_dana is not None:
+        d = _datum(r["datum"])
+        if d and d < sada_zagreb().date() - timedelta(days=rok_dana):
+            raise ValueError(f"Bilješku možete mijenjati najviše {rok_dana} dana nakon termina — javite se adminu.")
+    polja = {"napomena_javna": str(javna or "")[:1000]}
+    if interna is not None:
+        polja["napomena_interna"] = str(interna)[:1000]
+    _azuriraj_polja(ws, int(r["_row"]), polja, headers)
+
+
+# ---------------------------------------------------------------- 📲 PODSJETNICI
+
+PODSJETNIK_TEKST = ("Poštovani, podsjećamo: {kada} {vrijeme_tekst}{ime} ima instrukcije iz predmeta {predmet}"
+                    "{profesor}. Ako trebate otkazati, javite nam najkasnije {sati} sati ranije — kasnije "
+                    "otkazivanje se naplaćuje. Hvala! CAKI centar")
+
+
+def podsjetnici_za_datum(df_instr: pd.DataFrame, df_ucenici: pd.DataFrame, datum: date, danas: date | None = None) -> list:
+    """Zakazani termini na datum → [{termin_id, ime_djeteta, nastavnik, vrijeme, predmet, tekst, mobitel_roditelja,
+    mobitel_djeteta}]. Ništa se ne šalje — admin klikne WhatsApp link."""
+    if df_instr is None or df_instr.empty or "status_termina" not in df_instr.columns:
+        return []
+    danas = danas or sada_zagreb().date()
+    t = df_instr[(df_instr["status_termina"] == "Zakazan") & (df_instr["datum"].apply(_datum) == datum)]
+    uc = {} if df_ucenici is None or df_ucenici.empty else {str(r["ucenik_id"]): r for _, r in df_ucenici.iterrows()}
+    kada = "sutra" if datum == danas + timedelta(days=1) else ("danas" if datum == danas else
+                                                               f"{DANI_U_TJEDNU[datum.weekday()].lower()} {datum:%d.%m.}")
+    out = []
+    for _, r in t.sort_values("vrijeme" if "vrijeme" in t.columns else "datum").iterrows():
+        u = uc.get(str(r["ucenik_id"]), {})
+        vrijeme = str(r.get("vrijeme", "") or "").strip()
+        tekst = PODSJETNIK_TEKST.format(
+            kada=kada, vrijeme_tekst=f"u {vrijeme} " if vrijeme else "", ime=r["ime_djeteta"],
+            predmet=str(r.get("predmet", "") or "—").lower() if r.get("predmet") else "—",
+            profesor=f" (prof. {r['nastavnik']})" if str(r.get("nastavnik", "")).strip() else "", sati=OTKAZ_SATI)
+        out.append({"termin_id": r["termin_id"], "ime_djeteta": r["ime_djeteta"], "nastavnik": r["nastavnik"],
+                    "vrijeme": vrijeme, "predmet": str(r.get("predmet", "") or ""), "tekst": tekst,
+                    "mobitel_roditelja": str(u.get("mobitel_roditelja", "") or ""),
+                    "mobitel_djeteta": str(u.get("mobitel_djeteta", "") or "")})
+    return out
+
+
+# ---------------------------------------------------------------- 💰 HONORARI
+
+def load_honorari(sheet) -> pd.DataFrame:
+    return _load_opcionalno(sheet, HONORARI_TAB)
+
+
+def dodaj_honorar(sheet, profesor: str, vrsta: str, nacin: str, iznos, vrijedi_od=None, napomena: str = "") -> str:
+    if vrsta not in HONORAR_VRSTE or nacin not in HONORAR_NACINI:
+        raise ValueError("Nepoznata vrsta ili način honorara.")
+    iz = _broj(iznos)
+    if iz is None or iz < 0 or (nacin == "Postotak od cijene" and iz > 100):
+        raise ValueError("Iznos nije ispravan (postotak 0–100, ostalo ≥ 0 €).")
+    _osiguraj_tab_stupce(sheet, HONORARI_TAB, HONORARI_HEADERS)
+    hid = _id("HN-")
+    _dodaj_red_po_nazivu(sheet.worksheet(HONORARI_TAB), {
+        "honorar_id": hid, "profesor": profesor, "vrsta": vrsta, "nacin": nacin, "iznos": iz,
+        "vrijedi_od": str(vrijedi_od or sada_zagreb().date()), "aktivan": "Da", "napomena": str(napomena or "")})
+    return hid
+
+
+def ugasi_honorar(sheet, honorar_id: str):
+    ws = sheet.worksheet(HONORARI_TAB)
+    df = _load_worksheet_df(ws)
+    red = df[df["honorar_id"] == honorar_id]
+    if red.empty:
+        raise ValueError("Pravilo nije pronađeno.")
+    _azuriraj_polja(ws, int(red.iloc[0]["_row"]), {"aktivan": "Ne"})
+
+
+def pravilo_honorara(df_hon: pd.DataFrame, profesor: str, vrste: list, datum):
+    """Najprikladnije pravilo: prva vrsta iz `vrste` koja ima pravilo, najnoviji vrijedi_od ≤ datum."""
+    if df_hon is None or df_hon.empty or "profesor" not in df_hon.columns:
+        return None
+    d = _datum(datum) or date.max
+    akt = df_hon["aktivan"].astype(str) if "aktivan" in df_hon.columns else pd.Series("Da", index=df_hon.index)
+    df = df_hon[(df_hon["profesor"].astype(str) == profesor) & (akt != "Ne")]
+    for vrsta in vrste:
+        k = df[df["vrsta"] == vrsta]
+        k = k[k["vrijedi_od"].apply(lambda v: (_datum(v) or date.min) <= d)]
+        if not k.empty:
+            k = k.assign(_od=k["vrijedi_od"].apply(lambda v: _datum(v) or date.min)).sort_values("_od", kind="stable")
+            return k.iloc[-1].to_dict()
+    return None
+
+
+def _iznos_po_pravilu(pravilo: dict, minute: float, cijena_centi) -> int | None:
+    iz = _broj(pravilo.get("iznos"))
+    if iz is None:
+        return None
+    if pravilo["nacin"] == "Po satu":
+        return int(round(iz * 100 * minute / 60))
+    if pravilo["nacin"] == "Po terminu":
+        return int(round(iz * 100))
+    if cijena_centi is None:
+        return None
+    return int(round(cijena_centi * iz / 100))
+
+
+def honorar_termina(red, df_hon: pd.DataFrame):
+    """(centi, opis) za jedan termin instrukcija. None = nema pravila (admin upiše ručno)."""
+    status = str(red.get("status_termina", "") or "")
+    if status not in STATUSI_TERMINA_S_HONORAROM:
+        return 0, "bez honorara (" + status.lower() + ")"
+    rucno = u_cente(red.get("honorar_termina"))
+    if rucno is not None and str(red.get("honorar_termina", "")).strip() not in ("", "nan"):
+        return rucno, "ručno"
+    oblik = str(red.get("oblik", "") or "")
+    pravilo = pravilo_honorara(df_hon, str(red.get("nastavnik", "")),
+                               [oblik, "Sve instrukcije"] if oblik in HONORAR_VRSTE else ["Sve instrukcije"], red.get("datum"))
+    if not pravilo:
+        return None, "nema pravila"
+    iznos = _iznos_po_pravilu(pravilo, _broj(red.get("duljina_min")) or 0, u_cente(red.get("cijena_termina")))
+    if iznos is None:
+        return None, "nema cijene termina"
+    iz = f"{_broj(pravilo['iznos']):g}".replace(".", ",")
+    opis = {"Po satu": f"{iz} €/h", "Po terminu": f"{iz} €/termin",
+            "Postotak od cijene": f"{iz} % cijene"}[pravilo["nacin"]]
+    return iznos, opis
+
+
+def minute_grupnog_sata(vrijeme) -> int:
+    """'8,30-10,00' / '17:00–18:30' → 90; nepoznato → GRUPNI_SAT_MIN_ZADANO."""
+    s = str(vrijeme or "").replace(",", ":").replace(".", ":")
+    m = re.findall(r"(\d{1,2}):(\d{2})", s)
+    if len(m) >= 2:
+        a = int(m[0][0]) * 60 + int(m[0][1])
+        b = int(m[1][0]) * 60 + int(m[1][1])
+        if b > a:
+            return b - a
+    return GRUPNI_SAT_MIN_ZADANO
+
+
+def honorar_grupnog_sata(profesor: str, datum, minute: int, df_hon: pd.DataFrame):
+    pravilo = pravilo_honorara(df_hon, profesor, ["Grupni sat (Upisi/Matura)"], datum)
+    if not pravilo or pravilo["nacin"] == "Postotak od cijene":
+        return None, "nema pravila"
+    return _iznos_po_pravilu(pravilo, minute, None), \
+        f"{_broj(pravilo['iznos']):g} € {pravilo['nacin'].lower()}".replace(".", ",")
+
+
+def zarada_instrukcija(df_instr: pd.DataFrame, df_hon: pd.DataFrame, godina: int, mjesec: int) -> pd.DataFrame:
+    """📈 Po profesoru i predmetu: termini, sati, prihod (cijena naplativih termina), honorar, razlika.
+    Prihod iz paketa računa se po cijeni termina (približno)."""
+    stupci = ["Profesor", "Predmet", "Termina", "Sati", "Prihod (€)", "Honorar (€)", "Razlika (€)", "Bez pravila"]
+    if df_instr is None or df_instr.empty:
+        return pd.DataFrame(columns=stupci)
+    t = df_instr[df_instr["datum"].apply(lambda v: _u_mjesecu(v, godina, mjesec))]
+    if "status_termina" in t.columns:
+        t = t[t["status_termina"].fillna("").isin(STATUSI_TERMINA_ODRADJENI)]
+    redovi = {}
+    for _, r in t.iterrows():
+        k = (str(r["nastavnik"]), str(r.get("predmet", "") or "—"))
+        x = redovi.setdefault(k, {"Termina": 0, "min": 0.0, "prihod": 0, "honorar": 0, "bez": 0})
+        x["Termina"] += 1
+        x["min"] += _broj(r.get("duljina_min")) or 0
+        if str(r.get("status_termina", "") or "") in STATUSI_TERMINA_PRIHOD \
+                and str(r.get("status_obracuna", "")) != "Otpisano":
+            x["prihod"] += u_cente(r.get("cijena_termina")) or 0
+        h, _ = honorar_termina(r, df_hon)
+        if h is None:
+            x["bez"] += 1
+        else:
+            x["honorar"] += h
+    out = [{"Profesor": p, "Predmet": pr, "Termina": x["Termina"], "Sati": round(x["min"] / 60, 2),
+            "Prihod (€)": x["prihod"] / 100, "Honorar (€)": x["honorar"] / 100,
+            "Razlika (€)": (x["prihod"] - x["honorar"]) / 100, "Bez pravila": x["bez"]}
+           for (p, pr), x in sorted(redovi.items())]
+    return pd.DataFrame(out, columns=stupci)
+
+
+def postavi_honorar_termina(sheet, termin_id: str, iznos):
+    """Admin ručno prepiše honorar jednog termina (None/'' = vrati na pravilo)."""
+    ws = sheet.worksheet("Instrukcije_termini")
+    headers = ws.row_values(1)
+    if "honorar_termina" not in headers:
+        raise ValueError("Nema stupca honorar_termina — ⚙️ Jednokratno postavljanje → Dodjele/Honorari/Paketi.")
+    df = _load_worksheet_df(ws)
+    red = df[df["termin_id"] == termin_id]
+    if red.empty:
+        raise ValueError("Termin nije pronađen.")
+    _azuriraj_polja(ws, int(red.iloc[0]["_row"]),
+                    {"honorar_termina": "" if iznos in (None, "") else float(iznos)}, headers)
