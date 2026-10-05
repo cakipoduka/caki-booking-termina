@@ -26,6 +26,15 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+# podaci.py zna KOJI JE KLJUC ZAPISA u kojem tabu (5.10.2026.).
+# Uvoz je u try/except da ova datoteka ostane upotrebljiva i sama, bez modula.
+try:
+    from podaci import dodaj_kljuc
+except ImportError:  # modul jos nije u ovom repou
+    def dodaj_kljuc(df, tab):
+        return df
+
+
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # Nazivi komponenti — kod : čitljiva labela za dropdown
@@ -151,6 +160,64 @@ def get_gspread_client(service_account_info: dict):
 
 # --- Učitavanje podataka ---
 
+def _pravi_stupci(df) -> list:
+    """Stupci koji dolaze iz Sheeta — bez nasih pomocnih (`_row`, `_kljuc`, ...).
+
+    Vazno: bez ovoga bi redak koji je u Sheetu POTPUNO prazan izgledao neprazan
+    (jer smo mu mi dodali `_kljuc_izvor`), pa se prazni retci ne bi prepoznali.
+    """
+    return [k for k in df.columns if not str(k).startswith("_")]
+
+
+def _je_prazno(v) -> bool:
+    """Je li celija prazna (None, NaN, '' ili tekst 'nan')."""
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(v).strip().lower() in ("", "nan", "none", "nat", "<na>")
+
+
+def _load_df_ws(df: pd.DataFrame, ws) -> pd.DataFrame:
+    """Zajednički dio za oba učitavanja (obican i UNFORMATTED_VALUE).
+
+    Uz `_row` (broj retka, kako je bilo i do sada) dodaje `_kljuc` = KLJUC ZAPISA
+    iz taba (ucenik_id, redak_id, ...). `_row` ostaje nepromijenjen da nijedan
+    postojeci poziv ne pukne; `_kljuc` je ono na sto se kasnije veze baza.
+    """
+    df["_row"] = range(2, len(df) + 2)   # i prazan tab mora imati stupac _row, kao i do sada
+    if not df.empty:
+        # upozorenje se gleda PRIJE dodavanja nasih stupaca, da prazan redak ostane prazan
+        _upozori_prazne_retke(df, getattr(ws, "title", "") or "")
+    return dodaj_kljuc(df, getattr(ws, "title", "") or "")
+
+
+def _upozori_prazne_retke(df: pd.DataFrame, naziv: str) -> int:
+    """Broji retke u kojima su SVE celije prazne i javlja ih. Ne mijenja podatke.
+
+    Google Sheet vraca takve retke na kraju taba; skripta za uvoz ih preskace.
+    Ako ih ima, broj redaka u Sheetu NIJE jednak broju zapisa — to se mora vidjeti,
+    a ne izgubiti tiho. U bazi takvih redaka nema.
+    """
+    if df is None or df.empty:
+        return 0
+    pravi = _pravi_stupci(df)
+    if not pravi:
+        return 0
+    try:
+        maska = df[pravi].apply(lambda r: all(_je_prazno(v) for v in r.values), axis=1)
+    except Exception:
+        return 0
+    broj = int(maska.sum())
+    if broj:
+        print(f"[podaci] UPOZORENJE: tab {naziv!r} ima {broj} praznih redaka "
+              f"(od {len(df)}) — oni se ne uvoze u bazu")
+    return broj
+
+
 def _load_worksheet_df(ws) -> pd.DataFrame:
     """Robustno učitavanje - radi ispravno i kad tab ima samo header, bez ijednog retka podataka.
     Zaglavlje se posebno čita samo kad tab nema redaka (inače 1 čitanje umjesto 2)."""
@@ -159,8 +226,7 @@ def _load_worksheet_df(ws) -> pd.DataFrame:
         df = pd.DataFrame(columns=ws.row_values(1))
     else:
         df = pd.DataFrame(records)
-    df["_row"] = range(2, len(df) + 2)
-    return df
+    return _load_df_ws(df, ws)
 
 
 def load_ucenici(sheet) -> pd.DataFrame:
@@ -1198,7 +1264,7 @@ def _load_df_neformatirano(ws) -> pd.DataFrame:
     records = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
     df = pd.DataFrame(records) if records else pd.DataFrame(columns=ws.row_values(1))
     df["_row"] = range(2, len(df) + 2)
-    return df
+    return _load_df_ws(df, ws)
 
 
 def load_cjenik(sheet) -> pd.DataFrame:
