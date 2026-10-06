@@ -29,10 +29,13 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 # podaci.py zna KOJI JE KLJUC ZAPISA u kojem tabu (5.10.2026.).
 # Uvoz je u try/except da ova datoteka ostane upotrebljiva i sama, bez modula.
 try:
-    from podaci import dodaj_kljuc
+    from podaci import dodaj_kljuc, riješi
 except ImportError:  # modul jos nije u ovom repou
     def dodaj_kljuc(df, tab):
         return df
+
+    def riješi(sheet, vrijednost, tab, df=None, podaci_modul=None, sheet_name=""):
+        return int(vrijednost)
 
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -239,10 +242,14 @@ def load_prijave(sheet) -> pd.DataFrame:
 
 # --- Uređivanje kontakt podataka učenika ---
 
-def azuriraj_ucenika(sheet, row_number: int, polja: dict):
-    """polja = {"ime_djeteta": "...", "mobitel_djeteta": "...", ...}"""
+def azuriraj_ucenika(sheet, row_number, polja: dict):
+    """polja = {"ime_djeteta": "...", "mobitel_djeteta": "...", ...}
+
+    `row_number` može biti broj retka (`_row`) ILI ključ zapisa (`ucenik_id`).
+    """
     ws = sheet.worksheet("Učenici")
     headers = ws.row_values(1)
+    row_number = riješi(sheet, row_number, "Učenici", None, None, "Učenici")
     for naziv_polja, vrijednost in polja.items():
         if naziv_polja in headers:
             col = headers.index(naziv_polja) + 1
@@ -298,10 +305,12 @@ def postavi_status_poziva(sheet, ucenik_id: str, novi_status: str):
     return azurirano
 
 
-def oznaci_otkazano(sheet, row_number: int):
+def oznaci_otkazano(sheet, row_number):
+    """`row_number` može biti broj retka ili ključ (`redak_id`)."""
     ws = sheet.worksheet("Prijave")
     headers = ws.row_values(1)
     col_status = headers.index("status_kontakta") + 1
+    row_number = riješi(sheet, row_number, "Prijave", None, None, "Prijave")
     ws.update_cell(row_number, col_status, "Otkazano")
 
 
@@ -401,9 +410,11 @@ def kreiraj_grupu(sheet, program, dan, vrijeme, ucionica, kapacitet, tip, aktivn
     return grupa_id
 
 
-def azuriraj_grupu(sheet, row_number: int, polja: dict):
+def azuriraj_grupu(sheet, row_number, polja: dict):
+    """`row_number` može biti broj retka ili ključ (`grupa_id`)."""
     ws = sheet.worksheet("Grupe")
     headers = ws.row_values(1)
+    row_number = riješi(sheet, row_number, "Grupe", None, None, "Grupe")
     for naziv, vrijednost in polja.items():
         if naziv in headers:
             col = headers.index(naziv) + 1
@@ -468,10 +479,12 @@ def kreiraj_rezervaciju(sheet, grupa_id, ucenik_id, ime_djeteta, kontakt_roditel
     return rezervacija_id
 
 
-def azuriraj_rezervaciju(sheet, row_number: int, novi_status: str, resetiraj_vrijeme: bool = False):
+def azuriraj_rezervaciju(sheet, row_number, novi_status: str, resetiraj_vrijeme: bool = False):
+    """`row_number` može biti broj retka ili ključ (`rezervacija_id`)."""
     ws = sheet.worksheet("Rezervacije")
     headers = ws.row_values(1)
     col_status = headers.index("status") + 1
+    row_number = riješi(sheet, row_number, "Rezervacije", None, None, "Rezervacije")
     ws.update_cell(row_number, col_status, novi_status)
 
     if resetiraj_vrijeme and "vrijeme_rezervacije" in headers:
@@ -911,15 +924,20 @@ def azuriraj_instrukciju(sheet, row_number: int, polja: dict):
     nametnuto u Streamlit sučelju (ne nuditi to polje instruktoru u formi)."""
     ws = sheet.worksheet("Instrukcije_termini")
     headers = ws.row_values(1)
+    row_number = riješi(sheet, row_number, "Instrukcije_termini", None, None, "Instrukcije_termini")
     for naziv_polja, vrijednost in polja.items():
         if naziv_polja in headers:
             col = headers.index(naziv_polja) + 1
             ws.update_cell(row_number, col, vrijednost)
 
 
-def obrisi_instrukciju(sheet, row_number: int):
-    """Trajno brisanje retka termina. Samo admin."""
+def obrisi_instrukciju(sheet, row_number):
+    """Trajno brisanje retka termina. Samo admin.
+
+    `row_number` može biti broj retka ili ključ (`termin_id`).
+    """
     ws = sheet.worksheet("Instrukcije_termini")
+    row_number = riješi(sheet, row_number, "Instrukcije_termini", None, None, "Instrukcije_termini")
     ws.delete_rows(row_number)
 
 
@@ -1020,11 +1038,15 @@ def dodaj_nastavnika(sheet, ime: str, lozinka: str):
     ws.append_row([str(ime), str(lozinka), "Da"])
 
 
-def azuriraj_nastavnika(sheet, row_number: int, polja: dict):
+def azuriraj_nastavnika(sheet, row_number, polja: dict):
     """polja = {"lozinka": "...", "aktivan": "Ne", ...} — isti generički obrazac
-    kao azuriraj_ucenika/azuriraj_instrukciju."""
+    kao azuriraj_ucenika/azuriraj_instrukciju.
+
+    `row_number` može biti broj retka ili ključ (u tabu Nastavnici ključ je `ime`).
+    """
     ws = sheet.worksheet("Nastavnici")
     headers = ws.row_values(1)
+    row_number = riješi(sheet, row_number, "Nastavnici", None, None, "Nastavnici")
     for naziv, vrijednost in polja.items():
         if naziv in headers:
             col = headers.index(naziv) + 1

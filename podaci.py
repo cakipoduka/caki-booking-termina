@@ -24,6 +24,7 @@ Stanje:
 from __future__ import annotations
 
 import re
+import sys
 
 import pandas as pd
 
@@ -149,6 +150,24 @@ def _nadi_tab(tab: str) -> str:
     return str(tab or "")
 
 
+# Isti tab se u kodu zove na dva nacina: ljudski ("Instrukcije_termini")
+# i kratko, kako se zove funkcija za ucitavanje ("Instrukcije").
+# Bez ovoga bi kljuc iz jednog poziva bio prazan, a iz drugog ispravan.
+ALIJASI_TABOVA: dict[str, str] = {
+    "instrukcije": "Instrukcije_termini",
+    "instrukcije_termini": "Instrukcije_termini",
+    "termini": "Instrukcije_termini",
+}
+
+
+def normaliziraj_tab(tab: str) -> str:
+    """Vrati pravi naziv taba iz KLJUC_PO_TABU (ili ulaz ako ga ne prepoznaje)."""
+    pronaden = _nadi_tab(tab)
+    if pronaden in KLJUC_PO_TABU:
+        return pronaden
+    return ALIJASI_TABOVA.get(str(tab or "").strip().lower(), str(tab or ""))
+
+
 def izracunaj_kljuc(red, tab: str) -> str:
     """Ključ jednog retka.
 
@@ -159,7 +178,7 @@ def izracunaj_kljuc(red, tab: str) -> str:
          `raspored_matura.retci_za_spremanje`; bez ovoga bi takav redak ostao bez identiteta);
       3. inače prazno — i to se broji u izvješću, ne prešućuje.
     """
-    stupci = stupci_kljuca(tab)
+    stupci = stupci_kljuca(normaliziraj_tab(tab))
     if not stupci:
         return ""
     try:
@@ -197,9 +216,17 @@ def dodaj_kljuc(df: pd.DataFrame, tab: str) -> pd.DataFrame:
     if df.empty:
         df["_kljuc"] = pd.Series(dtype="object")
         df["_kljuc_izvor"] = pd.Series(dtype="object")
+        if "_row" not in df.columns:
+            df["_row"] = pd.Series(dtype="int64")
         return df
 
-    ima_kljuc = bool(stupci_kljuca(tab))
+    # `_row` je broj retka i mora postojati da se kljuc može pretvoriti natrag u
+    # redak za pisanje. Ako ga tablica već ima (učitavanje iz Sheeta ga postavi),
+    # NE diramo ga — inače bi se brojevi redaka pomakli.
+    if "_row" not in df.columns:
+        df["_row"] = range(2, len(df) + 2)
+
+    ima_kljuc = bool(stupci_kljuca(normaliziraj_tab(tab)))
     kljucevi = [izracunaj_kljuc(red, tab) for _, red in df.iterrows()]
     df["_kljuc"] = kljucevi
     if not ima_kljuc:
@@ -211,21 +238,155 @@ def dodaj_kljuc(df: pd.DataFrame, tab: str) -> pd.DataFrame:
     return df
 
 
+class NepoznatKljuc(ValueError):
+    """Ključ zapisa ne postoji u tabu.
+
+    Diže se NAMJERNO, umjesto da se upiše u pogrešan redak. Tko dobije ovu grešku
+    šalje broj retka (`_row`) ili točan ključ iz taba.
+    """
+
+
+class _NemaPodataka(Exception):
+    """Privremeno: nemamo podatke za rješavanje pa treba posegnuti za Sheetom."""
+
+
+def _je_broj_retka(vrijednost) -> bool:
+    """Je li vrijednost broj retka (`_row`), a ne ključ.
+
+    `_row` je cijeli broj (2, 3, 4...). Ključevi su tekst (ucenik_id, redak_id,
+    dokument_id...). Ako netko slučajno pošalje "7" kao tekst, to je ključ i ne
+    nalazi se — bolje glasna greška nego tihi upis u pogrešan redak.
+    """
+    return isinstance(vrijednost, int) and not isinstance(vrijednost, bool)
+
+
+def _redak_po_kljucu(df: pd.DataFrame, tab: str, kljuc, sheet_name: str = "") -> int:
+    """Nađe `_row` retka čiji je `_kljuc` jednak predanoj vrijednosti."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        raise _NemaPodataka(tab)
+    if "_kljuc" not in df.columns:
+        raise _NemaPodataka(tab)
+    trazeni = _tekst(kljuc)
+    if not trazeni:
+        raise NepoznatKljuc(f"[{tab}] ključ je prazan — ne mogu ga naći")
+    if "_row" not in df.columns:
+        raise _NemaPodataka(tab)
+    redci = df[df["_kljuc"].astype(str) == trazeni]
+    if redci.empty:
+        raise NepoznatKljuc(
+            f"[{tab}] nema retka s ključem {trazeni!r} "
+            f"({len(df)} redaka pregledano) — provjeri je li zapis obrisan ili je ključ pogrešan"
+        )
+    return int(redci.iloc[0]["_row"])
+
+
+def riješi(sheet, vrijednost, tab: str, df: pd.DataFrame | None = None,
+           podaci_modul=None, sheet_name: str = "") -> int:
+    """Broj retka (`_row`) iz onoga što je pozivatelj poslao — broja retka ILI ključa.
+
+    Zašto: dosad su sve funkcije za pisanje primale isključivo broj retka
+    (`azuriraj_ucenika(sheet, 7, {...})`). Broj retka se u bazi ne može koristiti
+    kao identitet (sortiranje, brisanje i istovremeni rad ga pomiču). Zato se sada
+    može poslati i KLJUČ (`azuriraj_ucenika(sheet, "AA1234", {...})`), a stari
+    pozivi s brojem retka rade dalje nepromijenjeno.
+
+    Redoslijed:
+      1. broj retka -> vraća se odmah;
+      2. ključ + predani `df` (najjeftinije, bez ijednog čitanja);
+      3. ključ bez `df` -> tablica se učita i ključ se nađe u njoj.
+
+    Ako ključ ne postoji, diže se `NepoznatKljuc` — NIKAD se ne upisuje u pogrešan
+    redak. To je namjerno glasno.
+
+    Citanje: ključ se traži u predanom `df`. Ako ga nema, koristi se postojeća
+    funkcija za učitavanje tog taba (`load_ucenici`, `load_grupe`...). Kad je zove
+    aplikacija, te funkcije su već keširane (`@st.cache_data`), pa nema novih
+    poziva prema Googleu. Izvan aplikacije (npr. u skripti) učita se izravno.
+    """
+    if _je_broj_retka(vrijednost):
+        return int(vrijednost)
+
+    naziv = sheet_name or tab
+    try:
+        return _redak_po_kljucu(df, tab, vrijednost)
+    except _NemaPodataka:
+        pass
+
+    modul = podaci_modul
+    if modul is None:
+        modul = sys.modules.get("pipeline_upisi")
+    if modul is None:
+        try:
+            import pipeline_upisi as modul  # kasni uvoz da ne bude kruga
+        except ImportError:
+            raise NepoznatKljuc(
+                f"[{tab}] ne mogu naći redak za ključ {_tekst(vrijednost)!r} "
+                f"(nemam učitane podatke)"
+            ) from None
+    df2 = _ucitaj_tab(modul, naziv, sheet)
+    return _redak_po_kljucu(df2, tab, vrijednost)
+
+
+# Keš učitavača po imenu taba — samo da se ne traži funkcija pri svakom pozivu.
+_UCITAVACI: dict[str, object] = {}
+
+
+def _ucitaj_tab(modul, naziv: str, sheet) -> pd.DataFrame:
+    """Učita tab koristeći POSTOJEĆU `load_*` funkciju iz pipelinea.
+
+    Zašto postojeću, a ne novu: te funkcije u aplikaciji imaju `@st.cache_data`,
+    pa se podaci ne čitaju ponovno iz Googlea. Nova funkcija bi zaobišla keš.
+
+    Imena se razlikuju (Učenici -> load_ucenici, Grupe -> load_grupe), pa se
+    kandidati grade bez dijakritika i s uobičajenim nastavcima.
+    """
+    ucitavac = _UCITAVACI.get(naziv)
+    if ucitavac is None:
+        cist = _bez_dijakritika(naziv)
+        kandidati = [cist, cist + "e", cist + "i", cist.rstrip("aei")]
+        if cist.startswith("instrukcije"):
+            kandidati.insert(0, "instrukcije")
+        if cist == "dolazak":
+            kandidati.append("dolasci")
+        ucitavac = None
+        for ime in kandidati:
+            kandidat = getattr(modul, "load_" + ime, None)
+            if callable(kandidat):
+                ucitavac = kandidat
+                break
+    if ucitavac is None:
+        # rezerva: izravno učitavanje radnog lista (bez keša, ali točno)
+        try:
+            return modul._load_worksheet_df(sheet.worksheet(naziv))
+        except Exception as e:
+            raise NepoznatKljuc(f"[{naziv}] ne mogu učitati tab: {type(e).__name__}: {e}") from None
+    df = ucitavac(sheet)
+    _UCITAVACI[naziv] = ucitavac
+    return df
+
+
+def _bez_dijakritika(tekst: str) -> str:
+    """'Učenici' -> 'ucenici' (za sastavljanje imena funkcija)."""
+    tablica = str.maketrans("čćžšđČĆŽŠĐ", "cczsdCCZSD")
+    return str(tekst or "").strip().lower().translate(tablica)
+
+
 # ============================================================================
 #  IZVJESTAJ — što je pronađeno, da se ništa ne izgubi tiho
 # ============================================================================
 
 def izvjestaj_kljuceva(df: pd.DataFrame, tab: str) -> dict:
     """Kratki nalaz za jedan tab: ima li ključ, koliko ih je jedinstvenih, koliko praznih."""
+    ispravan = normaliziraj_tab(tab)
     if df is None or df.empty:
-        return {"tab": tab, "redaka": 0, "kljuc": "/".join(stupci_kljuca(tab)) or "-",
+        return {"tab": tab, "redaka": 0, "kljuc": "/".join(stupci_kljuca(ispravan)) or "-",
                 "praznih_kljuceva": 0, "duplih_kljuceva": 0, "jedinstvenih": 0}
     kljucevi = list(df.get("_kljuc", []))
     neprazni = [k for k in kljucevi if k]
     return {
         "tab": tab,
         "redaka": int(len(df)),
-        "kljuc": "/".join(stupci_kljuca(tab)) or "-",
+        "kljuc": "/".join(stupci_kljuca(ispravan)) or "-",
         "praznih_kljuceva": int(len(kljucevi) - len(neprazni)),
         "duplih_kljuceva": int(len(neprazni) - len(set(neprazni))),
         "jedinstvenih": int(len(set(neprazni))),
