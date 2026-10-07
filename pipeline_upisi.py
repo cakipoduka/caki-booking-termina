@@ -256,7 +256,9 @@ def azuriraj_ucenika(sheet, row_number, polja: dict):
             ws.update_cell(row_number, col, vrijednost)
 
 
-def ocisti_duplikat_flag(sheet, row_number: int):
+def ocisti_duplikat_flag(sheet, row_number):
+    """`row_number` može biti broj retka ili ključ (`ucenik_id`)."""
+    row_number = riješi(sheet, row_number, "Učenici", None, None, "Učenici")
     azuriraj_ucenika(sheet, row_number, {"moguci_duplikat_id": ""})
 
 
@@ -309,8 +311,8 @@ def oznaci_otkazano(sheet, row_number):
     """`row_number` može biti broj retka ili ključ (`redak_id`)."""
     ws = sheet.worksheet("Prijave")
     headers = ws.row_values(1)
-    col_status = headers.index("status_kontakta") + 1
     row_number = riješi(sheet, row_number, "Prijave", None, None, "Prijave")
+    col_status = headers.index("status_kontakta") + 1
     ws.update_cell(row_number, col_status, "Otkazano")
 
 
@@ -1004,12 +1006,13 @@ def smije_naplatu_gotovinom(df_nastavnici: pd.DataFrame, ime: str) -> bool:
     return not red.empty and str(red.iloc[0]["naplata_gotovinom"]).strip().lower() == "da"
 
 
-def oznaci_naplatu_gotovinom(sheet, row_number: int, nastavnik: str):
+def oznaci_naplatu_gotovinom(sheet, row_number, nastavnik: str):
     """Instruktor s ovlaštenjem označi da je termin naplatio gotovinom. Termin više ne ulazi u
     obračun (status_obracuna), a roditelj na portalu vidi "✅ Plaćeno". Radi samo za termin
     tog instruktora koji još nije obračunat."""
     ws = sheet.worksheet("Instrukcije_termini")
     headers = ws.row_values(1)
+    row_number = riješi(sheet, row_number, "Instrukcije_termini", None, None, "Instrukcije_termini")
     red = dict(zip(headers, ws.row_values(row_number) + [""] * len(headers)))
     if red.get("nastavnik") != nastavnik:
         raise ValueError("Možete označiti samo svoje termine.")
@@ -1021,10 +1024,11 @@ def oznaci_naplatu_gotovinom(sheet, row_number: int, nastavnik: str):
     _azuriraj_polja(ws, row_number, polja, headers)
 
 
-def postavi_naplatu_gotovinom(sheet, row_number: int, smije: bool):
+def postavi_naplatu_gotovinom(sheet, row_number, smije: bool):
     """Admin: ovlaštenje instruktora za evidentiranje naplate gotovinom (stupac se doda ako ga nema)."""
     ws = sheet.worksheet("Nastavnici")
     headers = ws.row_values(1)
+    row_number = riješi(sheet, row_number, "Nastavnici", None, None, "Nastavnici")
     if "naplata_gotovinom" not in headers:
         if ws.col_count < len(headers) + 1:
             ws.add_cols(1)
@@ -1062,11 +1066,12 @@ def azuriraj_nastavnika(sheet, row_number, polja: dict):
 SOLO_SUBJEKTI = ["CAKI centar d.o.o.", "Caki poduka obrt", "CAKI obrt za poduku (DEDA)"]
 
 
-def postavi_solo_racun(sheet, row_number: int, subjekt: str):
+def postavi_solo_racun(sheet, row_number, subjekt: str):
     """Ručno postavlja koji pravni subjekt izdaje Solo ponudu za taj Prijave redak.
     Prazno/nepostavljeno = solo_ponuda_i_mail.gs preskače redak dok se ne odabere."""
     ws = sheet.worksheet("Prijave")
     headers = ws.row_values(1)
+    row_number = riješi(sheet, row_number, "Prijave", None, None, "Prijave")
     if "solo_racun" not in headers:
         raise ValueError("Stupac 'solo_racun' ne postoji u Prijave tabu — dodaj ga ručno u header.")
     col = headers.index("solo_racun") + 1
@@ -1080,6 +1085,7 @@ def posalji_ponudu_odmah(sheet, row_number: int):
     ws = sheet.worksheet("Prijave")
     headers = ws.row_values(1)
     col_status = headers.index("status_kontakta") + 1
+    row_number = riješi(sheet, row_number, "Prijave", None, None, "Prijave")
     col_posalji = headers.index("posalji_nakon") + 1
     ws.update_cell(row_number, col_status, "Potvrdio")
     ws.update_cell(row_number, col_posalji, sada_zagreb().strftime("%Y-%m-%d %H:%M:%S"))
@@ -1090,6 +1096,7 @@ def oznaci_placeno_gotovinom(sheet, row_number: int):
     automatsko slanje Solo ponude/računa za taj redak, uz zabilješku u napomeni."""
     ws = sheet.worksheet("Prijave")
     headers = ws.row_values(1)
+    row_number = riješi(sheet, row_number, "Prijave", None, None, "Prijave")
     col_solo_poslano = headers.index("solo_poslano") + 1
     ws.update_cell(row_number, col_solo_poslano, "Da")
 
@@ -1804,12 +1811,13 @@ def _mail_polja(headers: list, mail_predmet, mail_tekst) -> dict:
     return {"mail_predmet": str(mail_predmet or "")[:250], "mail_tekst": str(mail_tekst or "")}
 
 
-def spremi_nacrt(sheet, row_number: int, stavke: list, solo_racun: str, nacin_uplate: int,
+def spremi_nacrt(sheet, row_number, stavke: list, solo_racun: str, nacin_uplate: int,
                  napomena: str, rok_placanja, mail_predmet=None, mail_tekst=None):
     """Sprema izmjene nacrta BEZ slanja (status ostaje Nacrt)."""
     stavke = preracunaj_stavke(stavke)
     ws = sheet.worksheet(LEDGER_TAB)
     headers = ws.row_values(1)
+    row_number = riješi(sheet, row_number, "Racuni_i_ponude", None, None, "Racuni_i_ponude")
     _azuriraj_polja(ws, row_number, {**_mail_polja(headers, mail_predmet, mail_tekst), 
         "stavke_snapshot_json": json.dumps(stavke, ensure_ascii=False),
         "iznos_ukupno": zbroj_stavki_centi(stavke) / 100,
@@ -1898,9 +1906,11 @@ def odobri_dokument(sheet, red: dict, stavke: list, solo_racun: str, nacin_uplat
     return dokumenti
 
 
-def ponovi_slanje(sheet, row_number: int):
-    """Dokument u statusu 'Greška' (npr. Solo nije odgovorio) ponovno stavi u red za slanje."""
+def ponovi_slanje(sheet, row_number):
+    """Dokument u statusu 'Greška' (npr. Solo nije odgovorio) ponovno stavi u red za slanje.
+    `row_number` može biti broj retka ili ključ (`dokument_id`)."""
     ws = sheet.worksheet(LEDGER_TAB)
+    row_number = riješi(sheet, row_number, "Racuni_i_ponude", None, None, "Racuni_i_ponude")
     _azuriraj_polja(ws, row_number, {"status": "Odobreno", "greska_slanja": ""})
 
 
@@ -1940,7 +1950,9 @@ def oznaci_dokument_placen(sheet, red: dict):
             _azuriraj_polja(ws_i, r, {"uplata_potvrdjena_admin": "Da"}, h_i)
 
 
-def oznaci_dokument_istekao(sheet, row_number: int):
+def oznaci_dokument_istekao(sheet, row_number):
+    """`row_number` može biti broj retka ili ključ (`dokument_id`)."""
+    row_number = riješi(sheet, row_number, "Racuni_i_ponude", None, None, "Racuni_i_ponude")
     _azuriraj_polja(sheet.worksheet(LEDGER_TAB), row_number, {"status": "Isteklo"})
 
 
@@ -2076,12 +2088,17 @@ def ispravi_dokument(sheet, df_racuni: pd.DataFrame, red) -> tuple:
     return novi_id, rez
 
 
-def ponovi_brisanje(sheet, row_number: int):
+def ponovi_brisanje(sheet, row_number):
+    """`row_number` može biti broj retka ili ključ (`dokument_id`)."""
+    row_number = riješi(sheet, row_number, "Racuni_i_ponude", None, None, "Racuni_i_ponude")
     _azuriraj_polja(sheet.worksheet(LEDGER_TAB), row_number, {"status": "Za brisanje", "greska_slanja": ""})
 
 
-def oznaci_obrisano_rucno(sheet, row_number: int):
-    """Admin je ponudu već sam obrisao u Solu (ili je nikad nije bilo) — samo zapiši stanje."""
+def oznaci_obrisano_rucno(sheet, row_number):
+    """Admin je ponudu već sam obrisao u Solu (ili je nikad nije bilo) — samo zapiši stanje.
+
+    `row_number` može biti broj retka ili ključ (`dokument_id`)."""
+    row_number = riješi(sheet, row_number, "Racuni_i_ponude", None, None, "Racuni_i_ponude")
     _azuriraj_polja(sheet.worksheet(LEDGER_TAB), row_number, {"status": "Obrisano", "greska_slanja": ""})
 
 
@@ -2285,7 +2302,7 @@ def tekst_nacin_placanja(ime_djeteta: str, ucenik_id: str, ime_roditelja: str, n
 R1_STUPCI = ["r1_naziv", "r1_oib", "r1_adresa"]
 
 
-def spremi_r1(sheet, row_number: int, naziv: str, oib: str, adresa: str):
+def spremi_r1(sheet, row_number, naziv: str, oib: str, adresa: str):
     """Upiše podatke firme za R1 (prazan OIB = ponude idu na roditelja kao i dosad)."""
     oib = re.sub(r"\s", "", str(oib or ""))
     if oib and not re.fullmatch(r"\d{11}", oib):
@@ -2300,6 +2317,7 @@ def spremi_r1(sheet, row_number: int, naziv: str, oib: str, adresa: str):
             ws.add_cols(len(headers) + len(nedostaju) - ws.col_count)
         ws.update(range_name=gspread.utils.rowcol_to_a1(1, len(headers) + 1), values=[nedostaju], value_input_option="RAW")
         headers = headers + nedostaju
+    row_number = riješi(sheet, row_number, "Prijave", None, None, "Prijave")
     _azuriraj_polja(ws, row_number, {"r1_naziv": str(naziv or "").strip()[:100], "r1_oib": oib,
                                      "r1_adresa": str(adresa or "").strip()[:255]}, headers)
 
@@ -2648,10 +2666,11 @@ def posalji_izvjestaj_instruktora(sheet, izv: dict) -> str:
     return izv_id
 
 
-def azuriraj_izvjestaj(sheet, row_number: int, status: str, napomena: str = "",
+def azuriraj_izvjestaj(sheet, row_number, status: str, napomena: str = "",
                       nacin_isplate: str = "", iznos_isplate=None):
     ws = sheet.worksheet(IZVJESTAJI_TAB)
     headers = ws.row_values(1)
+    row_number = riješi(sheet, row_number, IZVJESTAJI_TAB, None, None, IZVJESTAJI_TAB)
     nedostaju = [h for h in IZVJESTAJI_HEADERS if h not in headers]
     if nedostaju:   # tab napravljen prije 26.9. — dodaj nove stupce
         if ws.col_count < len(headers) + len(nedostaju):
@@ -2773,7 +2792,7 @@ def predmeti_nastavnika(df_nastavnici: pd.DataFrame, ime: str) -> list:
     return [p.strip().upper() for p in re.split(r"[,;]", str(red.iloc[0]["predmeti"] or "")) if p.strip()]
 
 
-def postavi_predmete_nastavnika(sheet, row_number: int, predmeti: list):
+def postavi_predmete_nastavnika(sheet, row_number, predmeti: list):
     """Admin: predmeti koje nastavnik predaje (stupac 'predmeti' se doda ako ga nema)."""
     ws = sheet.worksheet("Nastavnici")
     headers = ws.row_values(1)
@@ -2782,6 +2801,7 @@ def postavi_predmete_nastavnika(sheet, row_number: int, predmeti: list):
             ws.add_cols(1)
         ws.update_cell(1, len(headers) + 1, "predmeti")
         headers = headers + ["predmeti"]
+    row_number = riješi(sheet, row_number, "Nastavnici", None, None, "Nastavnici")
     _azuriraj_polja(ws, row_number, {"predmeti": ", ".join(predmeti)}, headers)
 
 
