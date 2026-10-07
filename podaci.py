@@ -359,10 +359,21 @@ def _ucitaj_tab(modul, naziv: str, sheet) -> pd.DataFrame:
         try:
             return modul._load_worksheet_df(sheet.worksheet(naziv))
         except Exception as e:
+            # Tab koji još ne postoji (npr. prazni Izvjestaji_instruktora) NIJE greška:
+            # u njemu sigurno nema traženog ključa. Vraćamo praznu tablicu da pozivatelj
+            # dobije jasnu poruku "nema retka s tim ključem", a ne rušenje aplikacije.
+            if type(e).__name__ == "WorksheetNotFound":
+                _UCITAVACI[naziv] = _prazna_tablica
+                return _prazna_tablica(sheet)
             raise NepoznatKljuc(f"[{naziv}] ne mogu učitati tab: {type(e).__name__}: {e}") from None
     df = ucitavac(sheet)
     _UCITAVACI[naziv] = ucitavac
     return df
+
+
+def _prazna_tablica(_sheet=None) -> pd.DataFrame:
+    """Prazna tablica (tab još ne postoji) — da rješavanje ključa ne pukne."""
+    return pd.DataFrame(columns=["_row", "_kljuc", "_kljuc_izvor"])
 
 
 def _bez_dijakritika(tekst: str) -> str:
