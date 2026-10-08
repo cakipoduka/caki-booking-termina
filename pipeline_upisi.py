@@ -1614,7 +1614,8 @@ def zbroj_osnovica_centi(stavke: list) -> int:
     return ukupno
 
 
-def provjeri_za_slanje(stavke: list, solo_racun: str, rate: list | None = None) -> list:
+def provjeri_za_slanje(stavke: list, solo_racun: str, rate: list | None = None,
+                       po_predmetima: bool = False) -> list:
     """Vraća popis grešaka (prazan = smije se poslati). Rate: lista (iznos_centi, date)."""
     greske = []
     if solo_racun not in SOLO_SUBJEKTI:
@@ -1643,7 +1644,7 @@ def provjeri_za_slanje(stavke: list, solo_racun: str, rate: list | None = None) 
             )
         elif not greske:
             try:
-                raspodjela_rata(stavke, [i for i, _ in rate])
+                raspodjela_rata(stavke, [i for i, _ in rate], po_predmetima)
             except ValueError as e:
                 greske.append(str(e))
         rokovi = [r for _, r in rate]
@@ -1718,11 +1719,24 @@ def _zadana_raspodjela(stavke: list, n: int) -> list:
     return [_raspodijeli_stavku(B, p, F, n) for B, p, F in _podaci_stavki(stavke)]
 
 
-def raspodjela_rata(stavke: list, osnovice_rata: list) -> list:
+def rate_po_predmetima(stavke, prvi_rok: date) -> list:
+    """8.10.2026.: svaki predmet (stavka) = jedna rata — puna originalna cijena tog predmeta,
+    rokovi svakih 30 dana. Vraća listu (osnovica_centi, rok) kao predlozi_rate."""
+    osnovice = [B for B, _, _ in _podaci_stavki(preracunaj_stavke(stavke))]
+    return [(iznos, prvi_rok + timedelta(days=30 * k)) for k, iznos in enumerate(osnovice)]
+
+
+def raspodjela_rata(stavke: list, osnovice_rata: list, po_predmetima: bool = False) -> list:
     """Za zadane osnovice po ratama (zbroj = ukupna cijena prije popusta) vrati matricu
     [stavka][rata] osnovica. Ako su osnovice jednake automatskom prijedlogu, koristi se on;
-    inače (admin je ručno promijenio iznose) svaka se rata dijeli na stavke razmjerno cijeni."""
+    inače (admin je ručno promijenio iznose) svaka se rata dijeli na stavke razmjerno cijeni.
+    po_predmetima=True: rata k = cijela stavka k (svaki predmet zasebna rata)."""
     n = len(osnovice_rata)
+    if po_predmetima:
+        podaci = _podaci_stavki(stavke)
+        if n != len(podaci) or list(osnovice_rata) != [B for B, _, _ in podaci]:
+            raise ValueError("Kod rata po predmetima svaka rata je točno jedan predmet (broj rata = broj stavki).")
+        return [[B if i == k else 0 for k in range(n)] for i, (B, _, _) in enumerate(podaci)]
     zadana = _zadana_raspodjela(stavke, n)
     if [sum(r[k] for r in zadana) for k in range(n)] == list(osnovice_rata):
         return zadana
@@ -1742,12 +1756,12 @@ def raspodjela_rata(stavke: list, osnovice_rata: list) -> list:
     return m
 
 
-def stavke_za_rate(stavke: list, osnovice_rata: list) -> list:
+def stavke_za_rate(stavke: list, osnovice_rata: list, po_predmetima: bool = False) -> list:
     """Lista (po ratama) stavki koje idu u Solo: svaka stavka zadržava ORIGINALNI naziv iz Sola
     + "(rata k/N)", cijenu = njezin dio originalne cijene, i ISTI popust % kao na jednokratnoj ponudi."""
     stavke = preracunaj_stavke(stavke)
     n = len(osnovice_rata)
-    m = raspodjela_rata(stavke, osnovice_rata)
+    m = raspodjela_rata(stavke, osnovice_rata, po_predmetima)
     po_ratama = []
     for k in range(n):
         linije = []
@@ -1771,10 +1785,10 @@ def stavke_za_rate(stavke: list, osnovice_rata: list) -> list:
     return po_ratama
 
 
-def pregled_rata(stavke: list, osnovice_rata: list) -> list:
+def pregled_rata(stavke: list, osnovice_rata: list, po_predmetima: bool = False) -> list:
     """Za prikaz u adminu: po rati osnovica, popust i iznos za uplatu (centi)."""
     rez = []
-    for linije in stavke_za_rate(stavke, osnovice_rata):
+    for linije in stavke_za_rate(stavke, osnovice_rata, po_predmetima):
         popusti = sorted({float(l["popust_postotak"]) for l in linije if float(l["popust_postotak"])})
         tekst = " / ".join(f"{p:g}".replace(".", ",") for p in popusti)
         if not popusti:
@@ -1830,13 +1844,13 @@ def spremi_nacrt(sheet, row_number, stavke: list, solo_racun: str, nacin_uplate:
 
 def odobri_dokument(sheet, red: dict, stavke: list, solo_racun: str, nacin_uplate: int,
                     napomena: str, rok_placanja, rate: list | None = None,
-                    mail_predmet=None, mail_tekst=None) -> list:
+                    mail_predmet=None, mail_tekst=None, po_predmetima: bool = False) -> list:
     """Admin klikne "✅ Pošalji": dokument (ili više njih, ako su rate) dobiva status
     'Odobreno'. Stvarno slanje u Solo radi Apps Script posaljiOdobrene() u roku ~5 min.
     rate = None (jednokratno) ili lista (iznos_centi, rok: date).
     Vraća listu dokument_id. Baca ValueError s popisom grešaka ako provjera ne prođe."""
     stavke = preracunaj_stavke(stavke)
-    greske = provjeri_za_slanje(stavke, solo_racun, rate)
+    greske = provjeri_za_slanje(stavke, solo_racun, rate, po_predmetima)
     if greske:
         raise ValueError(" ".join(greske))
 
@@ -1872,7 +1886,7 @@ def odobri_dokument(sheet, red: dict, stavke: list, solo_racun: str, nacin_uplat
     # (Solo ga ispisuje na ponudi, pa roditelj vidi da je popust obračunat).
     grupa_id = "G-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
     n = len(rate)
-    po_ratama = stavke_za_rate(stavke, [i for i, _ in rate])
+    po_ratama = stavke_za_rate(stavke, [i for i, _ in rate], po_predmetima)
     program = red.get("program_tip", "")
     dokumenti = []
     for k, ((_, rok), stavke_rate) in enumerate(zip(rate, po_ratama), start=1):
@@ -2331,7 +2345,9 @@ def popuni_mail_pregled(tekst: str, zamjene: dict) -> str:
 
 def prikazi_datum(v) -> str:
     """Datum iz Sheeta za prikaz: tekst ostaje tekst, a Sheets serijski broj (npr. 46290.69)
-    pretvara se u '2026-09-25 16:41'."""
+    pretvara se u '2026-09-25 16:41' (i kad stigne kao tekst '46290.69')."""
+    if isinstance(v, str) and re.fullmatch(r"\s*\d{5}(\.\d+)?\s*", v):
+        v = float(v)
     if isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v)) and v > 30000:
         return (datetime(1899, 12, 30) + timedelta(days=float(v))).strftime("%Y-%m-%d %H:%M")
     return "" if v is None or (isinstance(v, float) and math.isnan(v)) else str(v)
@@ -3420,6 +3436,63 @@ def vrati_u_nacrt(sheet, df_racuni: pd.DataFrame, red) -> str:
     return novi_id
 
 
+def izdvoji_u_novi_nacrt(sheet, red, stavke: list, indeksi: list, novi_subjekt: str) -> str:
+    """8.10.2026. ✂️ Dio stavki nacrta (npr. MAT) premjesti u NOVI nacrt s drugim pravnim subjektom;
+    ostale (npr. HRV+ENG) ostaju u ovom nacrtu. Popusti, nazivi i cijene ostaju kakvi jesu.
+    Prijave premještenih predmeta ostaju Potvrdio (ne Otkazano!) i dobiju novi subjekt.
+    `stavke` = trenutne (i neuspremljene) stavke iz tablice. Vraća novi dokument_id."""
+    red = red.to_dict() if hasattr(red, "to_dict") else dict(red)
+    if red.get("status") not in ("Nacrt", "Greška"):
+        raise ValueError("Izdvajati se može samo iz nacrta.")
+    if novi_subjekt not in SOLO_SUBJEKTI:
+        raise ValueError("Odaberi pravni subjekt za izdvojenu ponudu.")
+    stavke = preracunaj_stavke(stavke)
+    indeksi = sorted({int(i) for i in indeksi})
+    if not indeksi or any(i < 0 or i >= len(stavke) for i in indeksi):
+        raise ValueError("Odaberi barem jednu stavku za izdvajanje.")
+    if len(indeksi) == len(stavke):
+        raise ValueError("Ne možeš izdvojiti sve stavke — za to samo promijeni pravni subjekt u ovom nacrtu.")
+    izdvojene = [st for i, st in enumerate(stavke) if i in indeksi]
+    ostaju = [st for i, st in enumerate(stavke) if i not in indeksi]
+
+    izvori = sifre_izvora(_cisto(red.get("izvorni_redci")))
+    sele = [str(st.get("izvor", "")) for st in izdvojene if str(st.get("izvor", "")).startswith("P:")]
+    sele = [s_ for s_ in sele if s_ in izvori]
+    ostaju_izvori = [s_ for s_ in izvori if s_ not in sele]
+
+    ws = sheet.worksheet(LEDGER_TAB)
+    headers = ws.row_values(1)
+    novi_id = "D-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    dok = _cisto(red.get("dokument_id"))
+    # 1) NOVI nacrt s premještenim stavkama (prvo on — izvori nikad nisu "slobodni" za Assembler)
+    _dodaj_red_po_nazivu(ws, {
+        "dokument_id": novi_id, "ucenik_id": _cisto(red.get("ucenik_id")), "ime_djeteta": _cisto(red.get("ime_djeteta")),
+        "program_tip": _cisto(red.get("program_tip")), "solo_racun": novi_subjekt,
+        "tip_dokumenta": _cisto(red.get("tip_dokumenta")) or "Ponuda", "status": "Nacrt",
+        "iznos_ukupno": zbroj_stavki_centi(izdvojene) / 100,
+        "stavke_snapshot_json": json.dumps(izdvojene, ensure_ascii=False),
+        "izvorni_redci": ",".join(sele), "nacin_uplate": _cisto(red.get("nacin_uplate")) or 1,
+        "napomena": _cisto(red.get("napomena")), "datum_kreiranja": sada_zagreb().strftime("%Y-%m-%d %H:%M:%S"),
+        "upozorenja": f"✂️ Izdvojeno iz nacrta {dok} ({novi_subjekt}). Provjeri i pošalji.",
+    }, headers)
+    # 2) Ovaj nacrt: ostaju samo preostale stavke i njihovi izvori
+    _azuriraj_polja(ws, int(red["_row"]), {
+        "stavke_snapshot_json": json.dumps(ostaju, ensure_ascii=False),
+        "iznos_ukupno": zbroj_stavki_centi(ostaju) / 100,
+        "izvorni_redci": ",".join(ostaju_izvori),
+    }, headers)
+    # 3) Prijave premještenih predmeta: novi subjekt (status se NE mijenja)
+    rids = [s_[2:] for s_ in sele]
+    if rids:
+        wp = sheet.worksheet("Prijave")
+        hp = wp.row_values(1)
+        if "solo_racun" in hp:
+            for i, r in enumerate(wp.get_all_records(), start=2):
+                if str(r.get("redak_id")) in rids:
+                    _azuriraj_polja(wp, i, {"solo_racun": novi_subjekt}, hp)
+    return novi_id
+
+
 def sifre_izvora(izvorni_redci: str) -> list:
     return [s_.strip() for s_ in str(izvorni_redci or "").split(",") if s_.strip()]
 
@@ -3615,17 +3688,26 @@ def stanje_predmeta(red, dok_po_retku: dict) -> dict:
     return {"kod": "uredi", "oznaka": OZNAKE_STATUSA_PREDMETA.get(status, status or "—"), "uredivo": True}
 
 
+class _Retci(dict):
+    """{redak_id: (broj_retka, dict)} + skup redak_id-eva koji se u Sheetu pojavljuju više puta."""
+    def __init__(self):
+        super().__init__()
+        self.dupli = set()
+
+
 def _svjeze_prijave(sheet):
     """(ws, headers, {redak_id: (broj_retka, dict)}) — svježe iz Sheeta, jednim čitanjem."""
     ws = sheet.worksheet("Prijave")
     vrijednosti = ws.get_all_values()
     h = [str(x).strip() for x in (vrijednosti[0] if vrijednosti else [])]
-    retci = {}
+    retci = _Retci()
     for i, r in enumerate(vrijednosti[1:], start=2):
         r = list(r) + [""] * (len(h) - len(r))
         d = dict(zip(h, r))
         rid = str(d.get("redak_id", "")).strip()
         if rid:
+            if rid in retci:
+                retci.dupli.add(rid)   # isti redak_id u dva retka Sheeta → upis bi mogao pasti na krivi redak
             retci[rid] = (i, d)
     return ws, h, retci
 
@@ -3640,6 +3722,18 @@ def _upisi_prijave(ws, h, izmjene: dict):
             data.append({"range": gspread.utils.rowcol_to_a1(broj, h.index(naziv) + 1), "values": [[v]]})
     if data:
         ws.batch_update(data, raw=True)
+        # Provjera: jesu li vrijednosti STVARNO u Sheetu (inače se gubi tiho — kartica "ništa ne pamti").
+        try:
+            procitano = ws.batch_get([x["range"] for x in data])
+        except Exception:
+            procitano = None
+        if procitano is not None:
+            for x, vr in zip(data, procitano):
+                ocekivano = str(x["values"][0][0]).strip()
+                dobiveno = str(vr[0][0]).strip() if vr and vr[0] else ""
+                if ocekivano != dobiveno:
+                    raise ValueError(f"Upis u Google Sheet nije potvrđen (ćelija {x['range']}: očekivano "
+                                     f"'{ocekivano}', u Sheetu '{dobiveno}'). Provjeri tab Prijave.")
 
 
 def spremi_statuse_predmeta(sheet, statusi: dict, subjekt: str = "") -> int:
@@ -3654,6 +3748,9 @@ def spremi_statuse_predmeta(sheet, statusi: dict, subjekt: str = "") -> int:
     for rid, novi in statusi.items():
         if novi not in STATUSI_PREDMETA or rid not in retci:
             continue
+        if rid in retci.dupli:
+            raise ValueError(f"redak_id {rid} postoji u tabu Prijave u više redaka — ispravi duplikat u Sheetu "
+                             "(upis bi mogao pasti na krivi redak).")
         broj, red = retci[rid]
         if not stanje_predmeta(red, dok)["uredivo"]:
             continue
@@ -3683,6 +3780,9 @@ def posalji_predmete_u_financije(sheet, redak_ids: list, subjekt: str) -> int:
         if rid not in retci:
             preskoceno.append(rid)
             continue
+        if rid in retci.dupli:
+            raise ValueError(f"redak_id {rid} postoji u tabu Prijave u više redaka — ispravi duplikat u Sheetu "
+                             "(upis bi mogao pasti na krivi redak).")
         broj, red = retci[rid]
         if not stanje_predmeta(red, dok)["uredivo"] or red.get("status_kontakta") == "Otkazano":
             preskoceno.append(rid)
