@@ -238,6 +238,78 @@ def dodaj_kljuc(df: pd.DataFrame, tab: str) -> pd.DataFrame:
     return df
 
 
+# ============================================================================
+#  GDJE SU PODACI — prekidač (korak 3)
+# ============================================================================
+#  Do sada su svi podaci bili u Google Sheetu. Sada se može birati:
+#
+#      PODACI_BACKEND = "sheets"     # kako je bilo (zadano)
+#      PODACI_BACKEND = "supabase"   # podaci iz baze
+#
+#  Prekidač se čita iz `st.secrets` (Streamlit → Settings → Secrets). Ako ga
+#  nema ili je neispravan, koristi se "sheets" — da se aplikacija NIKAD ne
+#  sruši zbog pogrešno upisane postavke, nego nastavi raditi kako je radila.
+#
+#  Povratak na Sheet: vrati "sheets" i rebootaj aplikaciju. Ništa se ne briše.
+# ----------------------------------------------------------------------------
+ZADANI_BACKEND = "sheets"
+POZNATI_BACKENDOVI = ("sheets", "supabase")
+
+
+def _tajne():
+    """Streamlit postavke, ako ih ima (izvan aplikacije ih nema — npr. u testu)."""
+    try:
+        import streamlit as st
+        return st.secrets
+    except Exception:
+        return {}
+
+
+class NepoznatBackend(ValueError):
+    """`PODACI_BACKEND` ima vrijednost koja nije poznata.
+
+    Diže se NAMJERNO. Prije (10.10.2026.) se pogrešno upisana vrijednost tiho
+    pretvarala u "sheets" — ali tada bi aplikacija, koja je trebala raditi na
+    bazi, mirno nastavila pisati u Google Sheet i dvije bi se kopije razišle.
+    Bolje je da aplikacija stane s jasnom uputom nego da radi pogrešnu stvar.
+    """
+
+
+def backend(secrets=None) -> str:
+    """Koji backend je uključen: "sheets" ili "supabase".
+
+    Nepoznata vrijednost (npr. "baza") NIJE dopuštena — diže se `NepoznatBackend`
+    s uputom što upisati. Povratak na Sheet je jedna postavka: "sheets".
+    """
+    izvor = _tajne() if secrets is None else secrets
+    try:
+        vrijednost = str(izvor.get("PODACI_BACKEND", ZADANI_BACKEND) or ZADANI_BACKEND).strip().lower()
+    except Exception:
+        vrijednost = ZADANI_BACKEND
+    if vrijednost not in POZNATI_BACKENDOVI:
+        raise NepoznatBackend(
+            f"PODACI_BACKEND = {vrijednost!r} nije poznat (dopušteno: "
+            f"{', '.join(POZNATI_BACKENDOVI)}). Ispravi postavku u st.secrets i rebootaj. "
+            f"Aplikacija namjerno NE bira ništa sama — pogrešan odabir znači da se "
+            f"podaci pišu na dva mjesta."
+        )
+    return vrijednost
+
+
+def je_supabase(secrets=None) -> bool:
+    """Je li uključena baza."""
+    return backend(secrets) == "supabase"
+
+
+def tabovi_iz_baze(klijent, tabovi: list[str] | None = None, sirine: dict | None = None):
+    """Vrati "radnu knjigu" koja se ponaša kao Google Sheet, a drži podatke u bazi.
+
+    Koristi je `sheet()` u pipelineu — kod dalje ne zna odakle podaci dolaze.
+    """
+    import supabase_tabovi
+    return supabase_tabovi.SupabaseSpreadsheet(klijent, tabovi, sirine)
+
+
 class NepoznatKljuc(ValueError):
     """Ključ zapisa ne postoji u tabu.
 

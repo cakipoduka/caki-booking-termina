@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import gspread
 import pandas as pd
+import streamlit as st
 from google.oauth2.service_account import Credentials
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
@@ -29,8 +30,11 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 # podaci.py zna KOJI JE KLJUC ZAPISA u kojem tabu (5.10.2026.).
 # Uvoz je u try/except da ova datoteka ostane upotrebljiva i sama, bez modula.
 try:
+    import podaci as podaci_modul
     from podaci import dodaj_kljuc, riješi
 except ImportError:  # modul jos nije u ovom repou
+    podaci_modul = None
+
     def dodaj_kljuc(df, tab):
         return df
 
@@ -159,6 +163,163 @@ def get_gspread_client(service_account_info: dict):
     izvorni_open = klijent.open_by_key
     klijent.open_by_key = lambda key: kesiraj_tabove(izvorni_open(key))
     return klijent
+
+
+# ============================================================================
+#  GDJE SU PODACI — jedan prekidač za sve tri aplikacije (korak 3, 10.10.2026.)
+# ============================================================================
+#  Do sada je svaka aplikacija sama otvarala Google Sheet:
+#
+#      gc = get_gspread_client(st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"])
+#      sheet = gc.open_by_key(st.secrets["SHEET_ID"])
+#
+#  Sada to radi `sheet()` — jedno mjesto koje zna GDJE su podaci:
+#
+#      PODACI_BACKEND = "sheets"     # kako je bilo (i ako postavke nema)
+#      PODACI_BACKEND = "supabase"   # podaci iz baze
+#
+#  VAZNO: aplikacija ništa ne zna o ovoj razlici. Objekt koji `sheet()` vrati ima
+#  iste metode (`worksheet`, `get_all_records`, `update_cell`...) u oba slučaja —
+#  u bazi ga glumi `supabase_tabovi.SupabaseSpreadsheet`.
+#
+#  Povratak na Sheet: vrati "sheets" u st.secrets i rebootaj aplikaciju.
+#  Ništa se ne briše i ne prepisuje.
+#
+#  Ako je uključena baza, a baza nije dostupna (nema ključeva, nema paketa
+#  `supabase`, baza ne odgovara) — aplikacija se NE vraća tiho na Sheet, nego
+#  stane s jasnom porukom. Tihi povratak bi značio da se dio dana piše u Sheet,
+#  a dio u bazu, pa se te dvije kopije raziđu. Vidi PRIJELAZ.md, točka 4.
+# ----------------------------------------------------------------------------
+
+PODACI_BACKEND_KLJUC = "PODACI_BACKEND"     # ime postavke (st.secrets)
+SUPABASE_URL_KLJUC = "SUPABASE_URL"
+SUPABASE_KEY_KLJUC = "SUPABASE_KEY"
+
+#: tabovi koje u bazi NEMA u `crm.zaglavlje`, a aplikacija ih sama stvara
+#: (`sheet.add_worksheet`). Imena tabova rasporeda Mature nose sezonu, pa se
+#: prepoznaju po početku imena. Popis je namjerno kratak — sve ostalo se čita
+#: iz baze, da se ovdje ne vodi drugi popis tabova koji može ostarjeti.
+TABOVI_KOJE_APP_STVARA: tuple[str, ...] = ("raspored",)
+
+
+class PodaciBackendError(RuntimeError):
+    """Podaci se ne mogu otvoriti onako kako je postavljeno (npr. baza bez ključa).
+
+    Diže se NAMJERNO, umjesto tihog povratka na Sheet: vidi obrazloženje gore.
+    """
+
+
+_CLIJENTI_BAZE: dict[str, object] = {}
+
+
+def _postavka(kljuc: str, zadano: str = "") -> str:
+    """Vrijednost iz `st.secrets`, a izvan aplikacije iz okoline (skripte, testovi)."""
+    try:
+        import streamlit as st
+        vrijednost = st.secrets.get(kljuc, "")
+    except Exception:
+        vrijednost = ""
+    if not vrijednost:
+        vrijednost = os.environ.get(kljuc, "")
+    return str(vrijednost or "").strip() or zadano
+
+
+def _klijent_iz_baze():
+    """Supabase klijent (veza se otvara jednom po adresi baze)."""
+    adresa = _postavka(SUPABASE_URL_KLJUC)
+    kljuc = _postavka(SUPABASE_KEY_KLJUC)
+    if not adresa or not kljuc:
+        raise PodaciBackendError(
+            f"PODACI_BACKEND je 'supabase', a nedostaje {SUPABASE_URL_KLJUC} ili "
+            f"{SUPABASE_KEY_KLJUC} u postavkama (Streamlit → Settings → Secrets). "
+            f"Ako baza još nije spremna, vrati PODACI_BACKEND = \"sheets\" i rebootaj."
+        )
+    if adresa in _CLIJENTI_BAZE:
+        return _CLIJENTI_BAZE[adresa]
+    try:
+        from supabase import create_client
+    except ImportError:
+        raise PodaciBackendError(
+            "PODACI_BACKEND je 'supabase', ali paket `supabase` nije instaliran "
+            "(dodaj ga u requirements.txt i pokreni aplikaciju ponovno). "
+            f"Ako baza još nije spremna, vrati PODACI_BACKEND = \"sheets\" i rebootaj."
+        ) from None
+    try:
+        klijent = create_client(adresa, kljuc)
+    except Exception as e:
+        raise PodaciBackendError(
+            f"Ne mogu se spojiti na bazu ({type(e).__name__}: {e}). "
+            f"Provjeri {SUPABASE_URL_KLJUC} i {SUPABASE_KEY_KLJUC}."
+        ) from None
+    _CLIJENTI_BAZE[adresa] = klijent
+    return klijent
+
+
+def tabovi_iz_baze(klijent) -> list[str]:
+    """Imena tabova koja u bazi postoje (iz `crm.zaglavlje`).
+
+    Zašto: `SupabaseSpreadsheet` mora, kao i gspread, znati koji tabovi postoje —
+    inače bi svaki pogrešno napisan naziv tiho dao prazan tab. Popis se NE vodi
+    ručno u kodu (ostario bi), nego se pročita iz baze.
+    """
+    imena: list[str] = []
+    velicina, od = 1000, 0
+    while True:
+        dio = (klijent.table("zaglavlje").select("tab")
+               .range(od, od + velicina - 1).execute().data) or []
+        imena.extend(str(r["tab"]) for r in dio if r.get("tab"))
+        if len(dio) < velicina:
+            break
+        od += velicina
+    return sorted(set(imena))
+
+
+def _tabovi_za_klijenta(klijent) -> list[str]:
+    """Popis tabova za adapter. Ako baza ne odgovara, diže se greška (ne tiho)."""
+    try:
+        return tabovi_iz_baze(klijent)
+    except Exception as e:
+        raise PodaciBackendError(
+            f"Baza ne odgovara na upit o tabovima ({type(e).__name__}: {e}). "
+            f"Ako tablice iz `crm` sheme još nisu napravljene, primijeni migraciju "
+            f"(vidi supabase_tabovi.SQL_TABLICE) ili vrati PODACI_BACKEND = \"sheets\"."
+        ) from None
+
+
+@st.cache_resource(show_spinner=False)
+def _radna_knjiga(backend: str):
+    """Otvori radnu knjigu za odabrani backend. Ime funkcije je "tehničko":
+    aplikacija zove `sheet()`, a ne ovo."""
+    if backend == "supabase":
+        klijent = _klijent_iz_baze()
+        return podaci_modul.tabovi_iz_baze(klijent, _tabovi_za_klijenta(klijent))
+    sa_info = json.loads(_postavka("GOOGLE_SERVICE_ACCOUNT_JSON", "{}") or "{}")
+    gc = get_gspread_client(sa_info)
+    return gc.open_by_key(_postavka("SHEET_ID"))
+
+
+def sheet(secrets=None):
+    """Radna knjiga s podacima — Google Sheet ili baza, prema `PODACI_BACKEND`.
+
+    Ovo je JEDINO mjesto koje zna gdje su podaci. Sve tri aplikacije (CRM,
+    evidencija dolazaka, booking) dobiju objekt istog oblika, pa ostatak koda
+    ostaje nepromijenjen.
+
+        sheet = pipeline_upisi.sheet()      # umjesto gc.open_by_key(...)
+
+    Postavka se čita iz `st.secrets`, a ako nje nema — koristi se "sheets".
+    Nepoznata vrijednost NIJE dopuštena: aplikacija stane s uputom (vidi
+    `podaci.backend`), jer bi tihi povratak na Sheet razdvojio dvije kopije.
+
+    `secrets` služi testovima (preda se rječnik umjesto `st.secrets`).
+    """
+    if podaci_modul is None:
+        raise PodaciBackendError(
+            "Modul `podaci.py` nije uz ovu datoteku, pa se ne zna gdje su podaci. "
+            "U repou moraju biti zajedno: pipeline_upisi.py, podaci.py i supabase_tabovi.py."
+        )
+    odabrani = podaci_modul.backend(secrets) if secrets is not None else podaci_modul.backend()
+    return _radna_knjiga(odabrani)
 
 
 # --- Učitavanje podataka ---
