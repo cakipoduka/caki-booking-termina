@@ -310,6 +310,185 @@ def tabovi_iz_baze(klijent, tabovi: list[str] | None = None, sirine: dict | None
     return supabase_tabovi.SupabaseSpreadsheet(klijent, tabovi, sirine)
 
 
+# ============================================================================
+#  HIBRID: koji tab ide u BAZU, a koji OSTAJE u Google Sheetu
+# ============================================================================
+#  ZASTO OVAJ SMJER ("u bazu samo dopusteno"):
+#    Apps Script (mailovi, ponude, obracun instrukcija, PDV prag) i Google Forms
+#    rade ISKLJUCIVO nad Sheetom. Kada bi sve preselilo u bazu, te bi skripte
+#    nastavile raditi — ali nad podacima koji se vise ne mijenjaju, pa bi mailovi
+#    isli na stare podatke, a ponude se sastavljale iz zastarjelih prijava.
+#    Zato je sigurno da u bazu ide SAMO ono sto je ovdje izricito navedeno;
+#    svaki novi tab ostaje u Sheetu dok se ne doda u skup. Time nijedan tab ne
+#    promijeni mjesto slucajno.
+#
+#  POPIS JE IZVEDEN IZ KODA I SHEETA (11.10.2026.), ne napamet:
+#    - imena su TOCNA imena tabova iz Google Sheeta (Provjereno: izvoz Sheeta i
+#      `sheet.worksheet(...)` pozivi u kodu). Npr. `Biljeske` (bez kvacice) i
+#      `Raspored_Matura_202627` (bez znaka /) — tako se zovu u Sheetu.
+#    - skup u Sheetu = sve sto dira Apps Script ili Forms (14 tabova, vidi
+#      `CAKI SUPABASE/05_CRM_PRIJELAZ/APPS_SCRIPT_TABOVI.md`) + `Dolasci` i
+#      `Gostovanja` (cita ih CAKI_izostanci.gs).
+# ----------------------------------------------------------------------------
+PODACI_BACKEND_KLJUC = "PODACI_BACKEND"
+TABOVI_U_BAZI_KLJUC = "PODACI_TABOVI_U_BAZI"
+TABOVI_U_BAZI_SVE = "sve"
+
+#: Tabovi koji IDU U BAZU. Popis se smije samo povecavati — kad se za neki tab
+#: dokaže da ga Apps Script ne dira. Skup je NAMJERNO eksplicitan (vidi gore).
+#:
+#: `Backup_log` NIJE ovdje iako ga aplikacija ne koristi za pisanje: u njega piše
+#: `CAKI_backup.gs` (`zapisBackupLog_`). Da je u bazi, aplikacija bi ga čitala iz
+#: baze, a skripta pisala u Sheet — pa dnevnik backupa u CRM-u ne bi pokazivao
+#: ništa. Ostaje u Sheetu (nalaz iz Dijela A2, 11.10.2026.).
+TABOVI_U_BAZI: frozenset[str] = frozenset({
+    "Grupe",
+    "Termini",
+    "Rezervacije",
+    "Biljeske",
+    "Nastavnici",
+    "Zamjene log",
+    "Dodjele",
+    "Honorari",
+    "Paketi_sati",
+    "Razdoblja_termina",
+    "Praznici",
+    "Raspored_Matura_202627",
+    "GDPR_log",
+    "Izvjestaji_instruktora",
+    "WhatsApp_predlosci",
+})
+
+#: Tabovi koji OSTAJU u Google Sheetu (Apps Script / Google Forms ih citaju ili pisu).
+#: Vodi se radi citljivosti i provjere; tab koji nije u TABOVI_U_BAZI ionako ide u Sheet.
+TABOVI_U_SHEETU: frozenset[str] = frozenset({
+    "Mail_dnevnik",
+    "Form responses 1",
+    "Prijave",
+    "Učenici",
+    "Matura_postavke",
+    "Uvoz_instrukcije",
+    "Cjenik",
+    "Racuni_i_ponude",
+    "PDV_prag",
+    "Mail_predlosci",
+    "Backup_log",          # pise ga CAKI_backup.gs — vidi obrazlozenje gore
+    "Instrukcije_termini",
+    "Dolasci",
+    "Gostovanja",
+})
+
+
+class PodaciBackendError(RuntimeError):
+    """Podaci se ne mogu otvoriti onako kako je postavljeno.
+
+    Diže se NAMJERNO (nikad tihi pad na drugi izvor): ako se trazi tab iz Sheeta,
+    a veza sa Sheetom ne radi, aplikacija stane s uputom. Tihi povratak znacio bi
+    da se dio dana pise u Sheet, a dio u bazu, pa se kopije raziđu.
+    """
+
+
+def svi_tabovi_u_bazi(secrets=None) -> bool:
+    """Je li ukljuceno `PODACI_TABOVI_U_BAZI = "sve"` (samo za testni projekt)."""
+    izvor = _tajne() if secrets is None else secrets
+    try:
+        vrijednost = str(izvor.get(TABOVI_U_BAZI_KLJUC, "") or "").strip().lower()
+    except Exception:
+        vrijednost = ""
+    return vrijednost == TABOVI_U_BAZI_SVE
+
+
+def tabovi_u_bazi(secrets=None) -> frozenset[str]:
+    """Skup tabova koji idu u bazu.
+
+    Uz `PODACI_TABOVI_U_BAZI = "sve"` vraca PRAZAN skup, a `izvor_taba` tada sve
+    salje u bazu — tako se ne mora voditi drugi popis tabova.
+    """
+    if svi_tabovi_u_bazi(secrets):
+        return frozenset()
+    return TABOVI_U_BAZI
+
+
+def izvor_taba(naziv: str, secrets=None) -> str:
+    """Odakle se cita tab: "baza" ili "sheet".
+
+    Pravilo: u bazu ide samo ono sto je u `TABOVI_U_BAZI`. Sve ostalo — ukljucujuci
+    svaki novi, nepoznati tab — ostaje u Sheetu (sigurni zadani smjer).
+    """
+    if svi_tabovi_u_bazi(secrets):
+        return "baza"
+    return "baza" if str(naziv) in TABOVI_U_BAZI else "sheet"
+
+
+class HibridnaKnjiga:
+    """Radna knjiga koja dio tabova drzi u bazi, a dio u Google Sheetu.
+
+    Ima isti oblik kao gspread Spreadsheet (i kao `SupabaseSpreadsheet`), pa je
+    `pipeline_upisi.py` ne razlikuje od ostalih. Spajanje podataka iz oba izvora
+    (npr. `Dolasci` iz Sheeta + `Grupe` iz baze preko `ucenik_id`) radi bez izmjena
+    pozivajuceg koda — svaki `worksheet(naziv)` vrati ispravan izvor.
+
+    Veza sa Sheetom otvara se LIJENO (`sheet_tvornik` se zove tek kad netko zatrzi
+    tab iz Sheeta), da rad s bazom i testovi ne traze Google racun.
+    """
+
+    def __init__(self, baza_knjiga, sheet_tvornik, secrets=None):
+        self.baza = baza_knjiga
+        self._sheet_tvornik = sheet_tvornik          # funkcija bez argumenata
+        self._sheet = None
+        self._secrets = secrets
+
+    # ------------------------------------------------------------------ izvor
+    def _izvor(self, naziv: str) -> str:
+        return izvor_taba(naziv, self._secrets)
+
+    def _sheet_knjiga(self):
+        """Otvori Sheet tek kad zatreba. Ako ne radi — glasna greska, ne tihi pad."""
+        if self._sheet is None:
+            if self._sheet_tvornik is None:
+                raise PodaciBackendError(
+                    "Trazi se tab iz Google Sheeta, ali veza sa Sheetom nije "
+                    "postavljena. Provjeri GOOGLE_SERVICE_ACCOUNT_JSON i SHEET_ID "
+                    "u postavkama (Streamlit → Settings → Secrets)."
+                )
+            try:
+                self._sheet = self._sheet_tvornik()
+            except Exception as e:
+                raise PodaciBackendError(
+                    f"Trazi se tab iz Google Sheeta, ali veza ne radi "
+                    f"({type(e).__name__}: {e}). Provjeri GOOGLE_SERVICE_ACCOUNT_JSON "
+                    f"i SHEET_ID. Ako zelis raditi samo na bazi, postavi "
+                    f"{TABOVI_U_BAZI_KLJUC} = \"{TABOVI_U_BAZI_SVE}\" (samo testni projekt)."
+                ) from None
+        return self._sheet
+
+    # --------------------------------------------------------------- sucelje
+    def worksheet(self, title: str):
+        if self._izvor(title) == "baza":
+            return self.baza.worksheet(title)
+        return self._sheet_knjiga().worksheet(title)
+
+    def worksheets(self) -> list:
+        """Tabovi iz oba izvora — ali SVAKI po pravilu izvora, bez duplikata.
+
+        Vazno (ispravka 11.10.2026., zadatak 01b): tab se uzima iz onog izvora u
+        koji ga `izvor_taba()` salje. Ako u bazi zaostane tab koji pripada Sheetu
+        (npr. nakon probnog prijenosa), prije bi `worksheets()` vratio objekt iz
+        BAZE, a `worksheet(naziv)` objekt iz SHEETA — dvije razlicite istine za
+        isti naziv. Sada su oba puta usklađena.
+        """
+        iz_baze = [ws for ws in self.baza.worksheets()
+                   if self._izvor(getattr(ws, "title", "")) == "baza"]
+        iz_sheeta = [ws for ws in self._sheet_knjiga().worksheets()
+                     if self._izvor(getattr(ws, "title", "")) == "sheet"]
+        return iz_baze + iz_sheeta
+
+    def add_worksheet(self, title: str, rows: int = 100, cols: int = 26):
+        if self._izvor(title) == "baza":
+            return self.baza.add_worksheet(title, rows, cols)
+        return self._sheet_knjiga().add_worksheet(title, rows, cols)
+
+
 class NepoznatKljuc(ValueError):
     """Ključ zapisa ne postoji u tabu.
 

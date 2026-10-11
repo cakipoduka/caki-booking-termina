@@ -286,16 +286,30 @@ def _tabovi_za_klijenta(klijent) -> list[str]:
         ) from None
 
 
-@st.cache_resource(show_spinner=False)
-def _radna_knjiga(backend: str):
-    """Otvori radnu knjigu za odabrani backend. Ime funkcije je "tehničko":
-    aplikacija zove `sheet()`, a ne ovo."""
-    if backend == "supabase":
-        klijent = _klijent_iz_baze()
-        return podaci_modul.tabovi_iz_baze(klijent, _tabovi_za_klijenta(klijent))
+def _sheet_knjiga_iz_googlea():
+    """Otvori Google Sheet (lijeno — zove se samo kad treba tab iz Sheeta)."""
     sa_info = json.loads(_postavka("GOOGLE_SERVICE_ACCOUNT_JSON", "{}") or "{}")
     gc = get_gspread_client(sa_info)
     return gc.open_by_key(_postavka("SHEET_ID"))
+
+
+@st.cache_resource(show_spinner=False)
+def _radna_knjiga(backend: str):
+    """Otvori radnu knjigu za odabrani backend. Ime funkcije je "tehničko":
+    aplikacija zove `sheet()`, a ne ovo.
+
+    Kada je ukljucena baza, ali nije SVE u bazi (uobicajeni slucaj), vraca se
+    HIBRID: tabovi iz `podaci.TABOVI_U_BAZI` idu u bazu, svi ostali u Google Sheet
+    (Apps Script i Google Forms rade nad Sheetom, pa njihovi tabovi moraju ostati
+    tamo). Veza sa Sheetom otvara se lijeno — tek kad se zatrzi tab iz Sheeta.
+    """
+    if backend == "supabase":
+        klijent = _klijent_iz_baze()
+        baza = podaci_modul.tabovi_iz_baze(klijent, _tabovi_za_klijenta(klijent))
+        if podaci_modul.svi_tabovi_u_bazi():
+            return baza
+        return podaci_modul.HibridnaKnjiga(baza, _sheet_knjiga_iz_googlea)
+    return _sheet_knjiga_iz_googlea()
 
 
 def sheet(secrets=None):
