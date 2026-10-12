@@ -36,6 +36,11 @@ from pipeline_upisi import (
     portal_raspored_matura,
     naziv_taba_rasporeda_mature,
     portal_rezultati,
+    datumi_termina,
+    kljuc_predmeta_mature,
+    u_datum,
+    ucitaj_praznike,
+    ucitaj_razdoblja,
 )
 
 KONTAKT = "📞 +385 95 900 5611 · ✉️ info@cakipoduka.com"
@@ -67,6 +72,28 @@ def _ucitaj_rezervacije():
 @st.cache_data(ttl=60)
 def _ucitaj_racune():
     return load_racuni(_init_sheet())
+
+
+# 12.10.2026.: početak priprema po predmetu (tab Razdoblja_termina) i praznici — isto čitanje kao u adminu
+@st.cache_data(ttl=60)
+def _ucitaj_razdoblja():
+    return ucitaj_razdoblja(_init_sheet())
+
+
+@st.cache_data(ttl=60)
+def _ucitaj_praznike():
+    return ucitaj_praznike(_init_sheet())
+
+
+def pocetak_predmeta(oznaka: str, dan: str, razdoblja: dict, praznici: dict) -> str:
+    """Datum prvog sata za predmet Mature na zadani dan u tjednu: prvi takav dan >= datuma početka predmeta
+    (praznici se preskaču). Predmet bez upisanog početka koristi opći 'MATURA' unos; ako ni njega nema → 'Javit ćemo'."""
+    zapis = (razdoblja or {}).get(kljuc_predmeta_mature(oznaka)) or (razdoblja or {}).get("MATURA")
+    od = u_datum(zapis.get("od")) if zapis else None
+    if not od:
+        return "Javit ćemo"
+    datumi, _ = datumi_termina(od, dan, 1, praznici)
+    return (datumi[0] if datumi else od).strftime("%d.%m.%Y.")
 
 
 def _poruka(vrsta: str, tekst: str):
@@ -173,6 +200,12 @@ def _prikazi_odabir_termina(sheet, ucenik, ucenik_id, komponente, df_grupe, df_r
 def prikazi_portal():
     sheet = _init_sheet()
 
+    # 12.10.2026.: veliki brojevi u zaglavlju više se ne režu ("Srijeda 15:0…") — manji font i dopušten prijelom
+    st.markdown("""<style>
+[data-testid="stMetricValue"] { font-size: 1.7rem; }
+[data-testid="stMetricValue"] > div { white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.25; }
+</style>""", unsafe_allow_html=True)
+
     st.title("📘 Moj CAKI")
     st.caption("Odabir termina, raspored, dolasci, instrukcije i plaćanja — sve na jednom mjestu.")
 
@@ -204,10 +237,10 @@ def prikazi_portal():
     # --- Zaglavlje: tko je i najvažnije u 3 broja ---
     with st.container(border=True):
         st.markdown(f"### 👋 {ucenik['ime_djeteta']}")
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3 = st.columns([2.4, 1, 1.5])
         prvi = raspored if not raspored.empty else raspored_matura
         m1.metric("📅 Grupa", f"{prvi.iloc[0]['Dan']} {prvi.iloc[0]['Vrijeme']}" if not prvi.empty else "—",
-                  help="Prvi termin u tjednu (svi termini su u kartici Raspored).")
+                  help="Prvi termin u tjednu, s vremenom (svi termini i datumi početka su u kartici Raspored).")
         ukupno_dol = round(sum(postotci.values()) / len(postotci)) if postotci else None
         m2.metric("✅ Dolasci", f"{ukupno_dol} %" if ukupno_dol is not None else "—")
         m3.metric("💶 Za uplatu", f"{centi_u_tekst(dug)} €" if dug else "0,00 €")
@@ -226,8 +259,13 @@ def prikazi_portal():
     with kartice["🗓️ Raspored"]:
         if not raspored_matura.empty:
             st.markdown("#### Pripreme za Maturu")
+            razdoblja, praznici = _ucitaj_razdoblja(), _ucitaj_praznike()
+            raspored_matura = raspored_matura.copy()
+            raspored_matura["Početak"] = [pocetak_predmeta(r["Predmet"], r["Dan"], razdoblja, praznici)
+                                          for _, r in raspored_matura.iterrows()]
             st.dataframe(raspored_matura, hide_index=True, width="stretch")
-            st.caption("Tjedni raspored po predmetima. Početak nastave razlikuje se po predmetu — javit ćemo vam ga.")
+            st.caption("Tjedni raspored po predmetima. U stupcu *Početak* je datum prvog sata za svaki predmet "
+                       "(početak nastave razlikuje se po predmetu). Ako piše „Javit ćemo“, datum još nije određen.")
         if not raspored.empty or raspored_matura.empty:
             st.markdown("#### Grupna nastava")
             if raspored.empty:
