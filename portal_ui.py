@@ -10,6 +10,7 @@ Pristup: samo šifra učenika (ucenik_id), bez lozinke — svjesna odluka (§24.
 Portal nikad ne prikazuje interne napomene, kontakte, nacrte ponuda ni neposlane dokumente.
 """
 import json
+import re
 
 import pandas as pd
 import streamlit as st
@@ -41,6 +42,19 @@ from pipeline_upisi import (
     u_datum,
     ucitaj_praznike,
     ucitaj_razdoblja,
+)
+from obavijesti import (  # 15.10.2026.: kartica 📣 Obavijesti (poruke od Cakija, linkovi, komentari)
+    MAX_KOMENTAR,
+    OD_OPCIJE,
+    dodaj_komentar,
+    komentari_ucenika,
+    linkovi_za_ucenika,
+    load_komentare,
+    load_linkove,
+    load_obavijesti,
+    obavijesti_za_ucenika,
+    oznake_ucenika,
+    previse_komentara,
 )
 
 KONTAKT = "📞 +385 95 900 5611 · ✉️ info@cakipoduka.com"
@@ -94,6 +108,35 @@ def pocetak_predmeta(oznaka: str, dan: str, razdoblja: dict, praznici: dict) -> 
         return "Javit ćemo"
     datumi, _ = datumi_termina(od, dan, 1, praznici)
     return (datumi[0] if datumi else od).strftime("%d.%m.%Y.")
+
+
+# 15.10.2026.: Obavijesti — tabovi Obavijesti, Linkovi_portal, Komentari_portal (stvara ih admin kad prvi put nešto spremi)
+@st.cache_data(ttl=60)
+def _ucitaj_obavijesti():
+    return load_obavijesti(_init_sheet())
+
+
+@st.cache_data(ttl=60)
+def _ucitaj_linkove():
+    return load_linkove(_init_sheet())
+
+
+@st.cache_data(ttl=30)
+def _ucitaj_komentare():
+    return load_komentare(_init_sheet())
+
+
+def _md_sigurno(tekst: str) -> str:
+    """Tekst koji je napisao klijent prikazuje se doslovno (bez markdowna, linkova i oznaka)."""
+    return re.sub(r"([\\`*_{}\[\]()#+!|<>~$:-])", r"\\\1", str(tekst or "")).replace("\n", "  \n")
+
+
+def _gumb_link(naziv: str, url: str):
+    """Gumb-link preko cijele širine (radi i na starijim i na novijim verzijama Streamlita)."""
+    try:
+        st.link_button(naziv, url, width="stretch")
+    except TypeError:
+        st.link_button(naziv, url, use_container_width=True)
 
 
 def _poruka(vrsta: str, tekst: str):
@@ -195,6 +238,62 @@ def _prikazi_odabir_termina(sheet, ucenik, ucenik_id, komponente, df_grupe, df_r
                     st.rerun()
 
 
+# ------------------------------------------------------------------ obavijesti (prva kartica)
+
+def _prikazi_obavijesti(sheet, ucenik, ucenik_id, obavijesti, linkovi, df_komentari, greska=False):
+    if greska:
+        st.info("Obavijesti trenutno nisu dostupne. Pokušajte malo kasnije ili nas nazovite.")
+        return
+
+    if not obavijesti and not linkovi:
+        st.caption("Trenutno nema novih obavijesti.")
+    for o in obavijesti:
+        with st.container(border=True):
+            st.markdown(("📌 " if o["vazno"] else "") + f"**{o['naslov']}**")
+            if o["datum"]:
+                st.caption(o["datum"])
+            st.markdown(o["tekst"].replace("\n", "  \n"))
+
+    if linkovi:
+        st.markdown("#### 🔗 Važni linkovi")
+        for l in linkovi:
+            _gumb_link(l["naziv"], l["url"])
+            if l["opis"]:
+                st.caption(l["opis"])
+
+    st.markdown("#### 💬 Napišite nam")
+    st.caption("Komentar, pitanje ili napomena za CAKI — ostaje zabilježena uz učenika, a odgovor vidite ovdje. "
+               "Za hitne stvari nazovite nas. Ne upisujte osjetljive osobne podatke.")
+    with st.form("obrazac_komentar", clear_on_submit=True):
+        od = st.radio("Tko piše?", OD_OPCIJE, horizontal=True)
+        tekst = st.text_area("Vaša poruka", max_chars=MAX_KOMENTAR, height=120)
+        poslano = st.form_submit_button("Pošalji", type="primary")
+    if poslano:
+        if not tekst.strip():
+            st.warning("Upišite poruku.")
+        elif previse_komentara(df_komentari, ucenik_id):
+            st.warning("Danas ste već poslali nekoliko poruka. Za hitne stvari nazovite nas.")
+        else:
+            try:
+                dodaj_komentar(sheet, ucenik_id, ucenik["ime_djeteta"], od, tekst)
+            except Exception:
+                st.error("Poruka nije poslana. Pokušajte ponovno ili nas nazovite.")
+            else:
+                _ucitaj_komentare.clear()
+                _poruka("success", "Hvala! Poruka je zabilježena.")
+                st.rerun()
+
+    moji = komentari_ucenika(df_komentari, ucenik_id)
+    if moji:
+        with st.expander(f"Vaše poruke ({len(moji)})"):
+            for k in moji:
+                st.markdown(f"**{k['datum']}** · {k['od']}")
+                st.markdown(_md_sigurno(k["tekst"]))
+                if k["odgovor"]:
+                    st.info("💬 **CAKI:** " + k["odgovor"].replace("\n", "  \n"))
+                st.divider()
+
+
 # ------------------------------------------------------------------ portal
 
 def prikazi_portal():
@@ -234,6 +333,16 @@ def prikazi_portal():
     tablica_dol, postotci = portal_dolasci(_ucitaj("Dolasci"), _ucitaj("Termini"), df_grupe, ucenik_id)
     dokumenti, dug = portal_naplata(df_racuni, ucenik_id)
 
+    # --- Obavijesti (15.10.2026.): ako tabovi ne postoje / Google zapne, ostatak portala radi dalje ---
+    try:
+        oznake = oznake_ucenika(_ucitaj("Prijave"), ucenik_id,
+                                matura_oznake=list(raspored_matura["Predmet"]) if not raspored_matura.empty else ())
+        obavijesti = obavijesti_za_ucenika(_ucitaj_obavijesti(), ucenik_id, oznake)
+        linkovi = linkovi_za_ucenika(_ucitaj_linkove(), ucenik_id, oznake)
+        df_komentari, obav_greska = _ucitaj_komentare(), False
+    except Exception:
+        obavijesti, linkovi, df_komentari, obav_greska = [], [], pd.DataFrame(), True
+
     # --- Zaglavlje: tko je i najvažnije u 3 broja ---
     with st.container(border=True):
         st.markdown(f"### 👋 {ucenik['ime_djeteta']}")
@@ -247,10 +356,14 @@ def prikazi_portal():
     if bez_termina:
         st.warning("📅 **Odaberite termin nastave** — kartica *Odabir termina* ispod.")
 
-    nazivi = ["🗓️ Raspored", "✅ Dolasci", "💶 Plaćanja", "📊 Rezultati"]
+    naziv_obav = f"📣 Obavijesti ({len(obavijesti)})" if obavijesti else "📣 Obavijesti"
+    nazivi = [naziv_obav, "🗓️ Raspored", "✅ Dolasci", "💶 Plaćanja", "📊 Rezultati"]
     if komponente:
-        nazivi.insert(0 if bez_termina else len(nazivi), "📅 Odabir termina")
+        nazivi.insert(1 if bez_termina else len(nazivi), "📅 Odabir termina")
     kartice = dict(zip(nazivi, st.tabs(nazivi)))
+
+    with kartice[naziv_obav]:
+        _prikazi_obavijesti(sheet, ucenik, ucenik_id, obavijesti, linkovi, df_komentari, obav_greska)
 
     if "📅 Odabir termina" in kartice:
         with kartice["📅 Odabir termina"]:
