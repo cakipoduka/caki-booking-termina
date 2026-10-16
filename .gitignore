@@ -1,0 +1,10 @@
+# --- TAJNE: nikad na GitHub (dodano 15.10.2026., nalaz 2) ---
+.streamlit/secrets.toml
+secrets.toml
+*.json.key
+service_account*.json
+.env
+
+# --- Python smece ---
+__pycache__/
+*.pyc

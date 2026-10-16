@@ -4,22 +4,17 @@ CAKI — app_booking.py  (glavna adresa portala, link iz maila: ...streamlit.app
 26.9.2026.: booking i Moj CAKI spojeni u JEDAN portal s karticama (portal_ui.py):
 odabir termina, raspored, dolasci, instrukcije, plaćanja, rezultati.
 Stari linkovi .../Moj_CAKI?ucenik_id=... i dalje rade (pages/1_Moj_CAKI.py prikazuje isto).
+
+15.10.2026. (nalaz 16): uklonjena je zaobilaznica koja je rucno ponovno ucitavala module.
+Postojala je jer je Streamlit Cloud nakon git pulla znao zadrzati staru verziju modula u
+memoriji (ImportError "cannot import name"). Radni postupak ionako ukljucuje rucni
+"Reboot app" nakon svakog Pusha, a reboot podize novi proces i ucitava svjeze module --
+pa zaobilaznica nema sto rijesiti. Ako se ImportError ipak vrati, vrati staru verziju
+iz gita (Discard / revert) i javi: znacilo bi da reboot ne radi ono sto mislimo.
 """
 import streamlit as st
 
-# Streamlit Cloud nakon git pulla zna zadržati STARU verziju modula u memoriji
-# (→ ImportError "cannot import name"). Ako je datoteka novija od učitanog modula, učitaj je ponovno.
-import importlib, os, time  # noqa: E401,E402
-import pipeline_upisi as _pipeline  # noqa: E402
-if os.path.getmtime(_pipeline.__file__) > getattr(_pipeline, "_ucitano_u", 0):
-    importlib.reload(_pipeline)
-    _pipeline._ucitano_u = time.time()
-import portal_ui as _portal  # noqa: E402
-if os.path.getmtime(_portal.__file__) > getattr(_portal, "_ucitano_u", 0) or \
-        getattr(_portal, "_pipeline_u", 0) != getattr(_pipeline, "_ucitano_u", 0):
-    importlib.reload(_portal)
-    _portal._ucitano_u = time.time()
-    _portal._pipeline_u = getattr(_pipeline, "_ucitano_u", 0)
+import portal_ui as _portal
 
 st.set_page_config(page_title="Moj CAKI", page_icon="📘", layout="centered")
 _portal.prikazi_portal()
