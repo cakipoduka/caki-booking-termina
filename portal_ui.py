@@ -44,6 +44,7 @@ from pipeline_upisi import (
     ucitaj_praznike,
     ucitaj_razdoblja,
 )
+from sat_biljeska import za_roditelja as sat_za_roditelja  # 17.10.2026.: teme i zadaca po satu
 from obavijesti import (  # 15.10.2026.: kartica 📣 Obavijesti (poruke od Cakija, linkovi, komentari)
     MAX_KOMENTAR,
     OD_OPCIJE,
@@ -396,6 +397,14 @@ def prikazi_portal():
                          column_config={"Cijena (€)": st.column_config.NumberColumn(format="%.2f")})
             st.caption("📒 Bilješku sa sata piše profesor (što se radilo, domaća zadaća). Termin otkažite najkasnije "
                        "24 sata ranije — kasnije otkazivanje i nedolazak se naplaćuju.")
+        try:  # 17.10.2026.: teme i zadaća po satu (ocjena sata i interna napomena se NE prikazuju)
+            sat_tablica = sat_za_roditelja(df_instr_p, ucenik_id)
+        except Exception:
+            sat_tablica = None
+        if sat_tablica is not None and not sat_tablica.empty:
+            st.markdown("#### 📚 Što smo radili i zadaća")
+            st.dataframe(sat_tablica, hide_index=True, width="stretch")
+
         paketi = portal_paketi(_ucitaj(PAKETI_TAB), df_instr_p, ucenik_id)
         if not paketi.empty:
             st.markdown("#### 📦 Paket sati")
