@@ -2269,7 +2269,7 @@ def portal_raspored_grupa(df_rezervacije: pd.DataFrame, df_grupe: pd.DataFrame, 
         "Program": spojeno["program"].map(lambda k: KOMPONENTE.get(k, k)),
         "Dan": spojeno["dan"],
         "Vrijeme": spojeno["vrijeme"],
-        "Učionica": spojeno["ucionica"],
+        "Učionica": spojeno["ucionica"].map(ucionica_javno),
         "Status": spojeno["status"].map({"Potvrđeno": "✅ Potvrđeno", "Rezervirano": "🟠 Čeka potvrdu uplate"}),
     }).reset_index(drop=True)
 
@@ -3933,8 +3933,8 @@ def poruke_ucenika(df_prijave: pd.DataFrame, df_form: pd.DataFrame, df_ucenici: 
 # Neradni dani su u tabu Praznici (uređuje se u 🗓️ Tjedni pregled); dok ga nema, vrijede PRAZNICI_ZADANI.
 # Online grupe ne zauzimaju učionicu. Sve funkcije osim čitanja/pisanja Sheeta su čiste (testovi).
 # ============================================================
-UCIONICE_CENTRA = [("A", "Učionica 1", 6), ("B", "Učionica 2", 6), ("C", "Učionica 3", 12)]
-UCIONICE_UPISI_OPCIJE = ["Učionica 1 (6)", "Učionica 2 (6)", "Učionica 3 (12)", "Online"]
+UCIONICE_CENTRA = [("A", "Učionica A", 6), ("B", "Učionica B", 6), ("C", "Učionica C", 12)]
+UCIONICE_UPISI_OPCIJE = ["Učionica A", "Učionica B", "Učionica C", "Online"]
 GRUPA_ARHIVA = "arhiva"            # Grupe.aktivna = "arhiva": skrivena svima, ne zauzima učionicu
 RAZDOBLJA_TAB = "Razdoblja_termina"
 STUPCI_RAZDOBLJA = ["kljuc", "datum_od", "broj_termina", "datum_do", "zadnje_azurirano"]
@@ -3979,18 +3979,34 @@ def kapacitet_ucionice_centra(oznaka: str) -> int:
 
 
 def naziv_ucionice_centra(oznaka: str) -> str:
-    """'A' -> 'Učionica 1 / A (6)'."""
-    for o, n, k in UCIONICE_CENTRA:
-        if o == oznaka:
-            return f"{n} / {o} ({k})"
-    return oznaka or "Online"
-
-
-def opcija_ucionice_upisi(oznaka: str) -> str:
-    """'A' -> 'Učionica 1 (6)' (vrijednost koju pišemo u Grupe.ucionica); '' -> 'Online'."""
+    """'A' -> 'Učionica A (6)'. Admin i profesori — naziv S kapacitetom (17.10.2026.)."""
     for o, n, k in UCIONICE_CENTRA:
         if o == oznaka:
             return f"{n} ({k})"
+    return oznaka or "Online"
+
+
+def naziv_ucionice_javno(oznaka: str) -> str:
+    """'A' -> 'Učionica A'. Za roditelje/učenike (Moj CAKI) — BEZ kapaciteta (17.10.2026.):
+    kapacitet se namjerno ne pokazuje, roditelj vidi samo broj slobodnih mjesta."""
+    for o, n, _k in UCIONICE_CENTRA:
+        if o == oznaka:
+            return n
+    return oznaka or "Online"
+
+
+def ucionica_javno(tekst) -> str:
+    """Sirova vrijednost iz Grupe.ucionica -> naziv bez kapaciteta. Prepoznaje i stare zapise
+    ('Učionica 3 (12)' -> 'Učionica C'), pa migracija Sheeta nije potrebna (17.10.2026.)."""
+    return naziv_ucionice_javno(oznaka_ucionice(tekst))
+
+
+def opcija_ucionice_upisi(oznaka: str) -> str:
+    """'A' -> 'Učionica A' (vrijednost koju pišemo u Grupe.ucionica); '' -> 'Online'.
+    17.10.2026.: u Sheet se više ne upisuje kapacitet u tekstu — on živi u stupcu Grupe.kapacitet."""
+    for o, n, _k in UCIONICE_CENTRA:
+        if o == oznaka:
+            return n
     return "Online"
 
 

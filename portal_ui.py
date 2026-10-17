@@ -24,6 +24,7 @@ from pipeline_upisi import (
     dohvati_ucenika_po_id,
     get_gspread_client,
     izracunaj_dostupnost,
+    ucionica_javno,
     kreiraj_rezervaciju,
     load_racuni,
     load_rezervacije,
@@ -186,12 +187,12 @@ def _prikazi_odabir_termina(sheet, ucenik, ucenik_id, komponente, df_grupe, df_r
             r = moje.iloc[0]
             g = grupe_komp[grupe_komp["grupa_id"] == r["grupa_id"]].iloc[0]
             if r["status"] == "Čekanje":
-                st.info(f"🕐 Na listi čekanja: **{g['dan']} {g['vrijeme']}** ({g['ucionica']}) — "
+                st.info(f"🕐 Na listi čekanja: **{g['dan']} {g['vrijeme']}** ({ucionica_javno(g['ucionica'])}) — "
                         "javit ćemo vam se ako se mjesto oslobodi.")
             elif r["status"] == "Rezervirano":
-                st.warning(f"🟠 Rezervirano: **{g['dan']} {g['vrijeme']}** ({g['ucionica']}) — čeka potvrdu uplate.")
+                st.warning(f"🟠 Rezervirano: **{g['dan']} {g['vrijeme']}** ({ucionica_javno(g['ucionica'])}) — čeka potvrdu uplate.")
             else:
-                st.success(f"✅ Potvrđeno: **{g['dan']} {g['vrijeme']}** ({g['ucionica']})")
+                st.success(f"✅ Potvrđeno: **{g['dan']} {g['vrijeme']}** ({ucionica_javno(g['ucionica'])})")
             continue
 
         aktivne = grupe_komp[grupe_komp["aktivna"].astype(str).str.lower() == "da"] if not grupe_komp.empty else grupe_komp
@@ -204,7 +205,7 @@ def _prikazi_odabir_termina(sheet, ucenik, ucenik_id, komponente, df_grupe, df_r
             kljuc = f"rez_{komponenta}_{grupa['grupa_id']}"
             with st.container(border=True):
                 c1, c2 = st.columns([3, 1])
-                c1.write(f"**{grupa['dan']} {grupa['vrijeme']}** — {grupa['ucionica']}")
+                c1.write(f"**{grupa['dan']} {grupa['vrijeme']}** — {ucionica_javno(grupa['ucionica'])}")
                 if dostupnost["status_boja"] == "zeleno":
                     c1.markdown(f":green[🟢 {dostupnost['slobodna']} slobodnih mjesta]")
                     status_nove = "Rezervirano"
@@ -231,7 +232,7 @@ def _prikazi_odabir_termina(sheet, ucenik, ucenik_id, komponente, df_grupe, df_r
                         kreiraj_rezervaciju(sheet, grupa["grupa_id"], ucenik_id, ucenik["ime_djeteta"],
                                             ucenik.get("mobitel_roditelja", ""), status=status_nove)
                         _poruka("success",
-                                f"Rezervacija je evidentirana: {grupa['dan']} {grupa['vrijeme']} ({grupa['ucionica']})"
+                                f"Rezervacija je evidentirana: {grupa['dan']} {grupa['vrijeme']} ({ucionica_javno(grupa['ucionica'])})"
                                 " — čekamo potvrdu uplate." if status_nove == "Rezervirano"
                                 else "Dodani ste na listu čekanja — javit ćemo vam se ako se mjesto oslobodi.")
                     st.cache_data.clear()
