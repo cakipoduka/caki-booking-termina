@@ -20,11 +20,19 @@ vidi povijest sati i teme BEZ imena prethodnog profesora i bez ikakvih plaćanja
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import gspread
 import pandas as pd
+
+
+def _danas() -> date:
+    """Današnji datum u Zagrebu. NE date.today(): server (Streamlit Cloud) je u UTC-u, pa bi
+    rokovi nakon ponoći po našem vremenu bili pomaknuti za dan (popravak 18.10.2026.).
+    Ovaj modul namjerno ne uvozi pipeline_upisi, pa koristi isti obrazac kao profesori.py."""
+    return datetime.now(ZoneInfo("Europe/Zagreb")).date()
 
 TAB = "Instrukcije_termini"
 SAT_STUPCI = ["teme", "ocjena_sata", "zadaca_zadana", "zadaca_napravljena", "zadaca_javljeno"]
@@ -146,7 +154,7 @@ def spremi_sat(sheet, termin_id: str, teme, ocjena: str = "", zadaca_zadana: boo
         raise ValueError("Možete uređivati samo svoje termine.")
     if rok_dana is not None:
         d = datum_iz(z.get("datum"))
-        danas = danas or date.today()
+        danas = danas or _danas()
         if d and (danas - d).days > rok_dana:
             raise ValueError(f"Bilješku možete mijenjati najviše {rok_dana} dana nakon termina — javite se adminu.")
     novo = {"teme": teme_u_tekst(teme), "ocjena_sata": ocjena, "zadaca_zadana": "Da" if zadaca_zadana else ""}
@@ -164,7 +172,7 @@ def smije_provjeriti(df_instr: pd.DataFrame, nastavnik: str, ucenik_id: str, df_
         if ((df_instr["ucenik_id"].astype(str) == uid) & (df_instr["nastavnik"].astype(str) == nastavnik)).any():
             return True
     if df_dodjele is not None and not df_dodjele.empty and "profesor" in df_dodjele.columns:
-        danas = danas or date.today()
+        danas = danas or _danas()
         for _, r in df_dodjele[(df_dodjele["ucenik_id"].astype(str) == uid)
                                & (df_dodjele["profesor"].astype(str) == nastavnik)].iterrows():
             do = datum_iz(r.get("do"))

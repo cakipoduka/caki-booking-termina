@@ -4232,8 +4232,11 @@ def razdoblje_kante_mature(kanta: dict, razdoblja: dict, praznici=None) -> tuple
     return (None if None in ods else min(ods)), (None if None in dos else max(dos))
 
 
-def blokovi_zauzetosti(df_grupe, df_raspored_matura=None, razdoblja: dict | None = None, praznici=None) -> list:
-    """Svi termini koji zauzimaju učionicu: grupe Upisa (osim arhiviranih i online) + kante Mature.
+def blokovi_zauzetosti(df_grupe, df_raspored_matura=None, razdoblja: dict | None = None, praznici=None,
+                       df_najam=None) -> list:
+    """Svi termini koji zauzimaju učionicu: grupe Upisa (osim arhiviranih i online) + kante Mature
+    + termini najma (18.10.2026.: suradnici na modelu najma, npr. Slađana — razdoblje im je samo
+    taj jedan datum, pa provjera preklapanja i tjedni pregled rade bez nove logike).
     [{izvor 'UPISI'/'MATURA', id, dan, vrijeme, minute (od, do), ucionica 'A'/'B'/'C', kapacitet,
       oznaka, profesor, datum_od, datum_do, broj_termina, broj_ucenika}]"""
     razdoblja = razdoblja or {}
@@ -4261,6 +4264,9 @@ def blokovi_zauzetosti(df_grupe, df_raspored_matura=None, razdoblja: dict | None
                     "minute": vrijeme_u_minute(k["vrijeme"]), "ucionica": uc, "kapacitet": kapacitet_ucionice_centra(uc),
                     "oznaka": " + ".join(k["predmeti"]) or "MATURA", "profesor": k["profesor"],
                     "datum_od": od, "datum_do": do, "broj_termina": 0, "broj_ucenika": len(k["ucenici"])})
+    for n in najam_termini(df_najam):
+        if n["ucionica"]:
+            out.append(blok_iz_najma(n))
     return out
 
 
@@ -4381,6 +4387,588 @@ def provjeri_grupu_upisa(blok: dict, blokovi: list) -> list:
     if not blok.get("ucionica"):
         return []
     return [tekst_sukoba(b) for b in sukobi_bloka(blok, blokovi)]
+
+
+# ============================================================
+# 🧩 BLOKOVI TERMINA (17.10.2026.) — višepredmetni termin, npr. PRELOG
+# Jedan termin grupe (npr. 12:00-15:15) dijeli se na blokove po 90 min; svaki blok ima SVOJ
+# predmet i SVOG profesora, i razlikuje se od datuma do datuma (Cakijev navod 17.10.2026.:
+# "17.1. PRELOG dugi 12:00-15:15 — 2 bloka po 90min, prvi BIO, drugi KEM").
+# Grupa ostaje JEDNA jedinica rezervacije (jedan kapacitet, jedna učionica, vrijeme = cijeli
+# raspon), pa zauzetost učionica i Moj CAKI rade bez izmjena — raspored UNUTAR termina je ovdje.
+# Odluke i otvorena pitanja: "Claude outputs/BRIEF_PRELOG_blokovi_2026-10-17-0922.md".
+# ============================================================
+BLOKOVI_TAB = "Blokovi_termina"
+BLOKOVI_HEADERS = ["blok_id", "grupa_id", "datum", "blok", "vrijeme", "predmet", "nastavnik",
+                   "event_id", "azurirano"]
+BLOK_TRAJANJE_MIN = 90        # jedan blok = 90 min = 2 školska sata
+BLOK_PAUZA_MIN = 15           # pauza između blokova (12:00-13:30 · pauza · 13:45-15:15)
+
+# Kvote u blokovima od 90 min po predmetu (Cakijev navod 17.10.2026., razdoblje 17.1.–31.5.).
+# Zbroj je JEDNAK ZADANI_BROJ_TERMINA za taj program: DUGI 7+9+7=23, KRATKI 5+7+5=17 —
+# dakle "broj termina" za te programe broji BLOKOVE, ne datume (v. brief §2).
+PRELOG_PREDMETI = ["BIO", "FIZ", "KEM"]
+KVOTE_BLOKOVA = {"PRELOG-DUGI": {"BIO": 7, "FIZ": 9, "KEM": 7},
+                 "PRELOG-KRATKI": {"BIO": 5, "FIZ": 7, "KEM": 5}}
+
+
+def program_ima_blokove(program) -> bool:
+    """Vodi li se raspored tog programa po blokovima (višepredmetni program)."""
+    return str(program or "").strip().upper() in KVOTE_BLOKOVA
+
+
+def kvote_programa(program) -> dict:
+    """{predmet: broj blokova} za program; {} ako program nije višepredmetni."""
+    return dict(KVOTE_BLOKOVA.get(str(program or "").strip().upper(), {}))
+
+
+def _hhmm(minuta) -> str:
+    return f"{int(minuta) // 60:02d}:{int(minuta) % 60:02d}"
+
+
+def vremena_blokova(vrijeme, broj_blokova: int = 0, pauza: int = BLOK_PAUZA_MIN) -> list:
+    """Raspon termina → vremena pojedinih blokova. '12:00-15:15' → ['12:00-13:30', '13:45-15:15'].
+    Broj blokova se izračuna sam iz trajanja ako nije zadan. [] = vrijeme nije ispravno."""
+    minute = vrijeme_u_minute(vrijeme)
+    if not minute:
+        return []
+    od, do = minute
+    ukupno = do - od
+    if ukupno <= 0:
+        return []
+    n = int(broj_blokova or 0)
+    if n <= 0:
+        n = max(1, round((ukupno + pauza) / (BLOK_TRAJANJE_MIN + pauza)))
+    trajanje = (ukupno - pauza * (n - 1)) / n
+    if trajanje <= 0:
+        return []
+    out = []
+    for i in range(n):
+        a = od + i * (trajanje + pauza)
+        out.append(f"{_hhmm(round(a))}-{_hhmm(round(a + trajanje))}")
+    return out
+
+
+def postavi_tab_blokova(sheet) -> bool:
+    """⚙️ Jednokratno (sigurno je ponoviti): tab Blokovi_termina. True = nešto je stvoreno/dodano."""
+    return _osiguraj_tab_stupce(sheet, BLOKOVI_TAB, BLOKOVI_HEADERS)
+
+
+def load_blokovi(sheet) -> pd.DataFrame:
+    return _load_opcionalno(sheet, BLOKOVI_TAB)
+
+
+def _blok_iz_retka(r) -> dict:
+    return {"blok_id": str(r.get("blok_id", "") or ""), "grupa_id": str(r.get("grupa_id", "") or ""),
+            "datum": _datum(r.get("datum")), "blok": int(u_broj(r.get("blok")) or 1),
+            "vrijeme": lijepo_vrijeme(r.get("vrijeme")),
+            "predmet": str(r.get("predmet", "") or "").strip().upper(),
+            "nastavnik": str(r.get("nastavnik", "") or "").strip(),
+            "event_id": str(r.get("event_id", "") or "")}
+
+
+def blokovi_grupe(df_blokovi, grupa_id, datum=None) -> list:
+    """Blokovi jedne grupe, sortirani po datumu pa rednom broju bloka (datum = samo taj dan)."""
+    if df_blokovi is None or getattr(df_blokovi, "empty", True) or "grupa_id" not in df_blokovi.columns:
+        return []
+    d = _datum(datum) if datum else None
+    out = [_blok_iz_retka(r) for _, r in df_blokovi.iterrows()
+           if str(r.get("grupa_id", "")) == str(grupa_id)]
+    if d:
+        out = [b for b in out if b["datum"] == d]
+    # grupa je treći kriterij: kad profesor drži isti blok u dvije učionice (nedjeljni PRELOG,
+    # velika + mala paralelno), redoslijed ne smije ovisiti o poretku redaka u Sheetu.
+    out.sort(key=lambda b: (b["datum"] or date.min, b["blok"], b["grupa_id"]))
+    return out
+
+
+def blokovi_nastavnika(df_blokovi, nastavnik: str, datum=None) -> list:
+    """Blokovi koje drži zadani profesor — za '⭐ Moje grupe' i karticu 🏠 Danas."""
+    if df_blokovi is None or getattr(df_blokovi, "empty", True) or "nastavnik" not in df_blokovi.columns:
+        return []
+    d = _datum(datum) if datum else None
+    out = [_blok_iz_retka(r) for _, r in df_blokovi.iterrows()
+           if str(r.get("nastavnik", "") or "").strip() == str(nastavnik).strip() and str(nastavnik).strip()]
+    if d:
+        out = [b for b in out if b["datum"] == d]
+    # grupa je treći kriterij: kad profesor drži isti blok u dvije učionice (nedjeljni PRELOG,
+    # velika + mala paralelno), redoslijed ne smije ovisiti o poretku redaka u Sheetu.
+    out.sort(key=lambda b: (b["datum"] or date.min, b["blok"], b["grupa_id"]))
+    return out
+
+
+def grupe_nastavnika_s_blokom(df_blokovi, nastavnik: str, datum=None) -> set:
+    """grupa_id-evi u kojima profesor drži barem jedan blok (širi filter '⭐ Moje grupe':
+    grupa je 'moja' ako sam redovni nastavnik ILI držim blok u njoj)."""
+    return {b["grupa_id"] for b in blokovi_nastavnika(df_blokovi, nastavnik, datum)}
+
+
+def stanje_kvota(df_blokovi, grupa_id, program) -> dict:
+    """{predmet: {'kvota', 'rasporedjeno', 'preuzeto', 'ostalo'}} — koliko je blokova po predmetu
+    planirano (rasporedjeno) i koliko ih ima profesora (preuzeto). Predmet izvan kvote se također
+    prikaže (kvota 0), da se greška u planiranju vidi, a ne sakrije."""
+    kvote = kvote_programa(program)
+    blokovi = blokovi_grupe(df_blokovi, grupa_id)
+    out = {}
+    for predmet in list(kvote) + [b["predmet"] for b in blokovi if b["predmet"] and b["predmet"] not in kvote]:
+        if predmet in out:
+            continue
+        svoji = [b for b in blokovi if b["predmet"] == predmet]
+        out[predmet] = {"kvota": int(kvote.get(predmet, 0)), "rasporedjeno": len(svoji),
+                        "preuzeto": sum(1 for b in svoji if b["nastavnik"]),
+                        "ostalo": int(kvote.get(predmet, 0)) - len(svoji)}
+    return out
+
+
+def slobodni_blokovi(df_blokovi, predmeti=None, od_datuma=None) -> list:
+    """Blokovi koje je admin OTVORIO (imaju predmet) ali još nemaju profesora — to profesor vidi
+    u portalu i preuzima. `predmeti` filtrira po predmetima profesora (prazno/None = vidi sve,
+    isto pravilo kao `predmeti_nastavnika`). `od_datuma` izbacuje prošle datume."""
+    if df_blokovi is None or getattr(df_blokovi, "empty", True) or "predmet" not in df_blokovi.columns:
+        return []
+    dopusteni = {str(x).strip().upper() for x in (predmeti or []) if str(x).strip()}
+    od = _datum(od_datuma) if od_datuma else None
+    out = []
+    for _, r in df_blokovi.iterrows():
+        b = _blok_iz_retka(r)
+        if b["nastavnik"] or not b["predmet"] or not b["datum"]:
+            continue
+        if od and b["datum"] < od:
+            continue
+        if dopusteni and b["predmet"] not in dopusteni:
+            continue
+        out.append(b)
+    out.sort(key=lambda b: (b["datum"], b["blok"], b["grupa_id"]))
+    return out
+
+
+# ============================================================
+# 📅 PLAN ZA GOOGLE KALENDAR (18.10.2026.) — jedan zapis po ZAUZETOJ UČIONICI i terminu
+# CRM izračuna plan OVDJE i zapiše ga u tab Kalendar_plan; Apps Script ga samo prepiše u kalendar
+# "Administracija CAKI centar". Tako se logika razdoblja/praznika/blokova ne duplicira u .gs,
+# a Caki u Sheetu vidi što ide u kalendar prije nego ode (v. brief §11).
+# Imena učenika se NIKAD ne upisuju (odluka O6).
+# ============================================================
+KALENDAR_PLAN_TAB = "Kalendar_plan"
+KALENDAR_PLAN_HEADERS = ["kljuc", "datum", "vrijeme", "ucionica", "naslov", "opis", "event_id",
+                         "azurirano"]
+PLAN_TJEDANA = 8          # koliko tjedana unaprijed plan pokriva kad granice nisu zadane
+
+
+def _tjedni_datumi(od, do, dan_indeks: int) -> list:
+    """Datumi između `od` i `do` (uključivo) koji padaju na taj dan tjedna (0 = ponedjeljak)."""
+    if not od or not do or do < od:
+        return []
+    out, d = [], od + timedelta(days=(dan_indeks - od.weekday()) % 7)
+    while d <= do:
+        out.append(d)
+        d += timedelta(days=7)
+    return out
+
+
+def plan_kalendara(df_grupe, df_raspored_matura=None, df_blokovi=None, df_instrukcije=None,
+                   razdoblja=None, praznici=None, od=None, do=None, df_najam=None,
+                   otkazani=None) -> list:
+    """[{kljuc, datum, vrijeme, ucionica, naslov, opis}] — što treba stajati u kalendaru centra.
+
+    Jedan zapis = jedna ZAUZETA UČIONICA u jednom terminu (Cakijev zahtjev 18.10.2026.: 3 zapisa
+    u terminu znače da su sve učionice pune, 2 da je jedna slobodna za instrukcije). Kod
+    višepredmetnih termina (PRELOG) ide jedan zapis PO BLOKU, pa se iz kalendara vidi i koji je
+    predmet kada.
+
+    `kljuc` je stabilan (izvor|id|datum|blok) — Apps Script po njemu zna koji event pripada kojem
+    zapisu, pa ponovni push ažurira isti event i ne stvara duplikate."""
+    praznici = praznici or {}
+    od = _datum(od) or sada_zagreb().date()
+    do = _datum(do) or (od + timedelta(days=7 * PLAN_TJEDANA))
+    out = []
+    for b in blokovi_zauzetosti(df_grupe, df_raspored_matura, razdoblja, praznici, df_najam):
+        if not b["ucionica"] or b["dan"] not in DANI_U_TJEDNU:
+            continue                      # online termin ne zauzima prostoriju
+        # datumi_termina_grupe izbacuje praznike I otkazane datume (otkazani s nadoknadom
+        # produže seriju za tjedan, oni bez nadoknade samo otpadnu) — v. odluka 18.10.2026.
+        for d in datumi_termina_grupe(b, praznici, otkazani, od, do):
+            if d < od or d > do:
+                continue
+            if b["izvor"] == "NAJAM":
+                out.append({"kljuc": f"NAJAM|{b['id']}|{d.isoformat()}|0", "datum": d,
+                            "vrijeme": b["vrijeme"], "ucionica": b["ucionica"],
+                            "naslov": f"Najam — {b['profesor'] or 'suradnik'} — uč. {b['ucionica']}",
+                            "opis": ""})
+                continue
+            blokovi_dana = [x for x in blokovi_grupe(df_blokovi, b["id"], d) if x["predmet"]] \
+                if b["izvor"] == "UPISI" else []
+            if blokovi_dana:
+                for bl in blokovi_dana:
+                    out.append({"kljuc": f"{b['izvor']}|{b['id']}|{d.isoformat()}|{bl['blok']}",
+                                "datum": d, "vrijeme": bl["vrijeme"], "ucionica": b["ucionica"],
+                                "naslov": f"{b['oznaka']} {bl['predmet']} — uč. {b['ucionica']}",
+                                "opis": bl["nastavnik"]})
+            else:
+                out.append({"kljuc": f"{b['izvor']}|{b['id']}|{d.isoformat()}|0",
+                            "datum": d, "vrijeme": b["vrijeme"], "ucionica": b["ucionica"],
+                            "naslov": f"{b['oznaka']} — uč. {b['ucionica']}",
+                            "opis": b["profesor"]})
+    # Instrukcije zauzimaju učionicu, ali tab ne zna KOJU (brief O12). Online se preskaču jer ne
+    # zauzimaju prostoriju; otkazani termini također.
+    if df_instrukcije is not None and not getattr(df_instrukcije, "empty", True) \
+            and "datum" in getattr(df_instrukcije, "columns", []):
+        for _, r in df_instrukcije.iterrows():
+            d = _datum(r.get("datum"))
+            if not d or d < od or d > do:
+                continue
+            if str(r.get("status_termina", "") or "").startswith("Otkazan"):
+                continue
+            if str(r.get("oblik", "") or "").strip().lower() == "online":
+                continue
+            prof = str(r.get("nastavnik", "") or "").strip()
+            out.append({"kljuc": f"INSTR|{str(r.get('termin_id', '') or '').strip()}|{d.isoformat()}|0",
+                        "datum": d, "vrijeme": lijepo_vrijeme(r.get("vrijeme")), "ucionica": "",
+                        "naslov": f"Instrukcije — {prof or 'CAKI centar'}", "opis": ""})
+    out.sort(key=lambda x: (x["datum"], x["vrijeme"], x["ucionica"], x["kljuc"]))
+    return out
+
+
+def spremi_plan_kalendara(sheet, plan: list) -> dict:
+    """Prepiše tab Kalendar_plan. `event_id` postojećih ključeva se ČUVA, da Apps Script ažurira
+    isti event umjesto da napravi novi. Vraća {dodano, zadrzano, maknuto}."""
+    _osiguraj_tab_stupce(sheet, KALENDAR_PLAN_TAB, KALENDAR_PLAN_HEADERS)
+    ws = sheet.worksheet(KALENDAR_PLAN_TAB)
+    stari = {}
+    for _, r in _load_worksheet_df(ws).iterrows():
+        k = str(r.get("kljuc", "") or "").strip()
+        if k:
+            stari[k] = str(r.get("event_id", "") or "")
+    sada = sada_zagreb().strftime("%Y-%m-%d %H:%M")
+    retci = [[z["kljuc"], z["datum"].isoformat(), z["vrijeme"], z["ucionica"], z["naslov"],
+              z["opis"], stari.get(z["kljuc"], ""), sada] for z in plan]
+    broj_starih = len(ws.col_values(1))
+    vrijednosti = [KALENDAR_PLAN_HEADERS] + retci \
+        + [[""] * len(KALENDAR_PLAN_HEADERS)] * max(0, broj_starih - len(retci) - 1)
+    if getattr(ws, "row_count", len(vrijednosti)) < len(vrijednosti):
+        ws.add_rows(len(vrijednosti) - ws.row_count + 50)
+    ws.update(range_name="A1", values=vrijednosti, value_input_option="RAW")
+    novi = {z["kljuc"] for z in plan}
+    return {"dodano": len(novi - set(stari)), "zadrzano": len(novi & set(stari)),
+            "maknuto": len(set(stari) - novi)}
+
+
+# ============================================================
+# 🚫 OTKAZIVANJE TERMINA PO DATUMU · 🔑 NAJAM PROSTORA (18.10.2026.)
+#
+# OTKAZIVANJE: grupni termin se ponavlja tjedno i nema svoj redak po datumu, pa otkazani datum
+# živi u tabu Otkazani_termini. `nadoknadi = Da` se ponaša kao praznik — serija se produži za
+# tjedan, da broj odrađenih termina ostane isti; `Ne` znači da termin jednostavno otpada.
+# Otkazani datum izlazi iz plana za kalendar, pa push obriše event i učionica se oslobodi.
+# Smiju otkazati: admin, profesor koji drži termin, i najmoprimac svoj termin (odluka 18.10.).
+#
+# NAJAM: Slađana i budući suradnici na modelu najma NISU profesori u ovom sustavu — nemaju
+# učenike u CRM-u i ne vide ih. Upisuju samo svoj termin (datum, vrijeme, učionica) da se vidi
+# zauzetost prostora i da Caki ima broj odrađenih termina; iznos naknade (npr. 15 % prometa)
+# Caki računa SAM, sustav ga ne izračunava jer ne poznaje njihove klijente.
+# Zato tab Najam_termini nema ni jedan stupac o učeniku.
+# ============================================================
+OTKAZANI_TAB = "Otkazani_termini"
+OTKAZANI_HEADERS = ["kljuc", "datum", "razlog", "nadoknadi", "otkazao", "kada"]
+NAJAM_TAB = "Najam_termini"
+NAJAM_HEADERS = ["najam_id", "profesor", "datum", "vrijeme", "ucionica", "status", "napomena",
+                 "event_id", "azurirano"]
+NAJAM_ODRZAN, NAJAM_OTKAZAN = "Održan", "Otkazan"
+# Model suradnje (stupac u Profesori_profil): određuje što suradnik vidi u portalu.
+MODEL_UGOVOR = "student/ugovor"          # sadašnji sustav (dodjele, instrukcije, honorari)
+MODEL_NAJAM_POSTOTAK = "najam-postotak"  # plaća postotak prometa (Slađana)
+MODEL_NAJAM_FIKSNO = "najam-fiksno"      # plaća fiksnu najamninu (obrtnici)
+MODELI_SURADNJE = [MODEL_UGOVOR, MODEL_NAJAM_POSTOTAK, MODEL_NAJAM_FIKSNO]
+# Tab s profilima profesora (vodi ga profesori.py u adminu); ovdje je naziv da ga mogu
+# čitati i portal za profesore i booking, koji taj modul ne uvoze.
+PROFILI_PROFESORA_TAB = "Profesori_profil"
+
+
+def postavi_tab_otkazanih(sheet) -> bool:
+    """⚙️ Jednokratno (sigurno je ponoviti)."""
+    return _osiguraj_tab_stupce(sheet, OTKAZANI_TAB, OTKAZANI_HEADERS)
+
+
+def load_otkazane(sheet) -> pd.DataFrame:
+    return _load_opcionalno(sheet, OTKAZANI_TAB)
+
+
+def otkazani_po_kljucu(df_otkazani) -> dict:
+    """{(kljuc, datum): {"razlog", "nadoknadi", "otkazao"}} — kljuc je grupa_id grupnog termina."""
+    out = {}
+    if df_otkazani is None or getattr(df_otkazani, "empty", True) or "kljuc" not in df_otkazani.columns:
+        return out
+    for _, r in df_otkazani.iterrows():
+        k, d = str(r.get("kljuc", "") or "").strip(), _datum(r.get("datum"))
+        if not k or not d:
+            continue
+        out[(k, d)] = {"razlog": str(r.get("razlog", "") or ""),
+                       "nadoknadi": str(r.get("nadoknadi", "") or "").strip().lower() in ("da", "true", "1"),
+                       "otkazao": str(r.get("otkazao", "") or "")}
+    return out
+
+
+def otkazi_termin(sheet, kljuc: str, datum, razlog: str = "", nadoknadi: bool = False,
+                  otkazao: str = "") -> None:
+    """Otkaže JEDAN datum termina. Ponovno otkazivanje istog datuma samo osvježi zapis."""
+    d = _datum(datum)
+    if not d:
+        raise ValueError("Otkazivanje treba datum.")
+    kljuc = str(kljuc or "").strip()
+    if not kljuc:
+        raise ValueError("Otkazivanje treba termin (ključ).")
+    postavi_tab_otkazanih(sheet)
+    ws = sheet.worksheet(OTKAZANI_TAB)
+    headers = ws.row_values(1)
+    polja = {"kljuc": kljuc, "datum": d.isoformat(), "razlog": str(razlog or "")[:300],
+             "nadoknadi": "Da" if nadoknadi else "Ne", "otkazao": str(otkazao or ""),
+             "kada": sada_zagreb().strftime("%Y-%m-%d %H:%M")}
+    df = _load_worksheet_df(ws)
+    for _, r in df.iterrows():
+        if str(r.get("kljuc", "")).strip() == kljuc and _datum(r.get("datum")) == d:
+            _azuriraj_polja(ws, int(r["_row"]), polja, headers)
+            return
+    _dodaj_red_po_nazivu(ws, polja, headers)
+
+
+def vrati_otkazani(sheet, kljuc: str, datum) -> None:
+    """Poništi otkazivanje (termin se ponovno održava)."""
+    d = _datum(datum)
+    ws = sheet.worksheet(OTKAZANI_TAB)
+    df = _load_worksheet_df(ws)
+    for _, r in df.iterrows():
+        if str(r.get("kljuc", "")).strip() == str(kljuc).strip() and _datum(r.get("datum")) == d:
+            ws.delete_rows(int(r["_row"]))
+            return
+    raise ValueError("Taj datum nije otkazan.")
+
+
+def datumi_termina_grupe(blok: dict, praznici=None, otkazani=None, od=None, do=None) -> list:
+    """Datumi na koje se termin STVARNO održava: iz razdoblja, bez praznika i bez otkazanih.
+    Otkazani s nadoknadom se ponašaju kao praznik (serija se produži za tjedan), oni bez
+    nadoknade samo otpadnu."""
+    praznici = dict(praznici or {})
+    moji = {d: v for (k, d), v in (otkazani or {}).items() if k == str(blok.get("id", ""))}
+    s_nadoknadom = {d: "otkazano (nadoknada)" for d, v in moji.items() if v.get("nadoknadi")}
+    dan = str(blok.get("dan", "") or "")
+    if dan not in DANI_U_TJEDNU:
+        return []
+    broj = u_broj(blok.get("broj_termina")) or 0
+    if broj and blok.get("datum_od"):
+        # {**a, **b} a ne dict(a, **b): ključevi su datumi, ne stringovi.
+        datumi, _presk = datumi_termina(blok["datum_od"], dan, int(broj),
+                                        {**praznici, **s_nadoknadom})
+    else:
+        pocetak = _datum(blok.get("datum_od")) or _datum(od) or sada_zagreb().date()
+        kraj = _datum(blok.get("datum_do")) or _datum(do) or (pocetak + timedelta(days=7 * PLAN_TJEDANA))
+        datumi = [x for x in _tjedni_datumi(pocetak, kraj, DANI_U_TJEDNU.index(dan))
+                  if x not in praznici and x not in s_nadoknadom]
+    return [x for x in datumi if x not in moji]
+
+
+# ---------------------------------------------------------------- 🔑 najam prostora
+
+def postavi_tab_najma(sheet) -> bool:
+    """⚙️ Jednokratno (sigurno je ponoviti)."""
+    return _osiguraj_tab_stupce(sheet, NAJAM_TAB, NAJAM_HEADERS)
+
+
+def load_najam(sheet) -> pd.DataFrame:
+    return _load_opcionalno(sheet, NAJAM_TAB)
+
+
+def _najam_iz_retka(r) -> dict:
+    return {"najam_id": str(r.get("najam_id", "") or ""), "profesor": str(r.get("profesor", "") or "").strip(),
+            "datum": _datum(r.get("datum")), "vrijeme": lijepo_vrijeme(r.get("vrijeme")),
+            "ucionica": oznaka_ucionice(r.get("ucionica")),
+            "status": str(r.get("status", "") or NAJAM_ODRZAN).strip(),
+            "napomena": str(r.get("napomena", "") or ""), "event_id": str(r.get("event_id", "") or "")}
+
+
+def najam_termini(df_najam, profesor: str = "", od=None, do=None, samo_odrzani: bool = True) -> list:
+    """Termini najma, sortirani po datumu i vremenu. `samo_odrzani` izbacuje otkazane."""
+    if df_najam is None or getattr(df_najam, "empty", True) or "najam_id" not in df_najam.columns:
+        return []
+    od, do = (_datum(od) if od else None), (_datum(do) if do else None)
+    out = []
+    for _, r in df_najam.iterrows():
+        n = _najam_iz_retka(r)
+        if not n["datum"] or not n["najam_id"]:
+            continue
+        if profesor and n["profesor"] != str(profesor).strip():
+            continue
+        if samo_odrzani and n["status"] == NAJAM_OTKAZAN:
+            continue
+        if (od and n["datum"] < od) or (do and n["datum"] > do):
+            continue
+        out.append(n)
+    out.sort(key=lambda n: (n["datum"], n["vrijeme"], n["ucionica"]))
+    return out
+
+
+def blok_iz_najma(n: dict) -> dict:
+    """Termin najma kao blok zauzetosti — isti oblik kao grupe/Matura, pa provjera preklapanja,
+    tjedni pregled i plan rade bez ikakve nove logike. Razdoblje je samo taj jedan datum."""
+    return {"izvor": "NAJAM", "id": n["najam_id"],
+            "dan": DANI_U_TJEDNU[n["datum"].weekday()] if n["datum"] else "",
+            "vrijeme": lijepo_vrijeme(n["vrijeme"]), "minute": vrijeme_u_minute(n["vrijeme"]),
+            "ucionica": n["ucionica"], "kapacitet": kapacitet_ucionice_centra(n["ucionica"]),
+            "oznaka": "NAJAM", "profesor": n["profesor"],
+            "datum_od": n["datum"], "datum_do": n["datum"], "broj_termina": 1, "broj_ucenika": None}
+
+
+def upisi_najam(sheet, profesor: str, datum, vrijeme: str, ucionica: str, napomena: str = "") -> str:
+    """Novi termin najma. Vrati najam_id. Provjeru zauzetosti radi pozivatelj (UI), jer treba
+    svježi popis svih blokova zauzetosti."""
+    d = _datum(datum)
+    if not d:
+        raise ValueError("Termin najma treba datum.")
+    if not str(profesor or "").strip():
+        raise ValueError("Termin najma treba suradnika.")
+    if not je_ispravno_vrijeme(vrijeme):
+        raise ValueError("Upiši vrijeme s početkom i krajem, npr. 17:00-18:30.")
+    uc = oznaka_ucionice(ucionica)
+    if not uc:
+        raise ValueError("Odaberi učionicu (A, B ili C).")
+    postavi_tab_najma(sheet)
+    ws = sheet.worksheet(NAJAM_TAB)
+    najam_id = _id("NJ-")
+    _dodaj_red_po_nazivu(ws, {
+        "najam_id": najam_id, "profesor": str(profesor).strip(), "datum": d.isoformat(),
+        "vrijeme": lijepo_vrijeme(vrijeme), "ucionica": opcija_ucionice_upisi(uc),
+        "status": NAJAM_ODRZAN, "napomena": str(napomena or "")[:300], "event_id": "",
+        "azurirano": sada_zagreb().strftime("%Y-%m-%d %H:%M")}, ws.row_values(1))
+    return najam_id
+
+
+def otkazi_najam(sheet, najam_id: str, profesor: str = "") -> None:
+    """Otkaže termin najma (status Otkazan) — učionica se oslobodi, event izlazi iz kalendara.
+    `profesor` = smije otkazati samo svoj termin."""
+    ws = sheet.worksheet(NAJAM_TAB)
+    df = _load_worksheet_df(ws)
+    red = df[df["najam_id"].astype(str) == str(najam_id)] if "najam_id" in df.columns else df.iloc[0:0]
+    if red.empty:
+        raise ValueError("Termin najma nije pronađen — osvježi stranicu.")
+    if profesor and str(red.iloc[0].get("profesor", "")).strip() != str(profesor).strip():
+        raise ValueError("Možete otkazati samo svoj termin.")
+    _azuriraj_polja(ws, int(red.iloc[0]["_row"]),
+                    {"status": NAJAM_OTKAZAN, "azurirano": sada_zagreb().strftime("%Y-%m-%d %H:%M")},
+                    ws.row_values(1))
+
+
+def najam_sazetak(df_najam, godina: int, mjesec: int) -> list:
+    """[{profesor, termina, sati}] za mjesec — podloga za Cakijev izračun naknade.
+    Novčani iznos se NE računa: sustav ne poznaje klijente najmoprimaca (odluka 18.10.2026.)."""
+    po_profesoru = {}
+    for n in najam_termini(df_najam):
+        if not n["datum"] or n["datum"].year != int(godina) or n["datum"].month != int(mjesec):
+            continue
+        m = vrijeme_u_minute(n["vrijeme"])
+        x = po_profesoru.setdefault(n["profesor"], {"profesor": n["profesor"], "termina": 0, "minuta": 0})
+        x["termina"] += 1
+        x["minuta"] += (m[1] - m[0]) if m else 0
+    out = [{"profesor": v["profesor"], "termina": v["termina"], "sati": round(v["minuta"] / 60, 2)}
+           for v in po_profesoru.values()]
+    out.sort(key=lambda v: v["profesor"])
+    return out
+
+
+def model_suradnje(df_profili, ime: str) -> str:
+    """Model suradnje iz Profesori_profil.model_suradnje; prazno/nepoznato = sadašnji sustav."""
+    if df_profili is None or getattr(df_profili, "empty", True) or "ime" not in df_profili.columns:
+        return MODEL_UGOVOR
+    red = df_profili[df_profili["ime"].astype(str).str.strip() == str(ime).strip()]
+    if red.empty or "model_suradnje" not in df_profili.columns:
+        return MODEL_UGOVOR
+    v = str(red.iloc[0].get("model_suradnje", "") or "").strip().lower()
+    return v if v in MODELI_SURADNJE else MODEL_UGOVOR
+
+
+def je_najmoprimac(df_profili, ime: str) -> bool:
+    """True = suradnik na modelu najma (ne vidi učenike ni financije, samo svoje termine)."""
+    return model_suradnje(df_profili, ime) in (MODEL_NAJAM_POSTOTAK, MODEL_NAJAM_FIKSNO)
+
+
+def _red_bloka(ws, blok_id: str) -> int:
+    """Broj retka bloka (čita se svježe — ne oslanja se na stari _row)."""
+    ids = [str(v).strip() for v in ws.col_values(1)]
+    if str(blok_id) not in ids[1:]:
+        raise ValueError(f"Blok {blok_id} nije pronađen (možda je u međuvremenu obrisan).")
+    return ids.index(str(blok_id)) + 1
+
+
+def upisi_blok(sheet, grupa_id: str, datum, blok: int, vrijeme: str, predmet: str,
+               nastavnik: str = "") -> str:
+    """Upiše ili ažurira JEDAN blok. Ključ je (grupa_id, datum, redni broj bloka) — ponovni upis
+    istog ključa mijenja postojeći redak, ne stvara duplikat. Vrati blok_id."""
+    d = _datum(datum)
+    if not d:
+        raise ValueError("Blok mora imati datum.")
+    blok = int(u_broj(blok) or 1)
+    if blok < 1:
+        raise ValueError("Redni broj bloka počinje od 1.")
+    predmet = str(predmet or "").strip().upper()
+    postavi_tab_blokova(sheet)
+    ws = sheet.worksheet(BLOKOVI_TAB)
+    headers = ws.row_values(1)
+    df = _load_worksheet_df(ws)
+    postojeci = [b for b in blokovi_grupe(df, grupa_id, d) if b["blok"] == blok]
+    polja = {"grupa_id": str(grupa_id), "datum": d.isoformat(), "blok": blok,
+             "vrijeme": lijepo_vrijeme(vrijeme), "predmet": predmet, "nastavnik": str(nastavnik or "").strip(),
+             "azurirano": sada_zagreb().strftime("%Y-%m-%d %H:%M")}
+    if postojeci:
+        blok_id = postojeci[0]["blok_id"]
+        _azuriraj_polja(ws, _red_bloka(ws, blok_id), polja, headers)
+        return blok_id
+    blok_id = _id("BL-")
+    _dodaj_red_po_nazivu(ws, {"blok_id": blok_id, "event_id": "", **polja}, headers)
+    return blok_id
+
+
+def preuzmi_blok(sheet, blok_id: str, nastavnik: str) -> None:
+    """Profesor preuzima blok (upisuje se kao njegov nositelj). Zauzet blok se ne preotima."""
+    nastavnik = str(nastavnik or "").strip()
+    if not nastavnik:
+        raise ValueError("Nije poznato koji profesor preuzima blok.")
+    ws = sheet.worksheet(BLOKOVI_TAB)
+    df = _load_worksheet_df(ws)
+    red = df[df["blok_id"].astype(str) == str(blok_id)] if "blok_id" in df.columns else df.iloc[0:0]
+    if red.empty:
+        raise ValueError("Blok nije pronađen — osvježi stranicu.")
+    r = _blok_iz_retka(red.iloc[0])
+    if r["nastavnik"] and r["nastavnik"] != nastavnik:
+        raise ValueError(f"Taj blok već drži {r['nastavnik']} — javite se adminu.")
+    if not r["predmet"]:
+        raise ValueError("Blok još nema upisan predmet — admin ga mora prvo otvoriti.")
+    _azuriraj_polja(ws, _red_bloka(ws, blok_id),
+                    {"nastavnik": nastavnik, "azurirano": sada_zagreb().strftime("%Y-%m-%d %H:%M")},
+                    ws.row_values(1))
+
+
+def otpusti_blok(sheet, blok_id: str, nastavnik: str = "") -> None:
+    """Profesor se odjavljuje s bloka (ili admin ga prazni). nastavnik = smije samo svoj blok."""
+    ws = sheet.worksheet(BLOKOVI_TAB)
+    df = _load_worksheet_df(ws)
+    red = df[df["blok_id"].astype(str) == str(blok_id)] if "blok_id" in df.columns else df.iloc[0:0]
+    if red.empty:
+        raise ValueError("Blok nije pronađen — osvježi stranicu.")
+    if nastavnik and _blok_iz_retka(red.iloc[0])["nastavnik"] != str(nastavnik).strip():
+        raise ValueError("Možete otpustiti samo svoj blok.")
+    _azuriraj_polja(ws, _red_bloka(ws, blok_id),
+                    {"nastavnik": "", "azurirano": sada_zagreb().strftime("%Y-%m-%d %H:%M")},
+                    ws.row_values(1))
+
+
+def obrisi_blok(sheet, blok_id: str) -> None:
+    ws = sheet.worksheet(BLOKOVI_TAB)
+    ws.delete_rows(_red_bloka(ws, blok_id))
+
+
+def upisi_event_id_bloka(sheet, blok_id: str, event_id: str) -> None:
+    """Zapamti ID eventa koji je push napravio u Google kalendaru (da update/delete pogodi taj event,
+    a ne da nastaju duplikati). Koristi ga Apps Script push — v. brief §7.5."""
+    ws = sheet.worksheet(BLOKOVI_TAB)
+    _azuriraj_polja(ws, _red_bloka(ws, blok_id), {"event_id": str(event_id or "")}, ws.row_values(1))
 
 
 # --- uređivanje / brisanje grupa Upisa ---
