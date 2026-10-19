@@ -43,8 +43,10 @@ from pipeline_upisi import (
     u_datum,
     ucitaj_praznike,
     ucitaj_razdoblja,
+    sada_zagreb,
 )
 from sat_biljeska import za_roditelja as sat_za_roditelja  # 17.10.2026.: teme i zadaca po satu
+import testovi_online as online_testovi  # 19.10.2026.: online testovi (objavljeni iz Test Buildera)
 from obavijesti import (  # 15.10.2026.: kartica 📣 Obavijesti (poruke od Cakija, linkovi, komentari)
     MAX_KOMENTAR,
     OD_OPCIJE,
@@ -126,6 +128,18 @@ def _ucitaj_linkove():
 @st.cache_data(ttl=30)
 def _ucitaj_komentare():
     return load_komentare(_init_sheet())
+
+
+# 19.10.2026.: online testovi — tabovi Testovi_zakazani / Rezultati_testova u CRM Sheetu.
+# Kratki TTL jer učitelj može objaviti test usred dana; rezultati moraju biti svježi odmah.
+@st.cache_data(ttl=60)
+def _ucitaj_online_testove():
+    return online_testovi.load_testovi(_init_sheet())
+
+
+@st.cache_data(ttl=30)
+def _ucitaj_online_rezultate():
+    return online_testovi.load_rezultati(_init_sheet())
 
 
 def _md_sigurno(tekst: str) -> str:
@@ -328,12 +342,30 @@ def prikazi_portal():
     df_grupe = _ucitaj("Grupe")
     df_rez = _ucitaj_rezervacije()
     df_racuni = _ucitaj_racune()
-    komponente = komponente_za_odabir(_ucitaj("Prijave"), ucenik_id)
+    df_prijave = _ucitaj("Prijave")
+    komponente = komponente_za_odabir(df_prijave, ucenik_id)
     bez_termina = treba_odabrati_termin(komponente, df_grupe, df_rez, ucenik_id)
     raspored = portal_raspored_grupa(df_rez, df_grupe, ucenik_id)
     raspored_matura = portal_raspored_matura(_ucitaj(naziv_taba_rasporeda_mature()), ucenik_id)   # 26.9.2026.
     tablica_dol, postotci = portal_dolasci(_ucitaj("Dolasci"), _ucitaj("Termini"), df_grupe, ucenik_id)
     dokumenti, dug = portal_naplata(df_racuni, ucenik_id)
+
+    # --- Online testovi (19.10.2026.): kratice iz Test Buildera; ako tabovi ne postoje, portal radi kao prije ---
+    try:
+        df_online_testovi = _ucitaj_online_testove()
+        df_online_rezultati = _ucitaj_online_rezultate()
+        programi_ucenika = set(
+            df_prijave.loc[df_prijave["ucenik_id"] == ucenik_id, "program_tip"].astype(str)
+        ) if not df_prijave.empty and "program_tip" in df_prijave.columns else set()
+        online_dostupni = online_testovi.testovi_za_ucenika(
+            df_online_testovi, df_online_rezultati, ucenik_id, programi_ucenika, sada_zagreb().date())
+        online_greska = ""
+    except Exception:
+        df_online_testovi, df_online_rezultati = [], []
+        programi_ucenika, online_dostupni = set(), []
+        online_greska = "Online testovi trenutno nisu dostupni — pokušajte malo kasnije."
+    za_rjesavanje = len([t for t in online_dostupni if not t["rjeseno"]])
+    moji_online_rezultati = online_testovi.rezultati_ucenika(df_online_rezultati, ucenik_id)
 
     # --- Obavijesti (15.10.2026.): ako tabovi ne postoje / Google zapne, ostatak portala radi dalje ---
     try:
@@ -359,13 +391,28 @@ def prikazi_portal():
         st.warning("📅 **Odaberite termin nastave** — kartica *Odabir termina* ispod.")
 
     naziv_obav = f"📣 Obavijesti ({len(obavijesti)})" if obavijesti else "📣 Obavijesti"
-    nazivi = [naziv_obav, "🗓️ Raspored", "✅ Dolasci", "💶 Plaćanja", "📊 Rezultati"]
-    if komponente:
-        nazivi.insert(1 if bez_termina else len(nazivi), "📅 Odabir termina")
+    naziv_testovi = f"📝 Testovi ({za_rjesavanje})" if za_rjesavanje else "📝 Testovi"
+    nazivi = [naziv_obav]
+    if komponente and bez_termina:
+        nazivi.append("📅 Odabir termina")
+    if online_dostupni or moji_online_rezultati:
+        nazivi.append(naziv_testovi)
+    nazivi += ["🗓️ Raspored", "✅ Dolasci", "💶 Plaćanja", "📊 Rezultati"]
+    if komponente and not bez_termina:
+        nazivi.append("📅 Odabir termina")
     kartice = dict(zip(nazivi, st.tabs(nazivi)))
 
     with kartice[naziv_obav]:
         _prikazi_obavijesti(sheet, ucenik, ucenik_id, obavijesti, linkovi, df_komentari, obav_greska)
+
+    if naziv_testovi in kartice:
+        with kartice[naziv_testovi]:
+            if online_greska:
+                st.info(online_greska)
+            else:
+                online_testovi.prikazi_testove(
+                    st, sheet, df_online_testovi, df_online_rezultati, ucenik, ucenik_id,
+                    programi_ucenika, sada_zagreb())
 
     if "📅 Odabir termina" in kartice:
         with kartice["📅 Odabir termina"]:
@@ -441,6 +488,13 @@ def prikazi_portal():
             st.dataframe(rezultati, hide_index=True, width="stretch",
                          column_config={"Postotak": st.column_config.ProgressColumn(min_value=0, max_value=100,
                                                                                    format="%d %%")})
+        # 19.10.2026.: online testovi (odvojen tab Rezultati_testova) — isti popis kao u kartici 📝 Testovi
+        if moji_online_rezultati:
+            st.markdown("#### 📝 Online testovi")
+            st.dataframe(online_testovi.tabela_rezultata(moji_online_rezultati), hide_index=True,
+                         width="stretch",
+                         column_config={"Postotak": st.column_config.ProgressColumn(
+                             min_value=0, max_value=100, format="%d %%")})
 
     st.divider()
     st.caption(f"Pitanja? {KONTAKT}")
