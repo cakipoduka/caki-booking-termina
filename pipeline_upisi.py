@@ -3446,8 +3446,10 @@ def vanjski_profesor(red) -> str:
 
 
 def je_ceka_poziv(red) -> bool:
-    """Redak koji stvarno čeka poziv (vanjski predmeti se ne broje — njih ne zovemo radi ponude)."""
-    return str(red.get("status_kontakta", "")).strip() == "Čeka poziv" and not vanjski_profesor(red)
+    """Redak koji stvarno čeka poziv (vanjski predmeti se ne broje — njih ne zovemo radi ponude).
+    20.10.2026.: ni Instrukcije — njih profesori preuzimaju u 📥 Upiti za instrukcije."""
+    return (str(red.get("status_kontakta", "")).strip() == "Čeka poziv" and not vanjski_profesor(red)
+            and str(red.get("program_tip", "") or "").strip() != "Instrukcije")
 
 
 def dokumenti_po_retku(df_racuni: pd.DataFrame) -> dict:
@@ -5022,7 +5024,11 @@ KORACI_UCENIKA = ["Prijava", "Potvrdio", "Nacrt", "Solo", "Mail", "Plaćeno"]
 
 
 def korak_predmeta(red, dok_po_retku: dict):
-    """0..5 (indeks u KORACI_UCENIKA) ili None ako se predmet ne prati na traci."""
+    """0..5 (indeks u KORACI_UCENIKA) ili None ako se predmet ne prati na traci.
+    20.10.2026.: Instrukcije se NIKAD ne prate na traci (nemaju ponudu iz prijave — naplata ide po
+    održanim terminima), pa ni dok im je status „Čeka poziv”."""
+    if str(red.get("program_tip", "") or "").strip() == "Instrukcije":
+        return None
     s = stanje_predmeta(red, dok_po_retku)
     kod = s["kod"]
     if kod in ("neaktivan", "vanjski", "instrukcije"):
@@ -5653,3 +5659,170 @@ def postavi_honorar_termina(sheet, termin_id: str, iznos):
         raise ValueError("Termin nije pronađen.")
     _azuriraj_polja(ws, int(red.iloc[0]["_row"]),
                     {"honorar_termina": "" if iznos in (None, "") else float(iznos)}, headers)
+
+
+# ============================================================
+# ➕ RUČNI UNOS UČENIKA (20.10.2026., Cakijev zahtjev)
+# Za jednog učenika/studenta kojeg nema u uvozu ni na formi (npr. starija generacija) — bez
+# otvaranja cijele baze. Piše u Učenici i, ako je zadan predmet, JEDAN redak u Prijave.
+# ============================================================
+
+RUCNI_IZVOR = "Ručni unos"
+
+
+def _tel_kljuc(v) -> str:
+    """Mobitel za usporedbu: samo znamenke, bez +385/00385 i vodeće nule ('091 2' == '+38591 2')."""
+    d = re.sub(r"\D", "", str(v or ""))
+    if d.startswith("00385"):
+        d = d[5:]
+    elif d.startswith("385") and len(d) >= 11:
+        d = d[3:]
+    d = d.lstrip("0")
+    return d if len(d) >= 8 else ""
+
+
+def _mail_kljuc(v) -> str:
+    m = str(v or "").strip().lower()
+    return m if "@" in m[1:] else ""
+
+
+def kljucevi_kontakta(*vrijednosti) -> set:
+    """Skup kontaktnih ključeva (telefoni + mailovi) za prepoznavanje iste osobe."""
+    out = set()
+    for v in vrijednosti:
+        t = _tel_kljuc(v)
+        if t:
+            out.add("t" + t)
+        m = _mail_kljuc(v)
+        if m:
+            out.add("m" + m)
+    return out
+
+
+def _ime_kljuc(t) -> str:
+    t = re.sub(r"\s+", " ", str(t or "")).strip().lower()
+    for a, b in (("č", "c"), ("ć", "c"), ("š", "s"), ("ž", "z"), ("đ", "d")):
+        t = t.replace(a, b)
+    return t
+
+
+def generiraj_ucenik_id(ime_djeteta: str, postojeci) -> str:
+    """Šifra kao na formama: 2 slova inicijala + 4 znamenke (npr. RV1234), bez ponavljanja."""
+    d = [x for x in re.split(r"\s+", str(ime_djeteta or "").strip()) if x]
+    inicijali = ""
+    for x in (d[0] if d else "X", d[1] if len(d) > 1 else "X"):
+        slovo = _ime_kljuc(x[:1]).upper()
+        inicijali += slovo if slovo.isalpha() and slovo.isascii() else "X"
+    zauzeto = {str(x).strip().upper() for x in (list(postojeci) if postojeci is not None else [])}
+    for _ in range(300):
+        novi = inicijali + str(random.randint(1000, 9999))
+        if novi not in zauzeto:
+            return novi
+    raise ValueError("Ne mogu generirati slobodnu šifru učenika — javi se Claudeu.")
+
+
+def nadji_ucenika_po_kontaktu(df_ucenici: pd.DataFrame, ime_djeteta: str, kontakti: set) -> dict:
+    """{'tocno': šifra ili '', 'moguce': šifra ili '', 'moguce_ime': ...}
+    tocno = isto ime djeteta I zajednički kontakt · moguce = samo zajednički kontakt (brat/sestra?)."""
+    prazno = {"tocno": "", "moguce": "", "moguce_ime": ""}
+    if df_ucenici is None or df_ucenici.empty or "ucenik_id" not in df_ucenici.columns:
+        return prazno
+    ime = _ime_kljuc(ime_djeteta)
+    moguce = prazno.copy()
+    for _, r in df_ucenici.iterrows():
+        red_kont = kljucevi_kontakta(r.get("mobitel_djeteta"), r.get("mobitel_roditelja"),
+                                     r.get("email_djeteta"), r.get("email_roditelja"))
+        if not (red_kont & kontakti):
+            continue
+        if _ime_kljuc(r.get("ime_djeteta")) == ime:
+            return {"tocno": str(r["ucenik_id"]), "moguce": "", "moguce_ime": ""}
+        if not moguce["moguce"]:
+            moguce = {"tocno": "", "moguce": str(r["ucenik_id"]), "moguce_ime": str(r.get("ime_djeteta", ""))}
+    return moguce
+
+
+def dodaj_ucenika_rucno(sheet, ime_djeteta: str, mobitel_djeteta: str = "", email_djeteta: str = "",
+                        ime_roditelja: str = "", mobitel_roditelja: str = "", email_roditelja: str = "",
+                        skola: str = "", predmet: str = "", stupanj_skolovanja: str = "",
+                        oblik_instrukcija: str = "", napomena: str = "", program_tip: str = "Instrukcije",
+                        status_kontakta: str = "Čeka poziv") -> dict:
+    """Ručno dodan učenik → Učenici (+ jedan redak u Prijave ako je zadan predmet).
+    Vraća {'ucenik_id', 'novi', 'redak_id', 'moguci_duplikat'}. Isti učenik (ime + kontakt) se NE
+    duplicira — dopune mu se samo prazni kontakti i doda prijava."""
+    ime_djeteta = re.sub(r"\s+", " ", str(ime_djeteta or "")).strip()
+    if len(ime_djeteta.split()) < 2:
+        raise ValueError("Upiši ime I prezime djeteta/studenta (ime ide na ponudu i u mail).")
+    kontakti = kljucevi_kontakta(mobitel_djeteta, mobitel_roditelja, email_djeteta, email_roditelja)
+    if not kontakti:
+        raise ValueError("Upiši barem jedan kontakt — mobitel ili e-mail (njegov ili roditeljev).")
+    if program_tip == "Instrukcije" and predmet and not stupanj_skolovanja:
+        raise ValueError("Za predmet odaberi i stupanj školovanja (OŠ / SŠ / Fakultet).")
+
+    ws = sheet.worksheet("Učenici")
+    headers = [str(x).strip() for x in ws.row_values(1)]
+    df = _load_worksheet_df(ws)
+    nadeno = nadji_ucenika_po_kontaktu(df, ime_djeteta, kontakti)
+    polja = {"ime_djeteta": ime_djeteta, "mobitel_djeteta": mobitel_djeteta, "email_djeteta": email_djeteta,
+             "ime_roditelja": ime_roditelja, "mobitel_roditelja": mobitel_roditelja,
+             "email_roditelja": email_roditelja, "skola": skola}
+    sada = sada_zagreb()
+
+    if nadeno["tocno"]:
+        uid, novi = nadeno["tocno"], False
+        red = df[df["ucenik_id"].astype(str) == uid].iloc[0]
+        dopune = {k: v for k, v in polja.items()
+                  if v and k in headers and not str(red.get(k, "") or "").strip()}
+        if dopune:
+            _azuriraj_polja(ws, int(red["_row"]), dopune, headers)
+    else:
+        uid, novi = generiraj_ucenik_id(ime_djeteta, df["ucenik_id"] if "ucenik_id" in df.columns else []), True
+        red_novi = {k: v for k, v in polja.items() if v}
+        red_novi.update({"ucenik_id": uid, "datum_prvog_upisa": sada.strftime("%Y-%m-%d %H:%M:%S"),
+                         "moguci_duplikat_id": nadeno["moguce"], "izvor": RUCNI_IZVOR})
+        if stupanj_skolovanja:
+            red_novi["stupanj_procjena"] = STUPANJ_KRATICE.get(stupanj_skolovanja, stupanj_skolovanja)
+        _dodaj_red_po_nazivu(ws, red_novi, headers)
+
+    redak_id = ""
+    if predmet:
+        ws_p = sheet.worksheet("Prijave")
+        h_p = [str(x).strip() for x in ws_p.row_values(1)]
+        redak_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+        _dodaj_red_po_nazivu(ws_p, {
+            "redak_id": redak_id, "ucenik_id": uid, "ime_djeteta": ime_djeteta, "program_tip": program_tip,
+            "predmet": predmet, "stupanj_skolovanja": stupanj_skolovanja, "oblik_instrukcija": oblik_instrukcija,
+            "status_kontakta": status_kontakta, "napomena": str(napomena or "")[:1000],
+            "timestamp_prijave": sada.strftime("%Y-%m-%d %H:%M:%S"), "sezona": SEZONA,
+        }, h_p)
+    return {"ucenik_id": uid, "novi": novi, "redak_id": redak_id, "moguci_duplikat": nadeno["moguce"],
+            "moguci_duplikat_ime": nadeno["moguce_ime"]}
+
+
+def ucenici_programa(df_prijave: pd.DataFrame) -> set:
+    """Šifre učenika koji su na TEKUĆIM programima (Upisi / Matura) — oni koji idu kroz traku
+    Prijava → … → Plaćeno. Instrukcije nisu tu: one se vode po održanim terminima
+    (📝 Instrukcije, 📥 Upiti, 👩‍🏫 Dodjele), pa ne zatrpavaju karticu Učenici (20.10.2026.)."""
+    if df_prijave is None or df_prijave.empty or "ucenik_id" not in df_prijave.columns:
+        return set()
+    out = set()
+    for _, r in df_prijave.iterrows():
+        if str(r.get("program_tip", "") or "").strip() == "Instrukcije":
+            continue
+        if str(r.get("status_kontakta", "") or "").strip() in STATUSI_NEAKTIVNI:
+            continue
+        out.add(str(r.get("ucenik_id", "")))
+    return out
+def ucenici_samo_instrukcije(df_prijave: pd.DataFrame) -> set:
+    """Šifre učenika koji imaju prijave, ali SVE su Instrukcije (nijedan tekući program Upisi/Matura).
+    Oni se vode po održanim terminima (📝 Instrukcije · 📥 Upiti · 👩‍🏫 Dodjele), pa ne stoje u popisu
+    kartice Učenici ni na traci Prijava → … → Plaćeno (20.10.2026.). Učenik BEZ ijedne prijave se tu
+    NE računa — takav ostaje vidljiv (da se nikad ne izgubi iz popisa zbog nepotpunih podataka)."""
+    if df_prijave is None or df_prijave.empty or "ucenik_id" not in df_prijave.columns:
+        return set()
+    instr, programi = set(), set()
+    for _, r in df_prijave.iterrows():
+        uid = str(r.get("ucenik_id", ""))
+        if not uid or str(r.get("status_kontakta", "") or "").strip() in STATUSI_NEAKTIVNI:
+            continue
+        (instr if str(r.get("program_tip", "") or "").strip() == "Instrukcije" else programi).add(uid)
+    return instr - programi
