@@ -42,6 +42,11 @@ from pipeline_upisi import (
     kljuc_predmeta_mature,
     matura_bez_termina,
     tekst_bez_termina,
+    RAZREDI,
+    RAZRED_MATURA,
+    postavi_razred,
+    razred_sada,
+    skole_iz_baze,
     u_datum,
     ucitaj_praznike,
     ucitaj_razdoblja,
@@ -399,7 +404,7 @@ def prikazi_portal():
         nazivi.append("📅 Odabir termina")
     if online_dostupni or moji_online_rezultati:
         nazivi.append(naziv_testovi)
-    nazivi += ["🗓️ Raspored", "✅ Dolasci", "💶 Plaćanja", "📊 Rezultati"]
+    nazivi += ["🗓️ Raspored", "✅ Dolasci", "💶 Plaćanja", "📊 Rezultati", "🙋 Moji podaci"]
     if komponente and not bez_termina:
         nazivi.append("📅 Odabir termina")
     kartice = dict(zip(nazivi, st.tabs(nazivi)))
@@ -488,6 +493,39 @@ def prikazi_portal():
                 "Iznos (€)": st.column_config.NumberColumn(format="%.2f"),
                 "Dokument": st.column_config.LinkColumn(display_text="PDF"),
             })
+
+    with kartice["🙋 Moji podaci"]:
+        # 21.10.2026. (Cakijev zahtjev): učenik/roditelj sam dopuni školu, razred i fakultet.
+        # Mijenjaju se SAMO ta četiri polja — ime, kontakti i programi ostaju na adminu.
+        st.caption("Dopunite podatke o školi i razredu. Ostale podatke (ime, kontakt, programe) "
+                   "mijenja CAKI centar — za ispravak nam javite.")
+        skole_p = skole_iz_baze(_ucitaj("Učenici"))
+        skola_p = str(ucenik.get("skola", "") or "").strip()
+        opcije_p = ["— nije upisano —"] + sorted(set(skole_p) | ({skola_p} if skola_p else set())) \
+            + ["➕ Druga škola (upišite)"]
+        with st.form("moji_podaci"):
+            izbor_p = st.selectbox("Škola koju pohađam", opcije_p,
+                                   index=opcije_p.index(skola_p) if skola_p in opcije_p else 0)
+            druga_p = st.text_input("Ako škole nema na popisu, upišite je ovdje", "")
+            razred_p_sad = razred_sada(ucenik)
+            razred_p = st.selectbox("Razred (ove školske godine)", RAZREDI,
+                                    index=RAZREDI.index(razred_p_sad) if razred_p_sad in RAZREDI else 0,
+                                    format_func=lambda r: r or "— nije upisano —")
+            fak_p = st.text_input("Fakultet (ako ste student)", str(ucenik.get("fakultet", "") or ""))
+            stud_p = st.text_input("Što studirate", str(ucenik.get("studij", "") or ""))
+            if st.form_submit_button("💾 Spremi moje podatke", type="primary"):
+                nova_skola = druga_p.strip() or ("" if izbor_p.startswith(("—", "➕")) else izbor_p)
+                try:
+                    postavi_razred(sheet, ucenik_id, razred_p, skola=nova_skola,
+                                   fakultet=fak_p.strip(), studij=stud_p.strip())
+                    _poruka("success", "Hvala — podaci su spremljeni.")
+                except ValueError as e_p:
+                    _poruka("error", str(e_p))
+                st.cache_data.clear()
+                st.rerun()
+        if razred_sada(ucenik) == RAZRED_MATURA:
+            st.info("🎓 Ove godine ste u 4. razredu — javite nam se za pripreme za Maturu ili za "
+                    "ispite na fakultetu.")
 
     with kartice["📊 Rezultati"]:
         rezultati = portal_rezultati(_ucitaj("Rezultati"), ucenik_id)

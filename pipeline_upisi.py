@@ -246,7 +246,7 @@ def kljuc_prijave(red) -> str:
     """Što se NE smije ponoviti kod istog učenika u istoj sezoni: isti Matura predmet (s razinom)
     ili ista komponenta Upisa. 21.10.2026. — dvoklik na „➕ Dodaj predmet” je upisivao dva reda,
     pa se učenik pojavljivao dvaput u slaganju rasporeda i dvaput na ponudi."""
-    g = lambda k: str(red.get(k, "") or "").strip()      # noqa: E731
+    g = lambda k: _cisto(red.get(k, "")).strip()      # noqa: E731  (_cisto: NaN iz pandasa -> "")
     program = g("program_tip") or ("Upisi" if g("komponenta") else "")
     if program == "Matura":
         return "MATURA|" + g("predmet").lower() + "|" + g("razina_ispita").upper()
@@ -807,6 +807,219 @@ def osiguraj_stupac_skola(sheet):
         ws.update_cell(1, len(headers) + 1, "skola")
 
 
+# ============================================================
+# 🎒 ŽIVOTNI CIKLUS UČENIKA — škola · razred · fakultet (21.10.2026., Cakijev zahtjev)
+# Razred se NE prepisuje masovno svake godine. Upisuje se razred I školska godina u kojoj je
+# taj razred bio (`razred`, `razred_sezona`), a `razred_sada()` doda +1 za svaku proteklu
+# sezonu. Tako je prijelaz u novu školsku godinu automatski i ne može se dogoditi dvaput.
+# ============================================================
+RAZREDI_NIZ = ["1. OŠ", "2. OŠ", "3. OŠ", "4. OŠ", "5. OŠ", "6. OŠ", "7. OŠ", "8. OŠ",
+               "1. SŠ", "2. SŠ", "3. SŠ", "4. SŠ", "Student"]
+RAZRED_ZAVRSIO = "Završio"
+RAZREDI = [""] + RAZREDI_NIZ + [RAZRED_ZAVRSIO]
+RAZRED_MATURA = "4. SŠ"            # kad učenik dođe ovdje → ponuda priprema za Maturu
+UCENICI_STUPCI_V3 = ["skola", "razred", "razred_sezona", "fakultet", "studij"]
+
+
+def osiguraj_stupce_ucenika(sheet) -> bool:
+    """Dodaje stupce škola/razred/razred_sezona/fakultet/studij na tab Učenici ako ih nema."""
+    return _osiguraj_tab_stupce(sheet, "Učenici", UCENICI_STUPCI_V3)
+
+
+def godina_sezone(sezona: str):
+    """'2026/27' -> 2026. Vraća None ako sezona nije u tom obliku."""
+    t = str(sezona or "").strip()[:4]
+    return int(t) if t.isdigit() else None
+
+
+def broj_sezona(od_sezone: str, do_sezone: str) -> int:
+    """Koliko je školskih godina prošlo (nikad negativno — razred se ne vraća unatrag)."""
+    a, b = godina_sezone(od_sezone), godina_sezone(do_sezone)
+    return max(0, b - a) if a is not None and b is not None else 0
+
+
+def pomakni_razred(razred: str, koraka: int = 1) -> str:
+    """'8. OŠ' +1 = '1. SŠ'; '4. SŠ' +1 = 'Student'. Student i Završio ostaju (studij traje
+    različito, a fakultet se vodi u stupcu `fakultet`). Prazno ostaje prazno."""
+    r = str(razred or "").strip()
+    if not r or r not in RAZREDI_NIZ or koraka <= 0:
+        return r
+    i = min(RAZREDI_NIZ.index(r) + koraka, len(RAZREDI_NIZ) - 1)
+    return RAZREDI_NIZ[i]
+
+
+def razred_sada(red, sezona: str = SEZONA) -> str:
+    """Razred učenika u traženoj (zadano: tekućoj) školskoj godini — automatski +1 po godini."""
+    if red is None:
+        return ""
+    g = (lambda k: _cisto(red.get(k) if hasattr(red, "get") else "").strip())
+    r = g("razred")
+    if not r:
+        return ""
+    return pomakni_razred(r, broj_sezona(g("razred_sezona"), sezona))
+
+
+def opis_razreda(red, sezona: str = SEZONA) -> str:
+    """Kratak tekst za kartice i popise: '4. SŠ · MIOC' ili 'Student · FER (računarstvo)'."""
+    g = (lambda k: _cisto(red.get(k) if hasattr(red, "get") else "").strip())
+    r = razred_sada(red, sezona)
+    if r == "Student":
+        fak = " · ".join(x for x in [g("fakultet"), f"({g('studij')})" if g("studij") else ""] if x)
+        return ("Student" + (" · " + fak if fak else "")).strip(" ·")
+    return " · ".join(x for x in [r, g("skola")] if x)
+
+
+def azuriraj_ucenika_po_id(sheet, ucenik_id: str, polja: dict) -> int:
+    """Kao azuriraj_ucenika, samo po šifri (portal Moj CAKI ne zna broj retka). Vraća broj retka."""
+    ws = sheet.worksheet("Učenici")
+    headers = ws.row_values(1)
+    df = _load_worksheet_df(ws)
+    red = df[df["ucenik_id"].astype(str).str.strip().str.upper() == str(ucenik_id).strip().upper()]
+    if red.empty:
+        raise ValueError("Učenik nije pronađen — osvježi stranicu.")
+    r = int(red.iloc[0]["_row"])
+    _azuriraj_polja(ws, r, {k: v for k, v in polja.items() if k in headers}, headers)
+    return r
+
+
+def postavi_razred(sheet, ucenik_id: str, razred: str, sezona: str = SEZONA, skola=None,
+                   fakultet=None, studij=None) -> int:
+    """Upisuje razred ZA ZADANU školsku godinu (sprema i `razred_sezona`, pa +1 dalje ide sam).
+    skola/fakultet/studij se upisuju samo kad su zadani (None = ne diraj)."""
+    r = str(razred or "").strip()
+    if r and r not in RAZREDI:
+        raise ValueError(f"Nepoznat razred: {razred}")
+    polja = {"razred": r, "razred_sezona": sezona if r else ""}
+    for naziv, v in (("skola", skola), ("fakultet", fakultet), ("studij", studij)):
+        if v is not None:
+            polja[naziv] = str(v).strip()
+    return azuriraj_ucenika_po_id(sheet, ucenik_id, polja)
+
+
+def skole_iz_baze(df_ucenici) -> list:
+    """Sve škole koje su već upisane — za padajući izbornik (uz slobodan upis nove)."""
+    if df_ucenici is None or getattr(df_ucenici, "empty", True) or "skola" not in df_ucenici.columns:
+        return []
+    return sorted({str(v).strip() for v in df_ucenici["skola"] if str(v).strip()
+                   and str(v).strip().lower() != "nan"})
+
+
+def maturanti_bez_mature(df_ucenici, df_prijave, sezona: str = SEZONA) -> list:
+    """Učenici koji su OVE godine u 4. razredu SŠ, a nemaju aktivnu prijavu za Maturu —
+    njima se nudi program priprema (Cakijev zahtjev: 'da znam kad dođe u 4. razred')."""
+    if df_ucenici is None or getattr(df_ucenici, "empty", True):
+        return []
+    s_matura = set()
+    if df_prijave is not None and not getattr(df_prijave, "empty", True)             and "program_tip" in df_prijave.columns:
+        for _, p_ in df_prijave.iterrows():
+            if str(p_.get("program_tip", "") or "").strip() != "Matura":
+                continue
+            if str(p_.get("status_kontakta", "") or "").strip() in STATUSI_NEAKTIVNI:
+                continue
+            sez = str(p_.get("sezona", "") or "").strip()
+            if sezona and sez and sez != sezona:
+                continue
+            s_matura.add(str(p_.get("ucenik_id", "")).strip())
+    out = []
+    for _, u in df_ucenici.iterrows():
+        uid = str(u.get("ucenik_id", "")).strip()
+        if not uid or uid in s_matura or razred_sada(u, sezona) != RAZRED_MATURA:
+            continue
+        out.append({"ucenik_id": uid, "ime_djeteta": str(u.get("ime_djeteta", "")),
+                    "skola": str(u.get("skola", "") or ""),
+                    "mobitel_roditelja": str(u.get("mobitel_roditelja", "") or ""),
+                    "mobitel_djeteta": str(u.get("mobitel_djeteta", "") or "")})
+    return sorted(out, key=lambda x: x["ime_djeteta"])
+
+
+def studenti_bez_fakulteta(df_ucenici, sezona: str = SEZONA) -> list:
+    """Postali su studenti, a ne znamo što studiraju — bez toga im ne možemo nuditi podršku
+    za ispite na fakultetu."""
+    if df_ucenici is None or getattr(df_ucenici, "empty", True):
+        return []
+    out = []
+    for _, u in df_ucenici.iterrows():
+        if razred_sada(u, sezona) != "Student":
+            continue
+        if str(u.get("fakultet", "") or "").strip():
+            continue
+        out.append({"ucenik_id": str(u.get("ucenik_id", "")).strip(),
+                    "ime_djeteta": str(u.get("ime_djeteta", ""))})
+    return sorted(out, key=lambda x: x["ime_djeteta"])
+
+
+# ============================================================
+# 🆕 STATUS OBRADE PRIJAVE — sve 4 prijavnice na jednom mjestu (21.10.2026., Cakijev zahtjev)
+# Namjerno NEMA novog stupca: status se izračuna iz onoga što već imamo, pa ne mogu postojati
+# dvije istine o istoj prijavi.
+#   Nova       = čeka poziv i nitko još nije zapisao bilješku (nitko nije zvao)
+#   U obradi   = čeka poziv, ali postoji bilješka (zvali smo, čekamo odgovor)
+#   Potvrđena  = učenik je potvrdio program
+#   Odbijena   = otkazano / odustao
+# ============================================================
+OBRADA_NOVA, OBRADA_U_OBRADI, OBRADA_POTVRDENA, OBRADA_ODBIJENA = (
+    "🆕 Nova", "📞 U obradi", "✅ Potvrđena", "🚫 Odbijena")
+OBRADA_REDOM = [OBRADA_NOVA, OBRADA_U_OBRADI, OBRADA_POTVRDENA, OBRADA_ODBIJENA]
+PRIJAVNICE = {"Upisi": "📘 Upisi u SŠ", "Matura": "🎓 Matura",
+              "Instrukcije": "📝 Instrukcije (škola)", "Instrukcije-FAX": "🎓 Instrukcije (fakultet)"}
+
+
+def prijavnica_prijave(red) -> str:
+    """Iz koje je prijavnice redak došao — 4 prijavnice (upisi · matura · instrukcije škola ·
+    instrukcije fakultet). Instrukcije se razlikuju po stupnju školovanja."""
+    g = (lambda k: _cisto(red.get(k) if hasattr(red, "get") else "").strip())
+    program = g("program_tip") or ("Upisi" if g("komponenta") else "")
+    if program == "Instrukcije" and g("stupanj_skolovanja").lower().startswith("fakult"):
+        return PRIJAVNICE["Instrukcije-FAX"]
+    return PRIJAVNICE.get(program, program or "—")
+
+
+def status_obrade_prijave(red, ima_biljesku: bool = False) -> str:
+    """Nova / U obradi / Potvrđena / Odbijena — v. komentar iznad."""
+    st_ = _cisto(red.get("status_kontakta") if hasattr(red, "get") else "").strip()
+    if st_ in STATUSI_NEAKTIVNI:
+        return OBRADA_ODBIJENA
+    if st_ == "Potvrdio":
+        return OBRADA_POTVRDENA
+    return OBRADA_U_OBRADI if ima_biljesku else OBRADA_NOVA
+
+
+def pregled_obrade_prijava(df_prijave, df_biljeske=None, sezona: str = SEZONA,
+                           max_dana: int | None = 30) -> dict:
+    """{broj: {status: n}, po_prijavnici: {prijavnica: n_novih}, nove: [{...}]} za 🏠 Danas.
+    `max_dana` izbacuje stare prijave (uvoz, prošle godine) iz popisa NOVIH — isto pravilo kao
+    📥 Upiti za instrukcije (UPIT_MAX_DANA), da stare prijave ne zatrpaju popis."""
+    prazno = {"broj": {k: 0 for k in OBRADA_REDOM}, "po_prijavnici": {}, "nove": []}
+    if df_prijave is None or getattr(df_prijave, "empty", True):
+        return prazno
+    s_biljeske = set()
+    if df_biljeske is not None and not getattr(df_biljeske, "empty", True) \
+            and "ucenik_id" in df_biljeske.columns:
+        s_biljeske = {str(v).strip() for v in df_biljeske["ucenik_id"] if str(v).strip()}
+    danas = sada_zagreb().date()
+    out = {"broj": {k: 0 for k in OBRADA_REDOM}, "po_prijavnici": {}, "nove": []}
+    for _, r in df_prijave.iterrows():
+        sez = str(r.get("sezona", "") or "").strip()
+        if sezona and sez and sez != sezona:
+            continue
+        uid = str(r.get("ucenik_id", "")).strip()
+        status = status_obrade_prijave(r, uid in s_biljeske)
+        out["broj"][status] = out["broj"].get(status, 0) + 1
+        if status != OBRADA_NOVA:
+            continue
+        d = _datum(prikazi_datum(r.get("timestamp_prijave")))
+        if max_dana is not None and (d is None or (danas - d).days > max_dana):
+            continue
+        prij = prijavnica_prijave(r)
+        out["po_prijavnici"][prij] = out["po_prijavnici"].get(prij, 0) + 1
+        out["nove"].append({"redak_id": str(r.get("redak_id", "")), "ucenik_id": uid,
+                            "ime_djeteta": str(r.get("ime_djeteta", "")), "prijavnica": prij,
+                            "predmet": str(r.get("predmet", "") or r.get("komponenta", "") or ""),
+                            "datum": d})
+    out["nove"].sort(key=lambda x: (x["datum"] or date.min), reverse=True)
+    return out
+
+
 def poveci_kao_obitelj(sheet, ucenik_id_1: str, ucenik_id_2: str):
     """Povezuje dva zapisa kao braću/sestre (dvosmjerno), bez spajanja u jedan zapis.
     Zahtijeva stupac 'povezani_ucenici' na Učenici tabu (gumb 'Dodaj povezani_ucenici stupac')."""
@@ -970,6 +1183,91 @@ def azuriraj_instrukciju(sheet, row_number: int, polja: dict):
         if naziv_polja in headers:
             col = headers.index(naziv_polja) + 1
             ws.update_cell(row_number, col, vrijednost)
+
+
+OZNAKA_GOTOVINA_ZA_POTVRDU = "treba potvrda admina"
+
+
+def gotovina_za_potvrdu(df_instrukcije) -> list:
+    """21.10.2026.: termini na kojima je profesor BEZ ovlaštenja javio da je plaćeno gotovinom.
+    Sat se vodi kao neplaćen dok admin ne potvrdi uplatu — ovo je taj popis (korak 1️⃣ Financija).
+    [{_row, termin_id, datum, ime_djeteta, nastavnik, predmet, duljina_min}]"""
+    if df_instrukcije is None or getattr(df_instrukcije, "empty", True) \
+            or "napomena_interna" not in df_instrukcije.columns:
+        return []
+    out = []
+    for _, r in df_instrukcije.iterrows():
+        if OZNAKA_GOTOVINA_ZA_POTVRDU not in _cisto(r.get("napomena_interna")):
+            continue
+        if _cisto(r.get("uplata_potvrdjena_admin")).strip() == "Da":
+            continue
+        if _cisto(r.get("placeno_oznaka_prof")).strip() == PLACENO_GOTOVINOM:
+            continue
+        out.append({"_row": int(r["_row"]) if "_row" in r else 0,
+                    "termin_id": _cisto(r.get("termin_id")),
+                    "datum": prikazi_datum(r.get("datum"))[:10],
+                    "ime_djeteta": _cisto(r.get("ime_djeteta")),
+                    "nastavnik": _cisto(r.get("nastavnik")),
+                    "predmet": _cisto(r.get("predmet")),
+                    "duljina_min": _cisto(r.get("duljina_min"))})
+    return sorted(out, key=lambda x: x["datum"], reverse=True)
+
+
+def potvrdi_gotovinu(sheet, row_number: int, termin_id: str = "") -> None:
+    """Admin je primio gotovinu koju je profesor javio → termin se zatvara kao plaćen gotovinom."""
+    azuriraj_instrukciju(sheet, row_number, {
+        "placeno_oznaka_prof": PLACENO_GOTOVINOM, "uplata_potvrdjena_admin": "Da",
+        "status_obracuna": "Naplaćeno gotovinom"})
+
+
+def instrukcije_za_obracun(df_instrukcije) -> dict:
+    """Koliko termina čeka obračun, po načinu naplate (Jednokratno / Mjesečno / Paket).
+    Mjesečne obračunava Apps Script 1. u mjesecu, jednokratne admin sam."""
+    if df_instrukcije is None or getattr(df_instrukcije, "empty", True) \
+            or "status_obracuna" not in df_instrukcije.columns:
+        return {}
+    out = {}
+    for _, r in df_instrukcije.iterrows():
+        if _cisto(r.get("status_obracuna")).strip() not in STATUSI_ZA_OBRACUN:
+            continue
+        if _cisto(r.get("status_termina")).strip() in STATUSI_BEZ_NAPLATE:
+            continue
+        nacin = _cisto(r.get("nacin_naplate")).strip() or "Jednokratno"
+        out[nacin] = out.get(nacin, 0) + 1
+    return out
+
+
+def potvrdeni_bez_ponude(df_prijave, df_racuni, sezona: str = SEZONA) -> list:
+    """Programi koje je učenik POTVRDIO, a nijedna ponuda/račun ih ne pokriva (korak 1️⃣):
+    [{ucenik_id, ime_djeteta, program_tip, predmet}]. Instrukcije se ne broje (naplata po satu)."""
+    if df_prijave is None or getattr(df_prijave, "empty", True):
+        return []
+    pokriveno = set()
+    if df_racuni is not None and not getattr(df_racuni, "empty", True) \
+            and "izvorni_redci" in df_racuni.columns:
+        for _, d in df_racuni.iterrows():
+            if _cisto(d.get("status")).strip() in ("Otkazano", "Obrisano"):
+                continue
+            for sif in sifre_izvora(_cisto(d.get("izvorni_redci"))):
+                pokriveno.add(sif)
+    out = []
+    for _, r in df_prijave.iterrows():
+        if _cisto(r.get("status_kontakta")).strip() != "Potvrdio":
+            continue
+        program = _cisto(r.get("program_tip")).strip() or ("Upisi" if _cisto(r.get("komponenta")) else "")
+        if program == "Instrukcije":
+            continue
+        sez = _cisto(r.get("sezona")).strip()
+        if sezona and sez and sez != sezona:
+            continue
+        rid = _cisto(r.get("redak_id")).strip()
+        if not rid or f"P:{rid}" in pokriveno:
+            continue
+        out.append({"ucenik_id": _cisto(r.get("ucenik_id")).strip(),
+                    "ime_djeteta": _cisto(r.get("ime_djeteta")),
+                    "program_tip": program or "—",
+                    "predmet": _cisto(r.get("predmet")) or _cisto(r.get("komponenta"))})
+    return sorted(out, key=lambda x: x["ime_djeteta"])
 
 
 def obrisi_instrukciju(sheet, row_number: int):
@@ -2846,6 +3144,46 @@ def predmeti_nastavnika(df_nastavnici: pd.DataFrame, ime: str) -> list:
     if red.empty:
         return []
     return [p.strip().upper() for p in re.split(r"[,;]", str(red.iloc[0]["predmeti"] or "")) if p.strip()]
+
+
+# 21.10.2026. (Cakijev zahtjev): profesor smije predavati više PROGRAMA, a ne samo predmeta.
+# Stupac Nastavnici.programi (npr. "Matura, Instrukcije"). PRAZNO = radi sve, kao dosad —
+# zato se ništa ne mijenja dok Caki ne popuni stupac.
+PROGRAMI_NASTAVNIKA = ["Matura", "Instrukcije", "Upisi"]
+
+
+def programi_nastavnika(df_nastavnici: pd.DataFrame, ime: str) -> list:
+    """Programi koje profesor predaje. Prazna lista = sve (ne filtriramo)."""
+    if df_nastavnici is None or getattr(df_nastavnici, "empty", True) \
+            or "programi" not in df_nastavnici.columns:
+        return []
+    red = df_nastavnici[df_nastavnici["ime"] == ime]
+    if red.empty:
+        return []
+    nadeno = []
+    for dio in re.split(r"[,;]", str(red.iloc[0]["programi"] or "")):
+        d = dio.strip().lower()
+        for p_ in PROGRAMI_NASTAVNIKA:
+            if d and p_.lower().startswith(d[:5]) and p_ not in nadeno:
+                nadeno.append(p_)
+    return nadeno
+
+
+def nastavnik_radi_program(df_nastavnici: pd.DataFrame, ime: str, program: str) -> bool:
+    """True kad profesor radi taj program (ili kad programi nisu upisani — tada vidi sve)."""
+    prog = programi_nastavnika(df_nastavnici, ime)
+    return (not prog) or program in prog
+
+
+def postavi_programe_nastavnika(sheet, row_number: int, programi: list):
+    """Admin: programi koje nastavnik predaje (stupac 'programi' se doda ako ga nema)."""
+    nepoznati = [p_ for p_ in programi if p_ not in PROGRAMI_NASTAVNIKA]
+    if nepoznati:
+        raise ValueError("Nepoznat program: " + ", ".join(nepoznati))
+    _osiguraj_tab_stupce(sheet, "Nastavnici", ["programi"])
+    ws = sheet.worksheet("Nastavnici")
+    headers = ws.row_values(1)
+    ws.update_cell(row_number, headers.index("programi") + 1, ", ".join(programi))
 
 
 def postavi_predmete_nastavnika(sheet, row_number: int, predmeti: list):
