@@ -345,6 +345,33 @@ def dodaj_komponentu(sheet, ucenik_id: str, ime_djeteta: str, komponenta_kod: st
     ])
 
 
+def dodaj_instrukcije_predmet(sheet, ucenik_id: str, ime_djeteta: str, predmet: str,
+                             stupanj_skolovanja: str = "", oblik_instrukcija: str = "", napomena: str = ""):
+    """21.10.2026.: predmet instrukcija postojećem učeniku — isti obrazac kao Matura/Upisi, da se sva
+    tri programa dodaju s jednog mjesta. Učenik SMIJE imati instrukcije uz Maturu ili Upise (maturant
+    koji usred godine traži instrukcije, 8. razred s programa Upisi…), samo ne isti predmet dvaput.
+    Status je "Čeka poziv" → predmet se odmah vidi u 📥 Upiti za instrukcije i može se dodijeliti."""
+    if not str(predmet or "").strip():
+        raise ValueError("Odaberi predmet.")
+    if not str(stupanj_skolovanja or "").strip():
+        raise ValueError("Za instrukcije odaberi i stupanj školovanja (OŠ / SŠ / Fakultet).")
+    ws = sheet.worksheet("Prijave")
+    headers = ws.row_values(1)
+    if prijava_vec_postoji(_load_worksheet_df(ws), ucenik_id,
+                           kljuc_prijave({"program_tip": "Instrukcije", "predmet": predmet})):
+        raise ValueError(f"{ime_djeteta} već ima aktivnu prijavu za instrukcije iz {predmet}. "
+                         "Ako je stara prijava pogrešna, prvo je otkaži.")
+    redak_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    _dodaj_red_po_nazivu(ws, {
+        "redak_id": redak_id, "ucenik_id": str(ucenik_id), "ime_djeteta": str(ime_djeteta),
+        "program_tip": "Instrukcije", "predmet": str(predmet),
+        "stupanj_skolovanja": str(stupanj_skolovanja), "oblik_instrukcija": str(oblik_instrukcija or ""),
+        "status_kontakta": "Čeka poziv", "napomena": str(napomena or "")[:1000],
+        "timestamp_prijave": sada_zagreb().strftime("%Y-%m-%d %H:%M:%S"), "sezona": SEZONA,
+    }, headers)
+    return redak_id
+
+
 def dodaj_maturu_predmet(sheet, ucenik_id: str, ime_djeteta: str, predmet: str,
                           razina_ispita: str = "", nacin_pracenja: str = "", napomena: str = ""):
     """Dodaje jedan Matura predmet postojećem učeniku. Piše po NAZIVU stupca (ne
