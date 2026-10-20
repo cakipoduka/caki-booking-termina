@@ -40,6 +40,8 @@ from pipeline_upisi import (
     portal_rezultati,
     datumi_termina,
     kljuc_predmeta_mature,
+    matura_bez_termina,
+    tekst_bez_termina,
     u_datum,
     ucitaj_praznike,
     ucitaj_razdoblja,
@@ -419,15 +421,22 @@ def prikazi_portal():
             _prikazi_odabir_termina(sheet, ucenik, ucenik_id, komponente, df_grupe, df_rez)
 
     with kartice["🗓️ Raspored"]:
-        if not raspored_matura.empty:
+        razdoblja, praznici = _ucitaj_razdoblja(), _ucitaj_praznike()
+        # 21.10.2026.: predmeti Mature koji su prijavljeni, a termin im još nije određen (npr. HRV i ENG
+        # koji počinju u siječnju) — roditelj mora vidjeti da je prijava zaprimljena.
+        bez_termina_m = matura_bez_termina(_ucitaj("Prijave"), _ucitaj(naziv_taba_rasporeda_mature()), ucenik_id,
+                                           razdoblja=razdoblja)
+        if not raspored_matura.empty or bez_termina_m:
             st.markdown("#### Pripreme za Maturu")
-            razdoblja, praznici = _ucitaj_razdoblja(), _ucitaj_praznike()
+        if not raspored_matura.empty:
             raspored_matura = raspored_matura.copy()
             raspored_matura["Početak"] = [pocetak_predmeta(r["Predmet"], r["Dan"], razdoblja, praznici)
                                           for _, r in raspored_matura.iterrows()]
             st.dataframe(raspored_matura, hide_index=True, width="stretch")
             st.caption("Tjedni raspored po predmetima. U stupcu *Početak* je datum prvog sata za svaki predmet "
                        "(početak nastave razlikuje se po predmetu). Ako piše „Javit ćemo“, datum još nije određen.")
+        if bez_termina_m:
+            st.info(tekst_bez_termina(bez_termina_m))
         if not raspored.empty or raspored_matura.empty:
             st.markdown("#### Grupna nastava")
             if raspored.empty:
