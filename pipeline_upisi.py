@@ -11,6 +11,7 @@ import string
 import time
 import json
 import math
+import unicodedata
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -241,8 +242,92 @@ def oznaci_otkazano(sheet, row_number: int):
 
 # --- Dodavanje nove komponente postojećem učeniku ---
 
+def kljuc_prijave(red) -> str:
+    """Što se NE smije ponoviti kod istog učenika u istoj sezoni: isti Matura predmet (s razinom)
+    ili ista komponenta Upisa. 21.10.2026. — dvoklik na „➕ Dodaj predmet” je upisivao dva reda,
+    pa se učenik pojavljivao dvaput u slaganju rasporeda i dvaput na ponudi."""
+    g = lambda k: str(red.get(k, "") or "").strip()      # noqa: E731
+    program = g("program_tip") or ("Upisi" if g("komponenta") else "")
+    if program == "Matura":
+        return "MATURA|" + g("predmet").lower() + "|" + g("razina_ispita").upper()
+    if program == "Instrukcije":
+        return "INSTRUKCIJE|" + g("predmet").lower()
+    return "UPISI|" + g("komponenta").upper()
+
+
+def prijava_vec_postoji(df_prijave, ucenik_id: str, kljuc: str, sezona: str = SEZONA) -> bool:
+    """True ako učenik u ovoj sezoni već ima AKTIVNU prijavu s istim ključem (otkazane/odustale
+    se ne gledaju — predmet se smije ponovno dodati nakon otkazivanja)."""
+    if df_prijave is None or getattr(df_prijave, "empty", True):
+        return False
+    for _, r in df_prijave.iterrows():
+        if str(r.get("ucenik_id", "")).strip() != str(ucenik_id).strip():
+            continue
+        if str(r.get("status_kontakta", "") or "").strip() in STATUSI_NEAKTIVNI:
+            continue
+        sez = str(r.get("sezona", "") or "").strip()
+        if sezona and sez and sez != sezona:
+            continue
+        if kljuc_prijave(r) == kljuc:
+            return True
+    return False
+
+
+def duple_prijave(df_prijave, ucenik_id: str = "", sezona: str = SEZONA) -> list:
+    """Postojeći duplikati u tabu Prijave: [{ucenik_id, ime_djeteta, kljuc, opis, zadrzi, duplikati}].
+    `zadrzi` = najstariji redak_id (ostaje), `duplikati` = ostali (njih se otkazuje)."""
+    if df_prijave is None or getattr(df_prijave, "empty", True):
+        return []
+    grupe = {}
+    for _, r in df_prijave.iterrows():
+        uid = str(r.get("ucenik_id", "")).strip()
+        if not uid or (ucenik_id and uid != str(ucenik_id).strip()):
+            continue
+        if str(r.get("status_kontakta", "") or "").strip() in STATUSI_NEAKTIVNI:
+            continue
+        sez = str(r.get("sezona", "") or "").strip()
+        if sezona and sez and sez != sezona:
+            continue
+        k = kljuc_prijave(r)
+        if k.endswith("||") or k in ("UPISI|", "MATURA||", "INSTRUKCIJE|"):
+            continue                       # redak bez predmeta/komponente nije duplikat
+        grupe.setdefault((uid, k), []).append(r)
+    out = []
+    for (uid, k), redci in grupe.items():
+        if len(redci) < 2:
+            continue
+        redci = sorted(redci, key=lambda r: str(r.get("timestamp_prijave", "") or ""))
+        prvi = redci[0]
+        out.append({"ucenik_id": uid, "ime_djeteta": str(prvi.get("ime_djeteta", "")), "kljuc": k,
+                    "opis": k.split("|", 1)[1].replace("|", " ").strip() or k,
+                    "zadrzi": str(prvi.get("redak_id", "")),
+                    "duplikati": [str(r.get("redak_id", "")) for r in redci[1:]]})
+    return sorted(out, key=lambda x: (x["ime_djeteta"], x["opis"]))
+
+
+def otkazi_duplu_prijavu(sheet, redak_id: str) -> None:
+    """Duplikat se ne briše (povijest ostaje) nego dobiva status Otkazano + napomenu."""
+    ws = sheet.worksheet("Prijave")
+    headers = ws.row_values(1)
+    df = _load_worksheet_df(ws)
+    red = df[df["redak_id"].astype(str) == str(redak_id)]
+    if red.empty:
+        raise ValueError("Prijava nije pronađena — osvježi stranicu.")
+    r = red.iloc[0]
+    stara = str(r.get("napomena", "") or "")
+    polja = {"status_kontakta": "Otkazano",
+             "napomena": ("🧹 Duplikat (otkazano " + sada_zagreb().strftime("%d.%m.%Y.") + "). "
+                          + stara)[:1000]}
+    _azuriraj_polja(ws, int(r["_row"]), {k: v for k, v in polja.items() if k in headers}, headers)
+
+
 def dodaj_komponentu(sheet, ucenik_id: str, ime_djeteta: str, komponenta_kod: str, nacin_placanja: str, napomena: str = ""):
     ws = sheet.worksheet("Prijave")
+    # 21.10.2026.: isti program dvaput kod istog učenika = greška (dvoklik, dvostruka ponuda)
+    if prijava_vec_postoji(_load_worksheet_df(ws), ucenik_id,
+                           kljuc_prijave({"komponenta": komponenta_kod})):
+        raise ValueError(f"{ime_djeteta} već ima aktivnu prijavu za {KOMPONENTE.get(komponenta_kod, komponenta_kod)}. "
+                         "Ako je stara prijava pogrešna, prvo je otkaži.")
     redak_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
     ws.append_row([
         redak_id,
@@ -267,6 +352,15 @@ def dodaj_maturu_predmet(sheet, ucenik_id: str, ime_djeteta: str, predmet: str,
     isti pristup kao CAKI_matura_onFormSubmit.gs."""
     ws = sheet.worksheet("Prijave")
     headers = ws.row_values(1)
+    # 21.10.2026.: isti predmet (s razinom) dvaput kod istog učenika = greška (dvoklik je upisivao
+    # dva reda → učenik dvaput u slaganju rasporeda i dvaput na ponudi)
+    if prijava_vec_postoji(_load_worksheet_df(ws), ucenik_id,
+                           kljuc_prijave({"program_tip": "Matura", "predmet": predmet,
+                                          "razina_ispita": razina_ispita})):
+        naziv = PREDMETI_MATURA.get(predmet, predmet)
+        raise ValueError(f"{ime_djeteta} već ima aktivnu prijavu za {naziv}"
+                         + (f" ({razina_ispita} razina)" if razina_ispita else "")
+                         + ". Ako je stara prijava pogrešna, prvo je otkaži.")
 
     redak_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
     vrijednosti = {
@@ -910,6 +1004,32 @@ def provjeri_lozinku_instruktora(df_nastavnici: pd.DataFrame, ime: str, lozinka:
         & (df_nastavnici["aktivan"].astype(str).str.lower() == "da")
     ]
     return not red.empty
+
+
+def _kljuc_imena(ime) -> str:
+    """'  Ivan   HORVÁT ' -> 'ivan horvat'. Za uparivanje imena koje profesor sam upiše:
+    mala slova, višak praznina i dijakritika (č ć š ž đ, á é…) se ne gledaju. 'đ' -> 'd'
+    jer ga unicodedata ne rastavlja."""
+    t = " ".join(str(ime or "").split()).lower().replace("đ", "d")
+    return "".join(c for c in unicodedata.normalize("NFKD", t) if not unicodedata.combining(c))
+
+
+def nastavnik_po_prijavi(df_nastavnici: pd.DataFrame, ime: str, lozinka: str) -> str:
+    """21.10.2026. (Cakijev zahtjev): profesor SAM upiše ime i prezime (nema padajuće liste).
+    Vraća ime točno kako stoji u tabu Nastavnici (to je ključ svih ostalih tabova) ili "" ako
+    ime+lozinka ne odgovaraju ili nastavnik nije aktivan. Lozinka se gleda točno — samo se
+    skidaju prazine s krajeva (kopiranje iz poruke)."""
+    if df_nastavnici is None or df_nastavnici.empty or "ime" not in df_nastavnici.columns:
+        return ""
+    kljuc, loz = _kljuc_imena(ime), str(lozinka or "").strip()
+    if not kljuc or not loz:
+        return ""
+    for _, r in df_nastavnici.iterrows():
+        if str(r.get("aktivan", "")).strip().lower() != "da":
+            continue
+        if _kljuc_imena(r.get("ime")) == kljuc and str(r.get("lozinka", "")).strip() == loz:
+            return str(r["ime"])
+    return ""
 
 
 def smije_naplatu_gotovinom(df_nastavnici: pd.DataFrame, ime: str) -> bool:
@@ -5523,9 +5643,14 @@ def obracun_za_status(status_termina: str, gotovina: bool = False, paket_id: str
 
 
 def promijeni_status_termina(sheet, termin_id: str, novi_status: str, biljeska: str | None = None,
-                             nastavnik: str = "") -> str:
+                             nastavnik: str = "", placanje: str | None = None) -> str:
     """Zakazan → Održan / Otkazan… (ili ispravak statusa). Obračunati termin se ne mijenja.
-    Kad termin postaje naplativ, prvo pokuša skinuti s paketa. nastavnik = samo svoj termin."""
+    Kad termin postaje naplativ, prvo pokuša skinuti s paketa. nastavnik = samo svoj termin.
+
+    21.10.2026.: `placanje` = što je profesor označio kad je zakazani termin prebacio u Održan:
+    PLACENO_GOTOVINOM (plaćeno njemu na satu) ili "Ne" (ide na obračun). None = ne mijenja se.
+    Gotovinu smije upisati samo profesor s ovlaštenjem — portal nedopuštenu gotovinu pretvara u
+    "Ne" + internu napomenu za admina, pa se ovdje ne provjerava ponovno."""
     if novi_status not in STATUSI_TERMINA:
         raise ValueError("Nepoznat status termina.")
     ws = sheet.worksheet("Instrukcije_termini")
@@ -5542,7 +5667,9 @@ def promijeni_status_termina(sheet, termin_id: str, novi_status: str, biljeska: 
     if novi_status not in ("Zakazan", "Otkazan na vrijeme") and (_datum(r["datum"]) or date.max) > sada_zagreb().date():
         raise ValueError("Termin je u budućnosti — može biti samo Zakazan ili Otkazan na vrijeme.")
     polja = {"status_termina": novi_status}
-    gotovina = str(r.get("placeno_oznaka_prof", "")) == PLACENO_GOTOVINOM
+    if placanje is not None and "placeno_oznaka_prof" in headers:
+        polja["placeno_oznaka_prof"] = PLACENO_GOTOVINOM if str(placanje) == PLACENO_GOTOVINOM else "Ne"
+    gotovina = str(polja.get("placeno_oznaka_prof", r.get("placeno_oznaka_prof", ""))) == PLACENO_GOTOVINOM
     paket_id = ""
     if novi_status not in STATUSI_BEZ_NAPLATE and not gotovina:
         paket_id = str(r.get("paket_id", "") or "")
