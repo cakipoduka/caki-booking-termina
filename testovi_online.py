@@ -148,9 +148,17 @@ def testovi_za_ucenika(testovi, rezultati, ucenik_id: str, programi=(), danas=No
         cilj = _tekst(t.get("ucenik_id")).upper()
         if cilj and cilj != ucenik_id:
             continue
-        program = _tekst(t.get("program"))
-        if program and program not in programi:
-            continue
+        if not cilj:
+            # 21.10.2026. (nalaz): program se provjerava SAMO za opcu objavu (bez ucenik_id-a,
+            # npr. "svi na Maturi"). Test ciljan na KONKRETNOG ucenika (objavi_test/
+            # objavi_za_ucenike s ucenik_id-om) prikazuje se njemu uvijek, bez obzira ima li
+            # redak u Prijave s odgovarajucim program_tip-om -- inace test ciljan na ucenika
+            # koji nema (ili jos nema) redak u Prijave (npr. samostalni Instrukcije klijent
+            # bez popunjene forme) nikad ne bi bio vidljiv, iako ga je Caki eksplicitno njemu
+            # poslao. V. TRACKER.md 21.10.2026.
+            program = _tekst(t.get("program"))
+            if program and program not in programi:
+                continue
         od, do = _danas(t.get("otvara_od")), _danas(t.get("zatvara_do"))
         if od and danas < od:
             continue
