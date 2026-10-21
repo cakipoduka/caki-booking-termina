@@ -3175,6 +3175,28 @@ def nastavnik_radi_program(df_nastavnici: pd.DataFrame, ime: str, program: str) 
     return (not prog) or program in prog
 
 
+ULOGA_ADMIN = "Admin"          # Nastavnici.uloga — Caki i Neira
+
+
+def je_admin_nastavnik(df_nastavnici: pd.DataFrame, ime: str) -> bool:
+    """21.10.2026.: admin (Caki, Neira) u profesorskom portalu vidi pune podatke o upitu
+    (ime i prezime učenika), jer ionako sve vidi u admin sučelju. Ostali profesori ne —
+    ime i kontakt obitelji dobivaju tek kad im admin dodijeli učenika (odluka 2.10.2026.)."""
+    if df_nastavnici is None or getattr(df_nastavnici, "empty", True) \
+            or "uloga" not in df_nastavnici.columns:
+        return False
+    red = df_nastavnici[df_nastavnici["ime"] == ime]
+    return not red.empty and _cisto(red.iloc[0]["uloga"]).strip().lower() == ULOGA_ADMIN.lower()
+
+
+def postavi_ulogu_nastavnika(sheet, row_number: int, je_admin: bool):
+    """Admin: označi da je nastavnik ujedno i admin (vidi pune podatke u portalu)."""
+    _osiguraj_tab_stupce(sheet, "Nastavnici", ["uloga"])
+    ws = sheet.worksheet("Nastavnici")
+    headers = ws.row_values(1)
+    ws.update_cell(row_number, headers.index("uloga") + 1, ULOGA_ADMIN if je_admin else "")
+
+
 def postavi_programe_nastavnika(sheet, row_number: int, programi: list):
     """Admin: programi koje nastavnik predaje (stupac 'programi' se doda ako ga nema)."""
     nepoznati = [p_ for p_ in programi if p_ not in PROGRAMI_NASTAVNIKA]
