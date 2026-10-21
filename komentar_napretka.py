@@ -957,6 +957,72 @@ def razdoblje_od_zadnje(df, ucenik_id, danas=None, zadano_dana: int = 30) -> tup
     return od, danas
 
 
+# --- ritam osvrta: koga podsjetiti na 🏠 Danas ------------------------------------------------
+
+RAZMAK_OSVRTA_DANA = 28      # jedan osvrt po učeniku mjesečno (Cakijeva odluka 21.10.2026.)
+PRVI_OSVRT_DANA = 14         # novi učenik: ne javljati se roditelju prije 14 dana od prvog sata
+
+
+def _kao_popis(ucenici) -> list:
+    """Popis dictova iz bilo DataFramea ili liste (profesorovi učenici)."""
+    if ucenici is None:
+        return []
+    if hasattr(ucenici, "to_dict") and hasattr(ucenici, "columns"):
+        return ucenici.to_dict("records")
+    return [x for x in ucenici if isinstance(x, dict)]
+
+
+def _prvi_odrzani_sat(df_instr) -> dict:
+    """{ucenik_id: datum prvog ODRŽANOG sata} — za učenike koji još nisu dobili osvrt."""
+    prvi = {}
+    if df_instr is None or getattr(df_instr, "empty", True) or "ucenik_id" not in getattr(df_instr, "columns", ()):
+        return prvi
+    d = df_instr
+    if "status_termina" in d.columns:
+        d = d[~d["status_termina"].astype(str).str.strip().isin(STATUSI_BEZ_SATA)]
+    if "datum" not in d.columns:
+        return prvi
+    for uid, g in d.groupby(d["ucenik_id"].astype(str).str.strip().str.upper()):
+        datumi = [x for x in (datum_iz(v) for v in g["datum"]) if x]
+        if datumi:
+            prvi[uid] = min(datumi)
+    return prvi
+
+
+def cekaju_osvrt(df_poruke, ucenici, df_instr=None, danas=None, razmak_dana: int = RAZMAK_OSVRTA_DANA,
+                 prvi_dana: int = PRVI_OSVRT_DANA) -> list:
+    """Učenici kojima je vrijeme za novi ✍️ osvrt roditelju (za karticu 🏠 Danas).
+
+    `ucenici` su SAMO profesorovi učenici (nikad cijeli Sheet). Pravilo:
+      - kome je već poslan osvrt → sljedeći kad prođe `razmak_dana` (zadano 28),
+      - kome nije → tek `prvi_dana` (zadano 14) nakon prvog **održanog** sata; bez ijednog sata
+        se ne pojavljuje (nema o čemu pisati).
+
+    Vraća [{ucenik_id, ime_djeteta, zadnji (date|None), ceka_od (date), dana (int)}] — najduže
+    čekani prvi, da profesor zna koga prvo zvati.
+    """
+    danas = datum_iz(danas) or sada().date()
+    prvi_sat = _prvi_odrzani_sat(df_instr)
+    izlaz = []
+    for u in _kao_popis(ucenici):
+        uid = _t(u.get("ucenik_id")).upper()
+        if not uid:
+            continue
+        zadnji = zadnja_poruka(df_poruke, uid)
+        if zadnji:
+            ceka_od, osnova = zadnji + timedelta(days=razmak_dana), zadnji
+        else:
+            p = prvi_sat.get(uid)
+            if not p or (danas - p).days < prvi_dana:
+                continue
+            ceka_od, osnova = p + timedelta(days=prvi_dana), p
+        if danas >= ceka_od:
+            izlaz.append({"ucenik_id": uid, "ime_djeteta": _t(u.get("ime_djeteta")),
+                          "zadnji": zadnji, "ceka_od": ceka_od, "dana": (danas - osnova).days})
+    izlaz.sort(key=lambda x: x["ceka_od"])
+    return izlaz
+
+
 # ============================================================================================
 # Prikaz (Streamlit) — kartica učenika i obrazac
 # ============================================================================================

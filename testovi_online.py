@@ -305,6 +305,22 @@ def _pocetak_testa(st, sheet, test_id: str, ucenik_id: str, sada) -> datetime:
 # Koji testovi su dostupni kojem učeniku
 # ============================================================
 
+def _smije_vidjeti(t, ucenik_id: str, programi) -> bool:
+    """Zajednički filter za učenika: aktivan + cilj (konkretan učenik ili program). Bez datuma.
+
+    Program se provjerava SAMO za opću objavu (bez `ucenik_id`-a, npr. „svi na Maturi"). Test
+    ciljan na KONKRETNOG učenika prikazuje se njemu uvijek, bez obzira ima li redak u Prijave s
+    odgovarajućim `program_tip`-om — inače test poslan učeniku bez Prijave nikad ne bi bio vidljiv
+    (v. TRACKER.md 21.10.2026.)."""
+    if _tekst(t.get("aktivan")).lower() not in ("", "da", "1", "true"):
+        return False
+    cilj = _tekst(t.get("ucenik_id")).upper()
+    if cilj:
+        return cilj == ucenik_id
+    program = _tekst(t.get("program"))
+    return not program or program in programi
+
+
 def testovi_za_ucenika(testovi, rezultati, ucenik_id: str, programi=(), danas=None) -> list[dict]:
     """Vraća dostupne testove za učenika, svaki s oznakom 'rjeseno' i 'rezultat'.
 
@@ -314,6 +330,8 @@ def testovi_za_ucenika(testovi, rezultati, ucenik_id: str, programi=(), danas=No
       - `program` prazan = svi programi; inače mora biti među učenikovim programima,
       - datum mora biti unutar [otvara_od, zatvara_do] (prazna granica = nema granice),
       - test koji je učenik već predao ostaje na popisu, ali označen kao rješen.
+
+    Test kojemu rok još nije počeo NIJE ovdje — v. `najava_testova()`.
     """
     ucenik_id = _tekst(ucenik_id).upper()
     programi = {_tekst(p) for p in (programi or ()) if _tekst(p)}
@@ -326,22 +344,8 @@ def testovi_za_ucenika(testovi, rezultati, ucenik_id: str, programi=(), danas=No
 
     out = []
     for t in testovi or []:
-        if _tekst(t.get("aktivan")).lower() not in ("", "da", "1", "true"):
+        if not _smije_vidjeti(t, ucenik_id, programi):
             continue
-        cilj = _tekst(t.get("ucenik_id")).upper()
-        if cilj and cilj != ucenik_id:
-            continue
-        if not cilj:
-            # 21.10.2026. (nalaz): program se provjerava SAMO za opcu objavu (bez ucenik_id-a,
-            # npr. "svi na Maturi"). Test ciljan na KONKRETNOG ucenika (objavi_test/
-            # objavi_za_ucenike s ucenik_id-om) prikazuje se njemu uvijek, bez obzira ima li
-            # redak u Prijave s odgovarajucim program_tip-om -- inace test ciljan na ucenika
-            # koji nema (ili jos nema) redak u Prijave (npr. samostalni Instrukcije klijent
-            # bez popunjene forme) nikad ne bi bio vidljiv, iako ga je Caki eksplicitno njemu
-            # poslao. V. TRACKER.md 21.10.2026.
-            program = _tekst(t.get("program"))
-            if program and program not in programi:
-                continue
         od, do = _danas(t.get("otvara_od")), _danas(t.get("zatvara_do"))
         if od and danas < od:
             continue
@@ -353,6 +357,34 @@ def testovi_za_ucenika(testovi, rezultati, ucenik_id: str, programi=(), danas=No
         out.append(test)
 
     out.sort(key=lambda t: (_tekst(t.get("kreirano")), _tekst(t.get("test_id"))), reverse=True)
+    return out
+
+
+def najava_testova(testovi, rezultati, ucenik_id: str, programi=(), danas=None) -> list[dict]:
+    """Objavljeni testovi kojima rok još NIJE počeo — učenik vidi da ga čeka i od kada.
+
+    Bez ovoga test „padne s neba" na dan otvaranja. Isti filteri kao `testovi_za_ucenika`, samo se
+    gleda suprotna strana `otvara_od`. Rješavanje nije moguće dok test ne uđe u `testovi_za_ucenika`.
+    """
+    ucenik_id = _tekst(ucenik_id).upper()
+    programi = {_tekst(p) for p in (programi or ()) if _tekst(p)}
+    danas = _danas(danas or date.today())
+    rjeseni = {_tekst(r.get("test_id")) for r in (rezultati or [])
+               if _tekst(r.get("ucenik_id")).upper() == ucenik_id}
+    out = []
+    for t in testovi or []:
+        if not _smije_vidjeti(t, ucenik_id, programi):
+            continue
+        od = _danas(t.get("otvara_od"))
+        if not od or danas >= od:
+            continue
+        if _tekst(t.get("test_id")) in rjeseni:
+            continue
+        do = _danas(t.get("zatvara_do"))
+        if do and danas > do:                 # rok prošao, a nije rješavan — nije „najava"
+            continue
+        out.append(dict(t))
+    out.sort(key=lambda t: (_tekst(t.get("otvara_od")), _tekst(t.get("naziv"))))
     return out
 
 
@@ -571,6 +603,93 @@ def tabela_rezultata(rezultati):
     } for r in (rezultati or [])])
 
 
+# ============================================================
+# 🔎 Pregled rješenja — tek PO ZATVARANJU roka (21.10.2026.)
+# ============================================================
+
+def rjesenja_dostupna(test, danas=None) -> bool:
+    """Smiju li učeniku biti vidljivi točni odgovori (i njegovi odgovori) tog testa?
+
+    Cakijeva odluka 21.10.2026.: dok rok za pisanje traje, rješenja su **skrivena** — inače učenik
+    koji prvi preda podijeli odgovore ostalima, a test još traje. Otvaraju se **odmah po isteku
+    roka**: `zatvara_do` je datum, rok istječe u ponoć na kraju tog dana, a prvi trenutak nakon toga
+    je `danas > zatvara_do` — dakle čim se stranica učita nakon isteka, rješenja su tu. Nema
+    dodatnog čekanja.
+
+    Test bez `zatvara_do` rješenja ne otvara nikad (nema kad stati) — 🩺 Provjere upozore na takav
+    test.
+    """
+    do = _danas((test or {}).get("zatvara_do"))
+    if not do:
+        return False
+    return _danas(danas or date.today()) > do
+
+
+def detalji_iz_retka(rezultat) -> list:
+    """JSON `detalji_json` jednog rezultata -> popis po zadatku (tolerantno na smeće)."""
+    import json
+    sirovo = (rezultat or {}).get("detalji_json") if isinstance(rezultat, dict) else None
+    try:
+        detalji = json.loads(str(sirovo or "[]"))
+    except (TypeError, ValueError):
+        return []
+    return detalji if isinstance(detalji, list) else []
+
+
+def _opis_odgovora(zadatak, vrijednost) -> str:
+    """'B' -> 'B) tekst opcije' kod višestrukog izbora; inače tekst kako je upisan."""
+    v = _tekst(vrijednost)
+    if not v:
+        return ""
+    opcije = opcije_zadatka(zadatak or {})
+    slovo = v[:1].upper()
+    if opcije and "A" <= slovo <= "Z" and 0 <= ord(slovo) - 65 < len(opcije):
+        return f"{slovo}) {_tekst(opcije[ord(slovo) - 65])}"
+    return v
+
+
+def pregled_rjesenja(test, rezultat) -> list:
+    """Spoji zamrznute zadatke s učenikovim odgovorima — za prikaz NAKON roka.
+
+    Vraća [{redni, zadatak, tvoj, tocan, tocno, bodovi, max}]. Zamrznuti zadatak (`zadaci_json`)
+    je mjerodavan, ne današnje stanje baze — ako je Caki poslije mijenjao zadatak, učenik vidi
+    točno ono što je rješavao."""
+    zadaci = zadaci_iz_retka(test)
+    detalji = detalji_iz_retka(rezultat)
+    izlaz = []
+    for i, z in enumerate(zadaci):
+        d = detalji[i] if i < len(detalji) and isinstance(detalji[i], dict) else {}
+        izlaz.append({
+            "redni": i + 1,
+            "zadatak": _tekst(z.get("tekst")),
+            "tvoj": _opis_odgovora(z, d.get("odgovor")),
+            "tocan": _opis_odgovora(z, d.get("ocekivano") or z.get("odgovor")),
+            "tocno": bool(d.get("tocno")),
+            "bodovi": _broj(d.get("bodovi"), 0.0),
+            "max": _broj(d.get("max"), _broj(z.get("bodovi"), 0.0)),
+        })
+    return izlaz
+
+
+def tabela_pregleda(test, rezultat):
+    """Pandas tablica za prikaz pregleda rješenja (prazna ako nema zadataka)."""
+    import pandas as pd
+
+    def _kratko(t, n=160):
+        t = _tekst(t)
+        return t if len(t) <= n else t[:n].rstrip() + "…"
+
+    redci = pregled_rjesenja(test, rezultat)
+    return pd.DataFrame([{
+        "Br.": r["redni"],
+        "Zadatak": _kratko(r["zadatak"]),
+        "Tvoj odgovor": r["tvoj"] or "— nije odgovoreno —",
+        "Točno rješenje": r["tocan"] or "—",
+        "Bodovi": f"{r['bodovi']:g} / {r['max']:g}",
+        "✓": "✅" if r["tocno"] else "❌",
+    } for r in redci])
+
+
 def _prikazi_rezultate(st, rezultati) -> None:
     if not rezultati:
         return
@@ -729,7 +848,10 @@ def prikazi_testove(st, sheet, testovi, rezultati, ucenik, ucenik_id: str, progr
 
     za_rjesavanje = [t for t in dostupni if not t["rjeseno"]]
 
-    if not dostupni and not moji:
+    # 21.10.2026.: 🗓️ najava — test objavljen, ali rok još nije počeo. Učenik zna da ga čeka.
+    najave = najava_testova(testovi, rezultati, ucenik_id, programi, sada.date())
+
+    if not dostupni and not moji and not najave:
         st.info("Trenutno nema testova za tebe. Kad Caki objavi test, pojavit će se ovdje.")
         return
 
@@ -749,6 +871,14 @@ def prikazi_testove(st, sheet, testovi, rezultati, ucenik, ucenik_id: str, progr
     else:
         st.success("Svi dostupni testovi su riješeni. 🎉")
 
+    if najave:
+        st.markdown("#### 🗓️ Najavljeni testovi")
+        st.caption("Još se ne mogu rješavati — otvaraju se na navedeni datum. Pripremi se na vrijeme.")
+        for t in najave:
+            st.markdown(f"**{_tekst(t.get('naziv'))}** — otvara se **{_tekst(t.get('otvara_od'))}** · "
+                        f"{_tekst(t.get('broj_zadataka'))} zadataka · "
+                        f"{int(float(_tekst(t.get('trajanje_min')) or 45))} minuta")
+
     if any(t["rjeseno"] for t in dostupni):
         st.markdown("#### ✅ Riješeni testovi")
         for t in dostupni:
@@ -761,6 +891,33 @@ def prikazi_testove(st, sheet, testovi, rezultati, ucenik, ucenik_id: str, progr
 
     _prikazi_rezultate(st, moji)
 
+    # 21.10.2026. (Cakijev zahtjev): 🔎 pregled rješenja otvara se TEK nakon roka — dok test traje,
+    # učenik koji prvi preda ne smije moći podijeliti točne odgovore ostalima.
+    po_id = {_tekst(t.get("test_id")): t for t in (testovi or [])}
+    parovi = [(_tekst(r.get("test_id")), r) for r in moji if _tekst(r.get("test_id")) in po_id]
+    otvoreni = [(po_id[i], r) for i, r in parovi if rjesenja_dostupna(po_id[i], sada.date())]
+    cekaju = [(po_id[i], r) for i, r in parovi if not rjesenja_dostupna(po_id[i], sada.date())]
+
+    if otvoreni:
+        st.markdown("#### 🔎 Pregled rješenja")
+        st.caption("Točni odgovori otvaraju se **odmah po isteku roka** za pisanje — da ih netko ne "
+                   "podijeli dok test još traje.")
+        for t, r in otvoreni:
+            with st.expander(f"🔎 {_tekst(t.get('naziv'))} — {_tekst(r.get('bodovi'))} / "
+                             f"{_tekst(r.get('bodovi_max'))} bodova"):
+                tabla = tabela_pregleda(t, r)
+                if tabla.empty:
+                    st.caption("Za ovaj test nema spremljenih detalja po zadatku.")
+                    continue
+                st.dataframe(tabla, hide_index=True, width="stretch")
+                tocno = sum(1 for x in pregled_rjesenja(t, r) if x["tocno"])
+                st.caption(f"Točno riješeno **{tocno}** od **{len(tabla)}** zadataka. "
+                           "Zadatke koje nisi riješio vježbaj iz cjeline koja je navedena uz zadatak.")
+    if cekaju:
+        rokovi = sorted({_tekst(t.get("zatvara_do")) or "bez roka" for t, _ in cekaju})
+        st.caption(f"🔒 **Rješenja se otvaraju odmah po isteku roka** — {', '.join(rokovi)} "
+                   "(u ponoć na kraju tog dana). Do tada vidiš samo broj bodova.")
+
 
 __all__ = [
     "TEST_TAB", "REZ_TAB", "REZ_HEADERS", "STATUS_PREDANO", "STATUS_ISTEKLO",
@@ -768,7 +925,8 @@ __all__ = [
     "load_testovi", "load_rezultati", "osiguraj_rez_tab", "zadaci_iz_retka",
     "load_pocetci", "osiguraj_pocetak_tab", "pocetak_ucenika", "upisi_pocetak",
     "je_vec_predan",
-    "testovi_za_ucenika", "rezultati_ucenika", "normalizuj", "kratki_tocan",
+    "testovi_za_ucenika", "najava_testova", "rezultati_ucenika", "normalizuj", "kratki_tocan",
     "je_tocan", "ocjeni", "novi_rezultat_id", "spremi_rezultat", "tabela_rezultata",
+    "rjesenja_dostupna", "pregled_rjesenja", "tabela_pregleda", "detalji_iz_retka",
     "prikazi_testove",
 ]
