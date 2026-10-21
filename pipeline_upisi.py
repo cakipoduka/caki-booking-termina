@@ -305,6 +305,35 @@ def duple_prijave(df_prijave, ucenik_id: str = "", sezona: str = SEZONA) -> list
     return sorted(out, key=lambda x: (x["ime_djeteta"], x["opis"]))
 
 
+def arhiviraj_prijavu(sheet, redak_id: str, razlog: str = "") -> None:
+    """21.10.2026. (Cakijev zahtjev): makni prijavu s popisa 📥 Upiti, ali ZADRŽI kontakt u bazi.
+    Koristi se za stare uvezene prijave i za one koji odustanu nakon prijave. Ništa se ne briše —
+    prijava dobije status Otkazano i napomenu, a učenik ostaje u Učenicima sa svim kontaktima."""
+    ws = sheet.worksheet("Prijave")
+    headers = ws.row_values(1)
+    df = _load_worksheet_df(ws)
+    red = df[df["redak_id"].astype(str) == str(redak_id)]
+    if red.empty:
+        raise ValueError("Prijava nije pronađena — osvježi stranicu.")
+    r = red.iloc[0]
+    stara = _cisto(r.get("napomena"))
+    oznaka = "🗄️ Maknuto s upita " + sada_zagreb().strftime("%d.%m.%Y.") + (f" — {razlog}" if razlog else "")
+    polja = {"status_kontakta": "Otkazano", "napomena": (oznaka + ". " + stara)[:1000]}
+    _azuriraj_polja(ws, int(r["_row"]), {k: v for k, v in polja.items() if k in headers}, headers)
+
+
+def arhiviraj_prijave(sheet, redak_ids, razlog: str = "") -> int:
+    """Skupno maknuće (npr. svi uvezeni upiti stariji od 30 dana). Vraća broj maknutih."""
+    n = 0
+    for rid in list(redak_ids):
+        try:
+            arhiviraj_prijavu(sheet, rid, razlog)
+            n += 1
+        except ValueError:
+            continue
+    return n
+
+
 def otkazi_duplu_prijavu(sheet, redak_id: str) -> None:
     """Duplikat se ne briše (povijest ostaje) nego dobiva status Otkazano + napomenu."""
     ws = sheet.worksheet("Prijave")
@@ -1160,6 +1189,8 @@ def dodaj_instrukciju_termin(
         "status_termina": str(status_termina or "Održan"),
         "vrijeme": str(vrijeme or ""),
         "paket_id": paket_id,
+        # 21.10.2026.: vrijeme UPISA — po njemu teče rok u kojem profesor smije sam ispraviti termin
+        "kreirano": sada_zagreb().strftime("%Y-%m-%d %H:%M:%S"),
     }
     red = ["" for _ in headers]
     for naziv, vrijednost in vrijednosti.items():
@@ -2812,6 +2843,40 @@ def portal_instrukcije(df_instrukcije: pd.DataFrame, df_racuni: pd.DataFrame, uc
     return out.reset_index(drop=True)
 
 
+OZNAKA_GOTOVINE_PRIJAVE = "Plaćeno gotovinom"      # upisuje se u Prijave.napomena (ručna gotovina)
+
+
+def portal_gotovina(df_prijave: pd.DataFrame, ucenik_id: str, sezona: str = SEZONA) -> list:
+    """21.10.2026. (Cakijev nalaz): program plaćen GOTOVINOM nema dokument u Solu, pa se u portalu
+    nije vidjelo da je plaćen. Vraća [{program, opis}] za takve prijave — portal ih prikazuje kao
+    ✅ Plaćeno gotovinom, bez iznosa i bez ičega iz interne evidencije."""
+    if df_prijave is None or getattr(df_prijave, "empty", True) or "napomena" not in df_prijave.columns:
+        return []
+    out, videno = [], set()
+    for _, r in df_prijave.iterrows():
+        if str(r.get("ucenik_id", "")).strip() != str(ucenik_id).strip():
+            continue
+        if OZNAKA_GOTOVINE_PRIJAVE.lower() not in _cisto(r.get("napomena")).lower():
+            continue
+        if _cisto(r.get("status_kontakta")).strip() in STATUSI_NEAKTIVNI:
+            continue
+        sez = _cisto(r.get("sezona")).strip()
+        if sezona and sez and sez != sezona:
+            continue
+        program = _cisto(r.get("program_tip")).strip() or ("Upisi" if _cisto(r.get("komponenta")) else "—")
+        predmet = _cisto(r.get("predmet")).strip() or _cisto(r.get("komponenta")).strip()
+        naziv = PREDMETI_MATURA.get(predmet, KOMPONENTE.get(predmet, predmet.replace("_", " ").capitalize()))
+        razina = _cisto(r.get("razina_ispita")).strip().upper()
+        if razina in ("A", "B"):
+            naziv += f" ({razina} razina)"
+        kljuc = (program, naziv)
+        if kljuc in videno:
+            continue
+        videno.add(kljuc)
+        out.append({"program": program, "opis": naziv})
+    return sorted(out, key=lambda x: (x["program"], x["opis"]))
+
+
 def portal_naplata(df_racuni: pd.DataFrame, ucenik_id: str):
     """§24.4: (tablica poslanih dokumenata, dug u centima). Nacrti/odobreni/greške/otkazani se NE prikazuju."""
     if df_racuni.empty or "status" not in df_racuni.columns:
@@ -4014,6 +4079,9 @@ OZNAKE_STATUSA_PREDMETA = {"Čeka poziv": "📞 Čeka poziv", "Čeka": "⏳ Ček
                            "Otkazano": "❌ Otkazao"}
 STATUSI_NEAKTIVNI = ["Otkazano", "Odustao"]
 _DOK_U_FINANCIJAMA = ["Nacrt", "Odobreno", "Šalje se…", "Greška"]
+# 21.10.2026.: odobren dokument čeka da ga Apps Script pošalje u Solo (zna potrajati). Prije je i
+# tada pisalo „🟡 Nacrt u Financijama”, pa je izgledalo kao da slanje nije ni pokrenuto.
+_DOK_CEKA_SOLO = ["Odobreno", "Šalje se…"]
 _DOK_POSLAN = ["Poslano", "Isteklo"]
 _DOK_UGASEN = ["Za brisanje", "Obrisano", "Brisanje nije uspjelo", "Otkazano"]
 
@@ -4068,6 +4136,8 @@ def stanje_predmeta(red, dok_po_retku: dict) -> dict:
         s, broj = dok["status"], dok["broj_dokumenta"]
         if s == "Greška":
             return {"kod": "greska", "oznaka": "⚠️ Greška slanja — vidi 💶 Financije", "uredivo": False}
+        if s in _DOK_CEKA_SOLO:
+            return {"kod": "ceka_solo", "oznaka": "⏳ Odobreno — čeka broj ponude iz Sola", "uredivo": False}
         if s in _DOK_U_FINANCIJAMA:
             return {"kod": "financije", "oznaka": "🟡 Nacrt u 💶 Financijama", "uredivo": False}
         if s in _DOK_POSLAN:
@@ -5645,7 +5715,7 @@ def korak_predmeta(red, dok_po_retku: dict):
     if kod == "poslano":
         dok = dok_po_retku.get(str(red.get("redak_id", "") or "").strip()) or {}
         return 4 if str(dok.get("mail_poslan", "") or "").strip().lower() in ("da", "true", "1") else 3
-    if kod in ("financije", "greska", "ide"):
+    if kod in ("financije", "greska", "ide", "ceka_solo"):
         return 2
     if kod == "ugasen":
         return 1
@@ -5709,7 +5779,7 @@ HONORAR_NACINI = ["Po satu", "Po terminu", "Postotak od cijene"]
 PAKETI_TAB = "Paketi_sati"
 PAKETI_HEADERS = ["paket_id", "ucenik_id", "ime_djeteta", "predmet", "sati", "datum_kupnje", "vrijedi_do",
                   "cijena", "status", "napomena"]
-INSTRUKCIJE_STUPCI_V2 = ["status_termina", "vrijeme", "paket_id", "honorar_termina"]
+INSTRUKCIJE_STUPCI_V2 = ["status_termina", "vrijeme", "paket_id", "honorar_termina", "kreirano"]
 
 STATUSI_TERMINA = ["Održan", "Zakazan", "Otkazan na vrijeme", "Otkazan kasno", "Nije došao", "Nadoknada"]
 OZNAKE_STATUSA_TERMINA = {
@@ -5717,7 +5787,112 @@ OZNAKE_STATUSA_TERMINA = {
     "Otkazan kasno": "⏰ Otkazan kasno (< 24 h — naplaćuje se)", "Nije došao": "🚫 Nije došao (naplaćuje se)",
     "Nadoknada": "🔁 Nadoknada (bez naplate)",
 }
-OTKAZ_SATI = 24   # pravilo otkazivanja: kasnije od toga = naplaćuje se
+OTKAZ_SATI = 12   # 21.10.2026. (Cakijeva odluka, prije 24): otkazivanje kasnije od toga = naplaćuje se
+ROK_ISPRAVKA_SATI = 24   # koliko dugo profesor smije sam ispraviti ili obrisati upisani termin
+# Izbornik vremena početka termina — brže i bez tipfelera nego slobodan upis (Cakijev zahtjev)
+VREMENA_TERMINA = [f"{h:02d}:{m:02d}" for h in range(8, 22) for m in (0, 15, 30, 45)
+                   if not (h == 21 and m > 30)]
+
+
+def vrijeme_unosa(red):
+    """Kad je termin UPISAN (stupac `kreirano`). Za stare retke bez tog stupca uzima se datum
+    termina (+ vrijeme ako postoji) — tako rok ispravka radi i unatrag."""
+    g = (lambda k: _cisto(red.get(k) if hasattr(red, "get") else "").strip())
+    t = g("kreirano")
+    for oblik_ in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(t, oblik_)
+        except ValueError:
+            continue
+    d = _datum(prikazi_datum(red.get("datum") if hasattr(red, "get") else None))
+    if not d:
+        return None
+    v = g("vrijeme")
+    try:
+        h, m = [int(x) for x in v.replace(".", ":").split(":")[:2]]
+    except (ValueError, IndexError):
+        h, m = 23, 59
+    return datetime(d.year, d.month, d.day, min(h, 23), min(m, 59))
+
+
+def smije_ispraviti_termin(red, nastavnik: str = "", sada=None, rok_sati: int = ROK_ISPRAVKA_SATI):
+    """(smije, razlog). Profesor: samo svoj termin, u roku od `rok_sati` i dok nije obračunat.
+    Admin (nastavnik='') smije uvijek osim kad je termin već obračunat/otpisan."""
+    g = (lambda k: _cisto(red.get(k) if hasattr(red, "get") else "").strip())
+    if g("status_obracuna") in ("Obračunato", "Otpisano"):
+        return False, "Termin je već obračunat — prvo odbaci njegov dokument u 💶 Financije."
+    if not nastavnik:
+        return True, ""
+    if g("nastavnik") != nastavnik:
+        return False, "Možete mijenjati samo svoje termine."
+    upisan = vrijeme_unosa(red)
+    sada = sada or sada_zagreb().replace(tzinfo=None)
+    if upisan and (sada - upisan).total_seconds() > rok_sati * 3600:
+        return False, (f"Ispravak je moguć {rok_sati} h nakon upisa termina. Za kasniji ispravak "
+                       "javite se adminu (Caki ili Neira).")
+    return True, ""
+
+
+POLJA_ISPRAVKA = ("datum", "vrijeme", "duljina_min", "oblik", "broj_ucenika_u_grupi", "predmet",
+                  "stupanj_skolovanja", "status_termina", "napomena_javna", "napomena_interna",
+                  "placeno_oznaka_prof")
+
+
+def uredi_termin_instrukcija(sheet, termin_id: str, polja: dict, nastavnik: str = "",
+                             rok_sati: int = ROK_ISPRAVKA_SATI, preracunaj: bool = True) -> dict:
+    """21.10.2026. (Cakijev zahtjev): ispravak svakog detalja upisanog termina.
+    Profesor (nastavnik zadan) smije svoj termin unutar `rok_sati`; admin (nastavnik='') uvijek.
+    Kad se promijeni oblik/predmet/duljina, ponovno se računaju šifra i cijena; kad se promijeni
+    status ili plaćanje, ponovno se računa status obračuna. Vraća upisana polja."""
+    ws = sheet.worksheet("Instrukcije_termini")
+    headers = ws.row_values(1)
+    df = _load_worksheet_df(ws)
+    red = df[df["termin_id"].astype(str) == str(termin_id)]
+    if red.empty:
+        raise ValueError("Termin nije pronađen — osvježi stranicu.")
+    r = red.iloc[0]
+    smije, razlog = smije_ispraviti_termin(r, nastavnik, rok_sati=rok_sati)
+    if not smije:
+        raise ValueError(razlog)
+    novo = {k: v for k, v in polja.items() if k in POLJA_ISPRAVKA and v is not None}
+    if not novo:
+        return {}
+    if "status_termina" in novo and novo["status_termina"] not in STATUSI_TERMINA:
+        raise ValueError("Nepoznat status termina.")
+    spojeno = {k: _cisto(r.get(k)).strip() for k in POLJA_ISPRAVKA}
+    spojeno.update({k: str(v) for k, v in novo.items()})
+    if preracunaj and "status_obracuna" in headers:
+        gotovina = spojeno["placeno_oznaka_prof"] == PLACENO_GOTOVINOM
+        if {"oblik", "predmet", "duljina_min"} & set(novo):
+            try:
+                df_cjenik = load_cjenik(sheet)
+                sifra_nova = odredi_sifru_instrukcije(spojeno["oblik"], spojeno["predmet"], df_cjenik)
+                novo["sifra"] = sifra_nova
+                cijena = izracunaj_cijenu_termina(df_cjenik, sifra_nova, spojeno["duljina_min"])
+                if cijena is not None:
+                    novo["cijena_termina"] = float(cijena)
+            except Exception:
+                pass          # cjenik nije dostupan → cijena ostaje kakva je bila
+        novo["status_obracuna"] = obracun_za_status(spojeno["status_termina"], gotovina,
+                                                    _cisto(r.get("paket_id")).strip())
+    _azuriraj_polja(ws, int(r["_row"]), {k: v for k, v in novo.items() if k in headers or k in POLJA_ISPRAVKA},
+                    headers)
+    return novo
+
+
+def obrisi_termin_instrukcija(sheet, termin_id: str, nastavnik: str = "",
+                              rok_sati: int = ROK_ISPRAVKA_SATI) -> None:
+    """Brisanje krivo upisanog termina: profesor svoj i u roku, admin bilo koji (osim obračunatog)."""
+    ws = sheet.worksheet("Instrukcije_termini")
+    df = _load_worksheet_df(ws)
+    red = df[df["termin_id"].astype(str) == str(termin_id)]
+    if red.empty:
+        raise ValueError("Termin nije pronađen — osvježi stranicu.")
+    r = red.iloc[0]
+    smije, razlog = smije_ispraviti_termin(r, nastavnik, rok_sati=rok_sati)
+    if not smije:
+        raise ValueError(razlog)
+    ws.delete_rows(int(r["_row"]))
 # Termini koji se NE naplaćuju — status_obracuna izvan STATUSI_ZA_OBRACUN, pa ih ni Apps Script
 # (mjesečni obračun) ni jednokratni obračun nikad ne uzimaju.
 STATUSI_BEZ_NAPLATE = {
@@ -6472,7 +6647,10 @@ def matura_bez_termina(df_prijave: pd.DataFrame, df_raspored: pd.DataFrame, ucen
         naziv = PREDMETI_MATURA.get(predmet, predmet.replace("_", " ").capitalize())
         if razina in ("A", "B"):
             naziv += f" ({razina} razina)"
-        zapis = (razdoblja or {}).get(kljuc_predmeta_mature(oznaka)) or (razdoblja or {}).get("MATURA")
+        # 21.10.2026. (Cakijev ispravak): SAMO razdoblje tog predmeta. Opći „MATURA” se više NE
+        # koristi kao rezerva — inače je portal javljao datum koji za HRV i ENG nije točan.
+        # Datum se pokazuje samo ako ga Caki sam upiše za taj predmet.
+        zapis = (razdoblja or {}).get(kljuc_predmeta_mature(oznaka))
         out.append({"oznaka": oznaka, "naziv": naziv, "pocetak": u_datum(zapis.get("od")) if zapis else None})
     return sorted(out, key=lambda x: x["naziv"])
 

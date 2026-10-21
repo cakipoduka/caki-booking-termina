@@ -44,6 +44,7 @@ from pipeline_upisi import (
     tekst_bez_termina,
     RAZREDI,
     RAZRED_MATURA,
+    portal_gotovina,
     postavi_razred,
     razred_sada,
     skole_iz_baze,
@@ -482,6 +483,10 @@ def prikazi_portal():
             st.dataframe(tablica_dol, hide_index=True, width="stretch")
 
     with kartice["💶 Plaćanja"]:
+        # 21.10.2026. (Cakijev nalaz): program plaćen gotovinom nema dokument u Solu, pa se dosad
+        # u portalu nije vidjelo da je plaćen. Prikazuje se samo oznaka — bez iznosa.
+        for g_ in portal_gotovina(df_prijave, ucenik_id):
+            st.success(f"✅ Plaćeno gotovinom — {g_['program']} · {g_['opis']}")
         if dokumenti.empty:
             st.info("Nema poslanih ponuda ni računa.")
         else:
