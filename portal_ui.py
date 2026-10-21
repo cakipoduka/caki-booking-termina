@@ -57,6 +57,7 @@ from pipeline_upisi import (
 )
 from sat_biljeska import za_roditelja as sat_za_roditelja  # 17.10.2026.: teme i zadaca po satu
 import testovi_online as online_testovi  # 19.10.2026.: online testovi (objavljeni iz Test Buildera)
+import komentar_napretka as osvrt_napretka  # 21.10.2026.: 📈 Napredak — osvrti profesora roditelju
 from obavijesti import (  # 15.10.2026.: kartica 📣 Obavijesti (poruke od Cakija, linkovi, komentari)
     MAX_KOMENTAR,
     OD_OPCIJE,
@@ -160,6 +161,12 @@ def _ucitaj_online_testove():
 @st.cache_data(ttl=30)
 def _ucitaj_online_rezultate():
     return online_testovi.load_rezultati(_init_sheet_testovi())
+
+
+# 21.10.2026.: 📈 Napredak — osvrti koje profesori pišu roditelju iz kartice 👩‍🎓 Moji učenici.
+@st.cache_data(ttl=60)
+def _ucitaj_napredak():
+    return osvrt_napretka.ucitaj_poruke(_init_sheet())
 
 
 def _md_sigurno(tekst: str) -> str:
@@ -401,6 +408,12 @@ def prikazi_portal():
     except Exception:
         obavijesti, linkovi, df_komentari, obav_greska = [], [], pd.DataFrame(), True
 
+    # --- 📈 Napredak (21.10.2026.): osvrti profesora. Ako tab još ne postoji, kartice nema. ---
+    try:
+        osvrti = osvrt_napretka.poruke_ucenika(_ucitaj_napredak(), ucenik_id)
+    except Exception:
+        osvrti = []
+
     # --- Zaglavlje: tko je i najvažnije u 3 broja ---
     with st.container(border=True):
         st.markdown(f"### 👋 {ucenik['ime_djeteta']}")
@@ -421,7 +434,10 @@ def prikazi_portal():
         nazivi.append("📅 Odabir termina")
     if online_dostupni or moji_online_rezultati:
         nazivi.append(naziv_testovi)
-    nazivi += ["🗓️ Raspored", "✅ Dolasci", "💶 Plaćanja", "📊 Rezultati", "🙋 Moji podaci"]
+    nazivi += ["🗓️ Raspored", "✅ Dolasci", "💶 Plaćanja", "📊 Rezultati"]
+    if osvrti:
+        nazivi.append("📈 Napredak")
+    nazivi.append("🙋 Moji podaci")
     if komponente and not bez_termina:
         nazivi.append("📅 Odabir termina")
     kartice = dict(zip(nazivi, st.tabs(nazivi)))
@@ -566,6 +582,24 @@ def prikazi_portal():
                          width="stretch",
                          column_config={"Postotak": st.column_config.ProgressColumn(
                              min_value=0, max_value=100, format="%d %%")})
+
+    if "📈 Napredak" in kartice:
+        with kartice["📈 Napredak"]:
+            # 21.10.2026.: profesor piše osvrt iz 👩‍🎓 Moji učenici (baza fraza). Ovdje je samo prikaz;
+            # roditelj vidi isključivo poruke namijenjene SVOM djetetu i samo one koje su poslane.
+            st.caption("Osvrti profesora na napredak — uz svaki piše razdoblje na koje se odnosi.")
+            for o_ in osvrti:
+                with st.container(border=True):
+                    naslov_o = o_["razdoblje"] or o_["datum"]
+                    if o_["predmet"]:
+                        naslov_o += f" · {o_['predmet']}"
+                    st.markdown(f"**{naslov_o}**")
+                    d_o = u_datum(o_["datum"])
+                    detalji = " · ".join(x for x in [f"poslano {d_o.strftime('%d.%m.%Y.')}" if d_o else "",
+                                                     o_["nastavnik"]] if x)
+                    if detalji:
+                        st.caption(detalji)
+                    st.markdown(o_["tekst"].replace("\n", "  \n"))
 
     st.divider()
     st.caption(f"Pitanja? {KONTAKT}")
