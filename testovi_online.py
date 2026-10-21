@@ -210,6 +210,21 @@ def je_vec_predan(rezultati, test_id: str, ucenik_id: str) -> bool:
     return False
 
 
+def smije_li_predati(sheet, test_id: str, ucenik_id: str) -> tuple[bool, str]:
+    """(smije li se upisati predaja, poruka ako ne smije).
+
+    Jedan učenik = jedna predaja po testu. Ako Google ne odgovori, propušta se (bolje
+    izgubiti zaštitu nego učeniku odgovore) — dvostruki upis tada hvata ljudsko oko u 📝 Testovi.
+    """
+    try:
+        if je_vec_predan(load_rezultati(sheet), test_id, ucenik_id):
+            return False, ("Ovaj test je već predan s tvojim podacima — novi upis nije napravljen "
+                           "(da se rezultat ne bi brojao dvaput). Ako misliš da je greška, javi Cakiju.")
+    except Exception:                           # noqa: BLE001 — Sheet ne smije blokirati predaju
+        return True, ""
+    return True, ""
+
+
 def _pocetak_testa(st, sheet, test_id: str, ucenik_id: str, sada) -> datetime:
     """Početak testa: iz sesije → iz taba `Test_pocetak` → upiši sada.
 
@@ -519,6 +534,22 @@ def _prikazi_rezultate(st, rezultati) -> None:
                      min_value=0, max_value=100, format="%d %%")})
 
 
+def _prikazi_sliku_zadatka(st, naziv) -> bool:
+    """Prikaže sliku zadatka iz Drivea (modul `slike_zadataka`). Nikad ne ruši test.
+
+    Vraća False ako slike nema, ako `SLIKE_FOLDER_ID` nije u Secrets ili ako Drive ne
+    odgovori — tada portal pokaže dosadašnju tekstualnu napomenu.
+    """
+    try:
+        from slike_zadataka import prikazi_sliku      # noqa: PLC0415 — modul je u portalu
+    except Exception:                                  # noqa: BLE001 — nije u ovoj kopiji repoa
+        return False
+    try:
+        return bool(prikazi_sliku(st, naziv))
+    except Exception:                                  # noqa: BLE001 — slika ne ruši test
+        return False
+
+
 def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
     zadaci = zadaci_iz_retka(test)
     test_id = _tekst(test.get("test_id"))
@@ -532,12 +563,9 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
             st.rerun()
         return
 
-    try:
-        pocetak = datetime.fromisoformat(_tekst(st.session_state.get("_online_test_pocetak")))
-    except (TypeError, ValueError):
-        pocetak = sada
-        st.session_state["_online_test_pocetak"] = pocetak.isoformat(timespec="seconds")
-    pocetak = pocetak.replace(tzinfo=None)   # sve usporedbe su u zagrebačkom lokalnom vremenu
+    # 21.10.2026.: početak testa se pamti u Sheetu (tab Test_pocetak), ne samo u sesiji —
+    # tako rok preživi osvježavanje stranice (F5), novi tab i prekid interneta.
+    pocetak = _pocetak_testa(st, sheet, test_id, ucenik_id, sada)
 
     rok = pocetak + timedelta(minutes=trajanje)
 
@@ -548,7 +576,8 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
         st.error(f"⏰ Vrijeme je isteklo u {rok:%H:%M}. Odgovori se i dalje mogu predati, ali će "
                  f"rezultat biti označen kao predan po isteku vremena.")
     else:
-        st.info(f"⏱️ Vrijeme se mjeri od početka. Rok za predaju: **{rok:%H:%M}**.")
+        st.info(f"⏱️ Vrijeme se mjeri od početka. Rok za predaju: **{rok:%H:%M}**. "
+                f"Ako osvježiš stranicu, vrijeme se nastavlja (ne počinje iznova).")
 
     from kratki_odgovor_unos import kratki_odgovor_unos
 
@@ -558,7 +587,8 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
             st.markdown(f"**Zadatak {i + 1}.** ({_broj(z.get('bodovi')):g} bod.)")
             st.markdown(_tekst(z.get("tekst")))
             if _tekst(z.get("slika")):
-                st.caption("🖼️ Uz zadatak ide slika — ako je ne vidiš, javi Cakiju prije predaje.")
+                if not _prikazi_sliku_zadatka(st, z.get("slika")):
+                    st.caption("🖼️ Uz zadatak ide slika — ako je ne vidiš, javi Cakiju prije predaje.")
             if _tekst(z.get("tip")) == "visestruki_izbor" and opcije_zadatka(z):
                 opcije = opcije_zadatka(z)
                 slova = [""] + [chr(65 + k) for k in range(len(opcije))]
@@ -580,6 +610,15 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
         st.rerun()
 
     if predaj:
+        # 21.10.2026.: zaštita od dvostrukog upisa (dva klika, dva taba, dva uređaja).
+        smije, razlog = smije_li_predati(sheet, test_id, ucenik_id)
+        if not smije:
+            st.warning(razlog)
+            _ocisti_kljuceve(st, test_id)
+            st.session_state.pop("_online_test_id", None)
+            st.session_state.pop("_online_test_pocetak", None)
+            return
+
         bodovi, maks, detalji = ocjeni(zadaci, odgovori)
         status = STATUS_ISTEKLO if sada > rok + timedelta(seconds=60) else STATUS_PREDANO
         try:
@@ -614,6 +653,19 @@ def prikazi_testove(st, sheet, testovi, rezultati, ucenik, ucenik_id: str, progr
                    f"bodova ({poruka['status']}).")
         if poruka["maks"] and poruka["bodovi"] == poruka["maks"]:
             st.balloons()
+
+    # 21.10.2026.: kratke upute učeniku (Cakijev zahtjev — da se ne pita u chatovima)
+    with st.expander("ℹ️ Kako radi test"):
+        st.markdown(
+            "- Test rješavaš **jednom**. Vrijeme se mjeri od otvaranja i **ne staje** ako "
+            "osvježiš stranicu ili zatvoriš tab.\n"
+            "- Piše ti do kada moraš predati. Ako vrijeme istekne, odgovori se i dalje mogu "
+            "predati, ali rezultat se označi kao predan po isteku.\n"
+            "- **Višestruki izbor**: klikni slovo. **Kratki odgovor**: upiši broj ili izraz "
+            "(može razlomak `1/2` ili decimalni zarez `0,5`).\n"
+            "- Ako piše da uz zadatak ide slika, a ne vidiš je — javi Cakiju **prije** predaje.\n"
+            "- Rezultat vidiš odmah nakon predaje i trajno u 📊 Rezultati."
+        )
 
     dostupni = testovi_za_ucenika(testovi, rezultati, ucenik_id, programi, sada.date())
 
@@ -666,7 +718,10 @@ def prikazi_testove(st, sheet, testovi, rezultati, ucenik, ucenik_id: str, progr
 
 __all__ = [
     "TEST_TAB", "REZ_TAB", "REZ_HEADERS", "STATUS_PREDANO", "STATUS_ISTEKLO",
+    "POCETAK_TAB", "POCETAK_HEADERS", "sa_info_za_testove",
     "load_testovi", "load_rezultati", "osiguraj_rez_tab", "zadaci_iz_retka",
+    "load_pocetci", "osiguraj_pocetak_tab", "pocetak_ucenika", "upisi_pocetak",
+    "je_vec_predan",
     "testovi_za_ucenika", "rezultati_ucenika", "normalizuj", "kratki_tocan",
     "je_tocan", "ocjeni", "novi_rezultat_id", "spremi_rezultat", "tabela_rezultata",
     "prikazi_testove",
