@@ -962,6 +962,15 @@ def razdoblje_od_zadnje(df, ucenik_id, danas=None, zadano_dana: int = 30) -> tup
 RAZMAK_OSVRTA_DANA = 28      # jedan osvrt po učeniku mjesečno (Cakijeva odluka 21.10.2026.)
 PRVI_OSVRT_DANA = 14         # novi učenik: ne javljati se roditelju prije 14 dana od prvog sata
 
+# Izbor razdoblja u obrascu (0 = od zadnje poslane poruke). Isti popis u portalu profesora i u CRM-u.
+RAZDOBLJA_OSVRTA = {"Od zadnje poruke": 0, "Zadnjih 30 dana": 30, "Zadnjih 60 dana": 60,
+                    "Cijela suradnja": 3650}
+
+
+def odabrane_fraze(po_id: dict, oznake) -> list:
+    """Oznake iz višestrukog izbora → popis fraza (dictova), u zadanom redoslijedu, bez nepoznatih."""
+    return [po_id[o] for o in (oznake or ()) if o in (po_id or {})]
+
 
 def _kao_popis(ucenici) -> list:
     """Popis dictova iz bilo DataFramea ili liste (profesorovi učenici)."""

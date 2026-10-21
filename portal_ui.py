@@ -72,13 +72,14 @@ from obavijesti import (  # 15.10.2026.: kartica 📣 Obavijesti (poruke od Caki
     previse_komentara,
 )
 
+import secrets_json as _sj  # 21.10.2026.: tolerantno čitanje JSON-a iz Secrets
 KONTAKT = "📞 +385 95 900 5611 · ✉️ info@cakipoduka.com"
 AKTIVNE_REZERVACIJE = ["Rezervirano", "Potvrđeno", "Čekanje"]
 
 
 @st.cache_resource
 def _init_sheet():
-    sa_info = json.loads(st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"])
+    sa_info = _sj.ucitaj(st, "GOOGLE_SERVICE_ACCOUNT_JSON")
     gc = get_gspread_client(sa_info)
     return gc.open_by_key(st.secrets["SHEET_ID"])
 
