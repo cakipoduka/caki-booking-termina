@@ -3194,6 +3194,34 @@ def matura_kante(df_raspored: pd.DataFrame) -> list:
     return out
 
 
+def grupe_ucenika_upisi(df_rezervacije, ucenik_id: str) -> list:
+    """21.10.2026.: grupe Upisa u kojima je učenik (potvrđena ili rezervirana prijava) — [grupa_id].
+    Isti posao kao `kante_ucenika` za Maturu: služi za gumb u Moj CAKI koji vidi samo ta grupa."""
+    if df_rezervacije is None or getattr(df_rezervacije, "empty", True) \
+            or "grupa_id" not in df_rezervacije.columns:
+        return []
+    out = []
+    for _, r in df_rezervacije.iterrows():
+        if str(r.get("ucenik_id", "")).strip() != str(ucenik_id).strip():
+            continue
+        if _cisto(r.get("status")).strip() not in ("Potvrđeno", "Rezervirano"):
+            continue
+        gid = _cisto(r.get("grupa_id")).strip()
+        if gid and gid not in out:
+            out.append(gid)
+    return out
+
+
+def kante_ucenika(df_raspored, ucenik_id: str) -> list:
+    """21.10.2026.: grupe (kante) u kojima je taj učenik — [(dan, termin, ucionica)].
+    Koristi se za ciljanje gumba u Moj CAKI na točno jednu grupu (npr. njezinu WhatsApp grupu)."""
+    out = []
+    for k in matura_kante(df_raspored):
+        if any(str(u["ucenik_id"]) == str(ucenik_id).strip() for u in k["ucenici"]):
+            out.append((k["dan"], k["termin"], k["ucionica"]))
+    return out
+
+
 def labela_kante(k: dict, s_profesorom: bool = False) -> str:
     return (f"{k['dan']} T{k['termin']} {k['vrijeme']} · Uč. {k['ucionica']} · "
             f"{' + '.join(k['predmeti']) or '—'} ({len(k['ucenici'])} uč.)"

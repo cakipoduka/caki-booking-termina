@@ -40,6 +40,8 @@ from pipeline_upisi import (
     portal_rezultati,
     datumi_termina,
     kljuc_predmeta_mature,
+    grupe_ucenika_upisi,
+    kante_ucenika,
     matura_bez_termina,
     tekst_bez_termina,
     RAZREDI,
@@ -377,8 +379,12 @@ def prikazi_portal():
 
     # --- Obavijesti (15.10.2026.): ako tabovi ne postoje / Google zapne, ostatak portala radi dalje ---
     try:
+        # 21.10.2026.: uz predmete šaljemo i GRUPE učenika (dan × termin × učionica), pa gumb
+        # (npr. WhatsApp grupa) može vidjeti samo njegova grupa.
         oznake = oznake_ucenika(_ucitaj("Prijave"), ucenik_id,
-                                matura_oznake=list(raspored_matura["Predmet"]) if not raspored_matura.empty else ())
+                                matura_oznake=list(raspored_matura["Predmet"]) if not raspored_matura.empty else (),
+                                matura_kante=kante_ucenika(_ucitaj(naziv_taba_rasporeda_mature()), ucenik_id),
+                                grupe_upisa=grupe_ucenika_upisi(df_rez, ucenik_id))
         obavijesti = obavijesti_za_ucenika(_ucitaj_obavijesti(), ucenik_id, oznake)
         linkovi = linkovi_za_ucenika(_ucitaj_linkove(), ucenik_id, oznake)
         df_komentari, obav_greska = _ucitaj_komentare(), False

@@ -145,7 +145,28 @@ def normaliziraj_za(za) -> str:
     return ", ".join(dict.fromkeys(t))
 
 
-def oznake_ucenika(df_prijave, ucenik_id, matura_oznake=()) -> set:
+DANI_KRATKO = {"PONEDJELJAK": "PON", "UTORAK": "UTO", "SRIJEDA": "SRI", "ČETVRTAK": "CET",
+               "PETAK": "PET", "SUBOTA": "SUB", "NEDJELJA": "NED"}
+
+
+def oznaka_kante(dan, termin, ucionica) -> str:
+    """21.10.2026.: kratka oznaka JEDNE grupe iz rasporeda Mature — 'Subota', 3, 'C' -> 'SUB-T3-C'.
+    Služi za ciljanje gumba u Moj CAKI na točno jednu grupu (npr. njezinu WhatsApp grupu), kad isti
+    predmet ima više grupa. Namjerno kratko i bez znakova koje `tokeni()` reže (zarez, razmak, ;)."""
+    d = DANI_KRATKO.get(str(dan or "").strip().upper(), str(dan or "").strip().upper()[:3])
+    t = str(termin or "").strip()
+    u = str(ucionica or "").strip().upper()
+    return "-".join(x for x in [d, f"T{t}" if t else "", u] if x)
+
+
+def oznaka_grupe_upisa(grupa_id) -> str:
+    """21.10.2026.: 'g1' -> 'G1' — oznaka JEDNE grupe Upisa (ključ je grupa_id iz taba Grupe).
+    Sve što nije slovo ili broj postaje '-', jer `tokeni()` reže po razmaku, zarezu i ';'."""
+    t = re.sub(r"[^A-Z0-9]+", "-", str(grupa_id or "").strip().upper()).strip("-")
+    return t
+
+
+def oznake_ucenika(df_prijave, ucenik_id, matura_oznake=(), matura_kante=(), grupe_upisa=()) -> set:
     """Sve oznake koje opisuju učenika: programi (MATURA/UPISI/INSTRUKCIJE), komponente Upisa
     (UPISI:MAT-DUGI) i predmeti Mature (MATURA:MAT-A i MATURA:MAT). Odustali/otkazani se ne računaju.
     `matura_oznake` = predmeti iz rasporeda Mature (npr. ['MAT-A', 'KEM'])."""
@@ -161,6 +182,16 @@ def oznake_ucenika(df_prijave, ucenik_id, matura_oznake=()) -> set:
 
     for o in matura_oznake or ():
         _matura(o)
+    # 21.10.2026.: GRUPA:<kod> — učenikove grupe iz rasporeda Mature (dan × termin × učionica)
+    for k in matura_kante or ():
+        kod = oznaka_kante(*k) if isinstance(k, (tuple, list)) else str(k).strip().upper()
+        if kod:
+            out.add("GRUPA:" + kod)
+    # 21.10.2026.: grupe UPISA (grupa_id iz rezervacija) — isti oblik oznake, GRUPA:<kod>
+    for g in grupe_upisa or ():
+        kod = oznaka_grupe_upisa(g)
+        if kod:
+            out.add("GRUPA:" + kod)
     if df_prijave is None or getattr(df_prijave, "empty", True) or "ucenik_id" not in df_prijave.columns:
         return out
     d = df_prijave[df_prijave["ucenik_id"].astype(str).str.strip().str.upper() == uid]
