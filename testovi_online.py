@@ -33,6 +33,9 @@ from datetime import date, datetime, timedelta
 
 TEST_TAB = "Testovi_zakazani"          # piše ga Test Builder (caki-baza-zadataka/testovi_online.py)
 REZ_TAB = "Rezultati_testova"
+POCETAK_TAB = "Test_pocetak"           # 21.10.2026.: serverski početak testa (preživi F5)
+
+POCETAK_HEADERS = ["test_id", "ucenik_id", "pocetak", "azurirano"]
 
 REZ_HEADERS = [
     "rezultat_id", "test_id", "naziv_testa", "ucenik_id", "ime_djeteta",
@@ -42,6 +45,25 @@ REZ_HEADERS = [
 
 STATUS_PREDANO = "Predano"
 STATUS_ISTEKLO = "Predano (vrijeme isteklo)"
+
+
+def sa_info_za_testove(st) -> dict:
+    """Servisni racun za sustav testiranja (Testovi_zakazani/Rezultati_testova).
+
+    Cakijeva odluka 21.10.2026. (v. TRACKER): ZASEBAN servisni racun samo za sustav
+    testiranja, da se njegova write-kvota (v. `Claude outputs/CAKI_BRIEF_kvota_sheets-
+    2026-10-18-0730.md`) ne dijeli s ostatkom portala Moj CAKI (Prijave/Dolasci/itd. i
+    dalje idu preko dijeljenog racuna). Koristi `GOOGLE_SERVICE_ACCOUNT_JSON_TESTOVI`
+    ako postoji u Secrets, inace pada natrag na dijeljeni `GOOGLE_SERVICE_ACCOUNT_JSON`
+    -- nista ne puca prije nego Caki postavi novi racun. ISTA logika kao
+    `caki-baza-zadataka/testovi_online.py::sa_info_za_testove` -- namjerna kopija,
+    isti razlog kao i ostala dvostruka mjesta u ovom modulu (cross-repo import ne radi
+    na Streamlit Cloudu).
+    """
+    import json
+    kljuc = ("GOOGLE_SERVICE_ACCOUNT_JSON_TESTOVI" if "GOOGLE_SERVICE_ACCOUNT_JSON_TESTOVI" in st.secrets
+             else "GOOGLE_SERVICE_ACCOUNT_JSON")
+    return json.loads(st.secrets[kljuc])
 
 
 # ============================================================
@@ -116,6 +138,106 @@ def zadaci_iz_retka(redak) -> list[dict]:
     except (TypeError, ValueError):
         return []
     return zadaci if isinstance(zadaci, list) else []
+
+
+# ============================================================
+# Serverski početak testa (21.10.2026.) — tab Test_pocetak
+# ============================================================
+
+def load_pocetci(sheet) -> list[dict]:
+    """Svi zapisi početaka (prazna lista ako tab još ne postoji)."""
+    try:
+        ws = sheet.worksheet(POCETAK_TAB)
+    except Exception:                                   # noqa: BLE001 — tab još ne postoji
+        return []
+    try:
+        return ws.get_all_records()
+    except Exception:                                   # noqa: BLE001 — Google ne odgovara
+        return []
+
+
+def osiguraj_pocetak_tab(sheet):
+    try:
+        return sheet.worksheet(POCETAK_TAB)
+    except Exception:                                   # noqa: BLE001
+        ws = sheet.add_worksheet(title=POCETAK_TAB, rows=500, cols=len(POCETAK_HEADERS))
+        ws.append_row(POCETAK_HEADERS, value_input_option="RAW")
+        return ws
+
+
+def pocetak_ucenika(pocetci, test_id: str, ucenik_id: str):
+    """Kad je učenik počeo taj test (ili None). Jedan test + jedan učenik = jedan zapis."""
+    tid, uid = _tekst(test_id), _tekst(ucenik_id).upper()
+    for r in pocetci or []:
+        if _tekst(r.get("test_id")) == tid and _tekst(r.get("ucenik_id")).upper() == uid:
+            try:
+                return datetime.fromisoformat(_tekst(r.get("pocetak"))).replace(tzinfo=None)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def upisi_pocetak(sheet, test_id: str, ucenik_id: str, pocetak: datetime,
+                  sada: datetime | None = None) -> bool:
+    """Upiše početak testa (ili osvježi postojeći zapis). Vraća True ako je upisan.
+
+    Jedan redak u tabu `Test_pocetak`; koristi se samo za vrijeme rješavanja, ne za ocjenu.
+    """
+    tid, uid = _tekst(test_id), _tekst(ucenik_id).upper()
+    if not tid or not uid:
+        return False
+    ws = osiguraj_pocetak_tab(sheet)
+    azurirano = (sada or datetime.now()).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M")
+    vrijednost = pocetak.strftime("%Y-%m-%d %H:%M:%S")
+
+    ids = [_tekst(v) for v in ws.col_values(1)]
+    ucenici = [_tekst(v).upper() for v in ws.col_values(2)]
+    for i, (t, u) in enumerate(zip(ids, ucenici)):
+        if t == tid and u == uid:
+            ws.update_cell(i + 1, 3, vrijednost)
+            ws.update_cell(i + 1, 4, azurirano)
+            return True
+    ws.append_row([tid, uid, vrijednost, azurirano], value_input_option="RAW")
+    return True
+
+
+def je_vec_predan(rezultati, test_id: str, ucenik_id: str) -> bool:
+    """Je li taj učenik već predao taj test (štiti od dvostrukog klika / dva taba)."""
+    tid, uid = _tekst(test_id), _tekst(ucenik_id).upper()
+    for r in rezultati or []:
+        if _tekst(r.get("test_id")) == tid and _tekst(r.get("ucenik_id")).upper() == uid:
+            return True
+    return False
+
+
+def _pocetak_testa(st, sheet, test_id: str, ucenik_id: str, sada) -> datetime:
+    """Početak testa: iz sesije → iz taba `Test_pocetak` → upiši sada.
+
+    Time vrijeme preživi osvježavanje stranice (F5), novi tab i prekid interneta — učenik
+    nastavlja s istim rokom, a ne počinje iznova.
+    """
+    kljuc = f"_online_pocetak_{_tekst(test_id)}_{_tekst(ucenik_id).upper()}"
+    zapis = st.session_state.get(kljuc)
+    if zapis:
+        try:
+            return datetime.fromisoformat(str(zapis)).replace(tzinfo=None)
+        except (TypeError, ValueError):
+            pass
+    try:
+        vec = pocetak_ucenika(load_pocetci(sheet), test_id, ucenik_id)
+    except Exception:                                   # noqa: BLE001 — Sheet ne smije blokirati
+        vec = None
+    if vec is not None:
+        st.session_state[kljuc] = vec.isoformat(timespec="seconds")
+        return vec
+
+    pocetak = (sada or datetime.now()).replace(tzinfo=None)
+    try:
+        upisi_pocetak(sheet, test_id, ucenik_id, pocetak, sada=pocetak)
+    except Exception:                                   # noqa: BLE001 — test ide dalje
+        pass
+    st.session_state[kljuc] = pocetak.isoformat(timespec="seconds")
+    return pocetak
 
 
 # ============================================================

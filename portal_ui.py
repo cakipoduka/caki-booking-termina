@@ -82,6 +82,16 @@ def _init_sheet():
     return gc.open_by_key(st.secrets["SHEET_ID"])
 
 
+@st.cache_resource
+def _init_sheet_testovi():
+    # 21.10.2026.: sustav testiranja (Testovi_zakazani/Rezultati_testova) ide preko
+    # ZASEBNOG servisnog racuna (v. online_testovi.sa_info_za_testove) da mu se write-
+    # kvota ne dijeli s ostatkom portala -- ISTI Sheet (SHEET_ID), druge vjerodajnice.
+    sa_info = online_testovi.sa_info_za_testove(st)
+    gc = get_gspread_client(sa_info)
+    return gc.open_by_key(st.secrets["SHEET_ID"])
+
+
 # Tabovi se čitaju najviše jednom u minuti i dijele među SVIM posjetiteljima — čuva Google kvotu.
 @st.cache_data(ttl=60)
 def _ucitaj(naziv: str):
@@ -144,12 +154,12 @@ def _ucitaj_komentare():
 # Kratki TTL jer učitelj može objaviti test usred dana; rezultati moraju biti svježi odmah.
 @st.cache_data(ttl=60)
 def _ucitaj_online_testove():
-    return online_testovi.load_testovi(_init_sheet())
+    return online_testovi.load_testovi(_init_sheet_testovi())
 
 
 @st.cache_data(ttl=30)
 def _ucitaj_online_rezultate():
-    return online_testovi.load_rezultati(_init_sheet())
+    return online_testovi.load_rezultati(_init_sheet_testovi())
 
 
 def _md_sigurno(tekst: str) -> str:
@@ -424,9 +434,12 @@ def prikazi_portal():
             if online_greska:
                 st.info(online_greska)
             else:
+                # 21.10.2026.: zaseban Sheet-objekt (isti Sheet, drugi servisni racun) da
+                # upis rezultata ide preko racuna posvecenog sustavu testiranja, ne preko
+                # dijeljenog racuna cijelog portala -- v. _init_sheet_testovi().
                 online_testovi.prikazi_testove(
-                    st, sheet, df_online_testovi, df_online_rezultati, ucenik, ucenik_id,
-                    programi_ucenika, sada_zagreb())
+                    st, _init_sheet_testovi(), df_online_testovi, df_online_rezultati, ucenik,
+                    ucenik_id, programi_ucenika, sada_zagreb())
 
     if "📅 Odabir termina" in kartice:
         with kartice["📅 Odabir termina"]:

@@ -6,9 +6,10 @@ uz fallback na čisti LaTeX tekstualni unos ako komponenta ne radi pouzdano.
 
 RIZIK PAKETA (zapisano u TRACKER-u 18.10.2026., v. ondje za detalje): `streamlit-mathlive`
 je verzija 0.0.3, zadnje izdanje 3.9.2025., samo 1 GitHub star/fork/watcher — slab signal
-održavanja za nešto na čemu će učenici upisivati odgovore za maturu. Zato POSTOJI fallback
-(parametar `koristi_mathlive=False`) i zato je potrebna Cakijeva vizualna provjera
-(`_demo_mathlive.py`) PRIJE nego ovo ide u stvarnu stranicu za rješavanje testa (task #4).
+održavanja za nešto na čemu učenici upisuju odgovore za maturu. VIZUALNO POTVRĐENO
+(Caki, 21.10.2026.): MathLive stvarno radi na strani učenika u produkciji. Fallback
+(parametar `koristi_mathlive=False`) ipak OSTAJE — paket je i dalje nisko održavan, pa
+je dobro imati siguran izlaz ako ikad počne pucati nakon update-a Streamlit Clouda.
 
 Ne dira pipeline_upisi.py niti druge portal datoteke — samostalan modul, bez Sheet pristupa.
 """
