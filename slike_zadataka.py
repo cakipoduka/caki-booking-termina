@@ -37,7 +37,9 @@ DRIVE_API = "https://www.googleapis.com/drive/v3"
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 SLIKE_SEKRET = "SLIKE_FOLDER_ID"
 # Baza zadataka bira folder po predmetu (predmet_config.py) — portal proba sve redom.
-FOLDER_KLJUCEVI = ("SLIKE_FOLDER_ID", "SLIKE_FOLDER_ID_MATEMATIKA_OS", "SLIKE_FOLDER_ID_FIZIKA")
+FOLDER_KLJUCEVI = ("SLIKE_FOLDER_ID", "SLIKE_FOLDER_ID_MATEMATIKA_OS",
+                   "SLIKE_FOLDER_ID_FIZIKA", "SLIKE_FOLDER_ID_FAKULTET",
+                   "FORMULE_FOLDER_ID")   # 22.10.: formule (PDF/slika) su u svojoj mapi
 SA_SEKRET = "GOOGLE_SERVICE_ACCOUNT_JSON"
 SA_SEKRET_TESTOVI = "GOOGLE_SERVICE_ACCOUNT_JSON_TESTOVI"
 TIMEOUT_S = 20
