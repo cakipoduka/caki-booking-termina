@@ -699,6 +699,61 @@ def _prikazi_rezultate(st, rezultati) -> None:
                      min_value=0, max_value=100, format="%d %%")})
 
 
+def formule_iz_retka(redak) -> list[dict]:
+    """📐 Zamrznute formule iz retka testa (`formule_json`) — 22.10.2026.
+
+    Kopija je napravljena pri objavi (v. `caki-baza-zadataka/formule.py`), pa portal ne mora
+    čitati bazu zadataka — dovoljan je CRM Sheet.
+    """
+    sirovo = _tekst((redak or {}).get("formule_json"))
+    if not sirovo:
+        return []
+    try:
+        podaci = json.loads(sirovo)
+    except ValueError:
+        return []
+    if not isinstance(podaci, list):
+        return []
+    return [f for f in podaci if isinstance(f, dict) and _tekst(f.get("tekst_latex"))]
+
+
+def tekst_formule(formula) -> str:
+    """Markdown za prikaz formule (Streamlit renderira $$…$$ preko KaTeX-a)."""
+    latex = _tekst((formula or {}).get("tekst_latex"))
+    if not latex:
+        return ""
+    return latex if "$" in latex else f"$${latex}$$"
+
+
+def prikazi_formule(st, formule, naslov: str = "📐 Formule") -> None:
+    """Desna kolona: formule koje je Caki dopustio za ovaj test. Nikad ne ruši test."""
+    formule = list(formule or [])
+    if not formule:
+        return
+    with st.container(border=True, height=560):
+        st.markdown(f"#### {naslov}")
+        st.caption("Formule koje smiješ koristiti. Nisu rješenja — samo pravila i obrasci.")
+        for f in formule:
+            _naslov = _tekst(f.get("naslov"))
+            _cjelina = _tekst(f.get("cjelina"))
+            st.markdown(f"**{_naslov}**" + (f" · *{_cjelina}*" if _cjelina else ""))
+            _datoteka = _tekst(f.get("datoteka"))
+            if _datoteka:
+                # 22.10.2026.: Caki unosi setove formula kao PDF/sliku — prikaži datoteku,
+                # a ako je nema, ostaje napomena (nikad ne ruši test).
+                _prikazano = False
+                try:
+                    from slike_zadataka import prikazi_sliku      # noqa: PLC0415
+                    _prikazano = bool(prikazi_sliku(st, _datoteka))
+                except Exception:                                  # noqa: BLE001
+                    _prikazano = False
+                if not _prikazano:
+                    st.caption(f"📄 Formula „{_datoteka}” se ne prikazuje — javi Cakiju.")
+            elif _tekst(f.get("tekst_latex")):
+                st.markdown(tekst_formule(f))
+            st.divider()
+
+
 def _prikazi_sliku_zadatka(st, naziv) -> bool:
     """Prikaže sliku zadatka iz Drivea (modul `slike_zadataka`). Nikad ne ruši test.
 
@@ -747,40 +802,71 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
     from kratki_odgovor_unos import kratki_odgovor_unos
 
     odgovori: dict[int, str] = {}
-    for i, z in enumerate(zadaci):
-        with st.container(border=True):
-            st.markdown(f"**Zadatak {i + 1}.** ({_broj(z.get('bodovi')):g} bod.)")
-            st.markdown(_tekst(z.get("tekst")))
-            if _tekst(z.get("slika")):
-                if not _prikazi_sliku_zadatka(st, z.get("slika")):
-                    # 22.10.2026.: Caki je prijavio „slike se ne vide” bez ikakve poruke —
-                    # sada se vidi RAZLOG (nema foldera, nema pristupa, datoteka nije nađena).
-                    try:
-                        from slike_zadataka import zadnja_greska      # noqa: PLC0415
-                        _razlog = zadnja_greska()
-                    except Exception:                                  # noqa: BLE001
+    # 22.10.2026. (Cakijev zahtjev): test 2/3 lijevo, 💡 pomoć 1/3 desno.
+    # Streamlit ne podržava „sticky” kolonu, pa je pomoć u fiksnoj visini (scroll unutar kutije) —
+    # ostaje kompaktna i ne bježi predaleko kad se skrola kroz 15+ zadataka.
+    lijevo, desno = st.columns([2, 1], gap="large")
+    with lijevo:
+        for i, z in enumerate(zadaci):
+            with st.container(border=True):
+                st.markdown(f"**Zadatak {i + 1}.** ({_broj(z.get('bodovi')):g} bod.)")
+                st.markdown(_tekst(z.get("tekst")))
+                if _tekst(z.get("slika")):
+                    if not _prikazi_sliku_zadatka(st, z.get("slika")):
+                        # 22.10.2026.: tehnički razlog (Secrets/Drive) vide SAMO Caki, i to kad
+                        # uključi TESTOVI_DIJAGNOSTIKA; učenik dobiva običnu, razumljivu poruku.
                         _razlog = ""
-                    st.caption("🖼️ Uz zadatak ide slika, ali se ne prikazuje"
-                               + (f" — {_razlog}" if _razlog else "")
-                               + ". Javi Cakiju prije predaje.")
-            if _tekst(z.get("tip")) == "visestruki_izbor" and opcije_zadatka(z):
-                opcije = opcije_zadatka(z)
-                slova = [""] + [chr(65 + k) for k in range(len(opcije))]
-                odgovori[i] = st.radio(
-                    "Odgovor", slova, index=0, horizontal=False, key=_kljuc(test_id, i),
-                    format_func=lambda s, o=opcije: "— odaberi —" if not s else f"{s}) {o[ord(s) - 65]}",
-                )
-            else:
-                odgovori[i] = kratki_odgovor_unos("Odgovor", key=_kljuc(test_id, i))
+                        try:
+                            from ai_pomoc import dijagnostika_ukljucena      # noqa: PLC0415
+                            if dijagnostika_ukljucena(st):
+                                from slike_zadataka import zadnja_greska     # noqa: PLC0415
+                                _razlog = zadnja_greska()
+                        except Exception:                                    # noqa: BLE001
+                            _razlog = ""
+                        if _razlog:
+                            st.caption(f"🔧 [samo za Cakija] Slika se ne prikazuje — {_razlog}.")
+                        else:
+                            st.caption("🖼️ Uz zadatak ide slika, ali se ne prikazuje — "
+                                       "javi Cakiju prije predaje.")
+                if _tekst(z.get("tip")) == "visestruki_izbor" and opcije_zadatka(z):
+                    opcije = opcije_zadatka(z)
+                    slova = [""] + [chr(65 + k) for k in range(len(opcije))]
+                    odgovori[i] = st.radio(
+                        "Odgovor", slova, index=0, horizontal=False, key=_kljuc(test_id, i),
+                        format_func=lambda s, o=opcije: "— odaberi —" if not s else f"{s}) {o[ord(s) - 65]}",
+                    )
+                else:
+                    odgovori[i] = kratki_odgovor_unos("Odgovor", key=_kljuc(test_id, i))
 
-    # 22.10.2026.: 💡 Pomoć pri učenju (AI, maskiran kao profesor) — samo ako je za taj test
-    # dopušteno (`pomoc` = Da) ili ako je uključeno globalno (`AI_POMOC` u Secrets).
-    # Nikad ne otkriva rješenje (v. ai_pomoc.py: tri sloja) i ne ruši test ako padne.
-    try:
-        from ai_pomoc import prikazi_pomoc                     # noqa: PLC0415
-        prikazi_pomoc(st, sheet, test, zadaci, ucenik_id)
-    except Exception:                                           # noqa: BLE001
-        pass
+        # 🔧 Provjera slika — vidljiva SAMO Cakiju (TESTOVI_DIJAGNOSTIKA = Da u Secrets portala).
+        try:
+            from ai_pomoc import dijagnostika_ukljucena            # noqa: PLC0415
+            if dijagnostika_ukljucena(st):
+                _nazivi_slika = [_tekst(z.get("slika")) for z in zadaci if _tekst(z.get("slika"))]
+                if _nazivi_slika:
+                    from slike_zadataka import dijagnostika_slika  # noqa: PLC0415
+                    with st.expander("🔧 Provjera slika (samo za Cakija)"):
+                        for _redak in dijagnostika_slika(st, _nazivi_slika):
+                            st.caption(_redak)
+        except Exception:                                           # noqa: BLE001
+            pass
+
+    with desno:
+        # 22.10.2026.: 📐 formule idu iznad pomoći (vidljive i kad pomoć nije dopuštena).
+        try:
+            _formule_testa = formule_iz_retka(test)
+            if _formule_testa:
+                prikazi_formule(st, _formule_testa)
+        except Exception:                                           # noqa: BLE001
+            pass
+
+        # 22.10.2026.: 💡 Pomoć pri učenju (AI, maskiran kao profesor) — samo ako je za taj test
+        # dopušteno (`pomoc` = Da) ili ako je uključeno globalno (`AI_POMOC` u Secrets).
+        try:
+            from ai_pomoc import prikazi_pomoc                     # noqa: PLC0415
+            prikazi_pomoc(st, sheet, test, zadaci, ucenik_id)
+        except Exception:                                           # noqa: BLE001
+            pass
 
     c1, c2 = st.columns([1, 1])
     predaj = c1.button("✅ Predaj test", type="primary", key=f"predaj_{test_id}")
@@ -906,6 +992,12 @@ def prikazi_testove(st, sheet, testovi, rezultati, ucenik, ucenik_id: str, progr
             st.write(f"**{_tekst(t.get('naziv'))}** — {_tekst(r.get('bodovi'))} / "
                      f"{_tekst(r.get('bodovi_max'))} bodova ({_tekst(r.get('postotak'))} %) · "
                      f"{_tekst(r.get('vrijeme_predaje'))}")
+            # 22.10.2026.: 📷 slanje rada na papiru — samo za testove koje je Caki označio.
+            try:
+                from radovi import prikazi_slanje_rada           # noqa: PLC0415
+                prikazi_slanje_rada(st, sheet, t, ucenik_id)
+            except Exception:                                    # noqa: BLE001
+                pass
 
     _prikazi_rezultate(st, moji)
 

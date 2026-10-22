@@ -222,6 +222,44 @@ def zadnja_greska() -> str:
     return ZADNJA_GRESKA
 
 
+def dijagnostika_slika(st, nazivi, transport=None) -> list[str]:
+    """Kratki izvještaj za Cakija: koji su ključevi postavljeni i vidi li Drive datoteke.
+
+    Prikazuje se SAMO kad je u Secrets portala `TESTOVI_DIJAGNOSTIKA = Da` — učenicima se
+    ovo nikad ne pokazuje. Namjerno ne baca greške.
+    """
+    izlaz = []
+    try:
+        kljucevi = []
+        for k in FOLDER_KLJUCEVI:
+            try:
+                v = _tekst(st.secrets.get(k))
+            except Exception:                       # noqa: BLE001
+                v = ""
+            if v:
+                kljucevi.append(f"{k}={v[:12]}…")
+        izlaz.append("folderi: " + (", ".join(kljucevi) if kljucevi else "NIJEDAN ključ nije postavljen"))
+
+        racuni = []
+        for info in sa_kandidati(st):
+            racuni.append(_tekst(info.get("client_email")) or "bez client_email")
+        izlaz.append("servisni računi: " + (", ".join(racuni) if racuni else "NIJEDAN"))
+
+        za_probe = [n for n in (nazivi or []) if _tekst(n)][:3]
+        if za_probe:
+            for naziv in za_probe:
+                try:
+                    bajtovi = slika_bytes(naziv, folder_kandidati(st)[0], token(sa_kandidati(st)[0]),
+                                          transport=transport)
+                except Exception as e:              # noqa: BLE001
+                    izlaz.append(f"„{naziv}”: greška {type(e).__name__}")
+                    continue
+                izlaz.append(f"„{naziv}”: {'nađena (' + str(len(bajtovi)) + ' B)' if bajtovi else 'NIJE nađena'}")
+    except Exception as e:                          # noqa: BLE001
+        izlaz.append(f"dijagnostika nije uspjela ({type(e).__name__})")
+    return izlaz
+
+
 def ocisti_kes() -> None:
     """Prazni memorijski keš slika (za testove i za slučaj da Caki zamijeni sliku)."""
     _KEŠ_ID.clear()
@@ -232,4 +270,5 @@ __all__ = [
     "SLIKE_SEKRET", "SA_SEKRET", "SA_SEKRET_TESTOVI", "folder_id", "sa_info",
     "sa_kandidati", "token", "nadji_id", "slika_bytes", "prikazi_sliku", "ocisti_kes",
     "zadnja_greska", "ZADNJA_GRESKA", "folder_kandidati", "FOLDER_KLJUCEVI",
+    "dijagnostika_slika",
 ]

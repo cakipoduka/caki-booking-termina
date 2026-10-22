@@ -16,5 +16,5 @@ import streamlit as st
 
 import portal_ui as _portal
 
-st.set_page_config(page_title="Moj CAKI", page_icon="📘", layout="centered")
+st.set_page_config(page_title="Moj CAKI", page_icon="📘", layout="wide")
 _portal.prikazi_portal()

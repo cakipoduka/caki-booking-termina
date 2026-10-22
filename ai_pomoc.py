@@ -40,8 +40,8 @@ DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-flash"
 MAX_PITANJA = 5
 TIMEOUT_S = 60
-MAX_TOKENA = 320
-TEMPERATURA = 0.4
+MAX_TOKENA = 700
+TEMPERATURA = 0.5
 
 LOG_TAB = "AI_pomoc_log"
 LOG_HEADERS = ["pitanje_id", "test_id", "ucenik_id", "zadatak_id", "zadatak",
@@ -56,7 +56,8 @@ STROGA PRAVILA:
 - NIKAD ne reci konačan rezultat, ni brojčanu vrijednost rješenja, ni "x = …".
 - Ne rješavaj zadatak do kraja. Daj TOČNO JEDAN korak (ili jedno pravilo/formulu) i pusti učenika da nastavi.
 - Ako učenik traži rješenje, pristojno odbij i ponudi korak.
-- Piši na hrvatskom, toplo i kratko: 2–3 rečenice, bez žargona, bez popisa.
+- Piši na hrvatskom, toplo i korisno: 4–6 rečenica. Smiješ objasniti zašto korak radi i na što
+  učenik treba pripaziti (bez konačnog rezultata). Kratki popis koraka je dopušten ako pomaže.
 - Nikad ne spominji da si AI, model ni aplikacija. Ti si profesor.
 
 Zadatak: {tekst}
@@ -300,6 +301,18 @@ def _ukljuceno(st, test) -> bool:
         return False
 
 
+def dijagnostika_ukljucena(st) -> bool:
+    """Prikaži tehničke poruke u portalu — SAMO ako Caki postavi `TESTOVI_DIJAGNOSTIKA = Da`.
+
+    Zašto: 22.10.2026. je poruka o `DEEPSEEK_API_KEY`/Secrets bila vidljiva UČENICIMA. Tehnički
+    detalji ne smiju ići učenicima; Caki ih uključi u Secrets portala kad mu trebaju.
+    """
+    try:
+        return _tekst(st.secrets.get("TESTOVI_DIJAGNOSTIKA")).lower() in ("da", "1", "true")
+    except Exception:                                   # noqa: BLE001 — nema Secrets
+        return False
+
+
 def prikazi_pomoc(st, sheet, test, zadaci, ucenik_id: str) -> None:
     """Blok „💡 Pomoć pri učenju" unutar rješavanja testa.
 
@@ -308,10 +321,10 @@ def prikazi_pomoc(st, sheet, test, zadaci, ucenik_id: str) -> None:
     if not _ukljuceno(st, test) or not zadaci:
         return
     if not ima_kljuc(st):
-        # 22.10.2026.: Caki je uključio pomoć, a blok se nije pojavio — zato se razlog sada
-        # VIDI umjesto da se tiho preskoči (učenik ga ne vidi, ali Caki u appu da).
-        st.caption("💡 Pomoć pri učenju je uključena, ali u Secrets portala nema "
-                   "`DEEPSEEK_API_KEY`.")
+        # Učenik NE vidi nikakvo tehničko objašnjenje — samo Caki, i to ako uključi dijagnostiku.
+        if dijagnostika_ukljucena(st):
+            st.caption("🔧 [samo za Cakija] Pomoć je uključena, ali u Secrets portala nema "
+                       "`DEEPSEEK_API_KEY`.")
         return
 
     test_id = _tekst(test.get("test_id"))
@@ -322,7 +335,10 @@ def prikazi_pomoc(st, sheet, test, zadaci, ucenik_id: str) -> None:
     iskoristeno = broj_pitanja(log, test_id, ucenik_id)
     ostalo = max(0, MAX_PITANJA - iskoristeno)
 
-    with st.expander(f"💡 Pomoć pri učenju — {IME_BOTA} (još {ostalo} pitanja)"):
+    # 22.10.2026. (Cakijev zahtjev): pomoć stoji u DESNOJ koloni (1/3), uvijek otvorena i
+    # ograničene visine — ne raste s brojem zadataka i ostaje pri ruci dok se skrola.
+    with st.container(border=True, height=560):
+        st.markdown(f"#### 💡 Pomoć pri učenju — {IME_BOTA}")
         st.caption(f"Pitaj me za **sljedeći korak** ili **pravilo**. Rješenje ne pišem — "
                    f"to je tvoj dio posla. Pitanja: {iskoristeno}/{MAX_PITANJA}.")
         if ostalo <= 0:
@@ -369,7 +385,7 @@ def prikazi_pomoc(st, sheet, test, zadaci, ucenik_id: str) -> None:
 
 __all__ = [
     "MODEL", "MAX_PITANJA", "LOG_TAB", "LOG_HEADERS", "IME_BOTA", "RAZINE",
-    "ima_kljuc", "sastavi_uputu", "pitaj_ai", "izgleda_kao_rjesenje", "kljuc_iz_testa",
+    "ima_kljuc", "dijagnostika_ukljucena", "sastavi_uputu", "pitaj_ai", "izgleda_kao_rjesenje", "kljuc_iz_testa",
     "load_log", "osiguraj_log_tab", "broj_pitanja", "novi_id", "upisi_pitanje",
     "prikazi_pomoc",
 ]
