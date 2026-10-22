@@ -703,7 +703,7 @@ def _prikazi_sliku_zadatka(st, naziv) -> bool:
     """Prikaže sliku zadatka iz Drivea (modul `slike_zadataka`). Nikad ne ruši test.
 
     Vraća False ako slike nema, ako `SLIKE_FOLDER_ID` nije u Secrets ili ako Drive ne
-    odgovori — tada portal pokaže dosadašnju tekstualnu napomenu.
+    odgovori — tada portal pokaže dosadašnju tekstualnu napomenu (s razlogom, v. 22.10.).
     """
     try:
         from slike_zadataka import prikazi_sliku      # noqa: PLC0415 — modul je u portalu
@@ -753,7 +753,16 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
             st.markdown(_tekst(z.get("tekst")))
             if _tekst(z.get("slika")):
                 if not _prikazi_sliku_zadatka(st, z.get("slika")):
-                    st.caption("🖼️ Uz zadatak ide slika — ako je ne vidiš, javi Cakiju prije predaje.")
+                    # 22.10.2026.: Caki je prijavio „slike se ne vide” bez ikakve poruke —
+                    # sada se vidi RAZLOG (nema foldera, nema pristupa, datoteka nije nađena).
+                    try:
+                        from slike_zadataka import zadnja_greska      # noqa: PLC0415
+                        _razlog = zadnja_greska()
+                    except Exception:                                  # noqa: BLE001
+                        _razlog = ""
+                    st.caption("🖼️ Uz zadatak ide slika, ali se ne prikazuje"
+                               + (f" — {_razlog}" if _razlog else "")
+                               + ". Javi Cakiju prije predaje.")
             if _tekst(z.get("tip")) == "visestruki_izbor" and opcije_zadatka(z):
                 opcije = opcije_zadatka(z)
                 slova = [""] + [chr(65 + k) for k in range(len(opcije))]

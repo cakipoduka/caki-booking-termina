@@ -36,6 +36,8 @@ from google.oauth2.service_account import Credentials
 DRIVE_API = "https://www.googleapis.com/drive/v3"
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 SLIKE_SEKRET = "SLIKE_FOLDER_ID"
+# Baza zadataka bira folder po predmetu (predmet_config.py) — portal proba sve redom.
+FOLDER_KLJUCEVI = ("SLIKE_FOLDER_ID", "SLIKE_FOLDER_ID_MATEMATIKA_OS", "SLIKE_FOLDER_ID_FIZIKA")
 SA_SEKRET = "GOOGLE_SERVICE_ACCOUNT_JSON"
 SA_SEKRET_TESTOVI = "GOOGLE_SERVICE_ACCOUNT_JSON_TESTOVI"
 TIMEOUT_S = 20
@@ -44,6 +46,7 @@ MAX_KES = 300
 _TOKEN = {"token": "", "vrijedi_do": 0.0}
 _KEŠ_ID: dict[str, str] = {}
 _KEŠ_SLIKA: dict[str, bytes] = {}
+ZADNJA_GRESKA = ""          # zašto se zadnja slika nije prikazala (v. zadnja_greska)
 
 
 # ============================================================
@@ -85,6 +88,24 @@ def sa_kandidati(st) -> list[dict]:
                 izlaz.append(podaci)
         except Exception:                               # noqa: BLE001 — nema Secrets / loš JSON
             continue
+    return izlaz
+
+
+def folder_kandidati(st) -> list[str]:
+    """Svi ID-evi foldera sa slikama koje portal ima u Secrets — redom.
+
+    22.10.2026. (Cakijev nalaz „slike se ne vide”): baza zadataka bira folder **po predmetu**
+    (`SLIKE_FOLDER_ID`, `..._MATEMATIKA_OS`, `..._FIZIKA`), a portal je čitao samo prvi ključ.
+    Zato se sada probaju svi — radi bez obzira na to koji je ključ Caki ispunio u portalu.
+    """
+    izlaz: list[str] = []
+    for kljuc in FOLDER_KLJUCEVI:
+        try:
+            vrijednost = _tekst(st.secrets.get(kljuc))
+        except Exception:                               # noqa: BLE001 — nema Secrets
+            vrijednost = ""
+        if vrijednost and vrijednost not in izlaz:
+            izlaz.append(vrijednost)
     return izlaz
 
 
@@ -160,25 +181,45 @@ def prikazi_sliku(st, naziv: str, folder: str = "", sa_info_dict=None,
     Nijedna greška ovdje ne smije prekinuti test — zato sve vraća False i portal tada
     pokaže tekstualnu napomenu (dosadašnje ponašanje). Ako je zadan `sa_info_dict`,
     koristi se samo on; inače se redom probaju računi iz Secrets (dijeljeni, pa testni).
+
+    Razlog neuspjeha se pamti u `ZADNJA_GRESKA` (v. `zadnja_greska()`) da ga Caki vidi u
+    portalu — 22.10.2026., jer se slike nisu prikazale bez ikakve poruke.
     """
+    global ZADNJA_GRESKA
+    ZADNJA_GRESKA = ""
     try:
-        folder = folder or folder_id(st)
-        if not folder:
+        folderi = [folder] if folder else folder_kandidati(st)
+        if not folderi:
+            ZADNJA_GRESKA = "u Secrets portala nema SLIKE_FOLDER_ID (ni po predmetu)"
             return False
         kandidati = [sa_info_dict] if sa_info_dict is not None else sa_kandidati(st)
-        for podaci in kandidati:
-            try:
-                bajtovi = slika_bytes(naziv, folder, token(podaci), transport=transport)
-            except Exception:                   # noqa: BLE001 — probaj sljedeći račun
-                continue
-            if bajtovi:
-                # Namjerno BEZ širine: `use_container_width` je u novijim Streamlitima zastario,
-                # a `width="stretch"` ne postoji u starijima — ovako slika radi na obje verzije.
-                st.image(bajtovi, caption=f"🖼️ {_tekst(naziv)}")
-                return True
+        if not kandidati:
+            ZADNJA_GRESKA = "nema servisnog računa u Secrets"
+            return False
+        greske = []
+        for _folder in folderi:
+            for podaci in kandidati:
+                try:
+                    bajtovi = slika_bytes(naziv, _folder, token(podaci), transport=transport)
+                except Exception as e:          # noqa: BLE001 — probaj sljedeći folder/račun
+                    greske.append(f"{type(e).__name__}")
+                    continue
+                if bajtovi:
+                    # Namjerno BEZ širine: `use_container_width` je u novijim Streamlitima
+                    # zastario, a `width="stretch"` ne postoji u starijima.
+                    st.image(bajtovi, caption=f"🖼️ {_tekst(naziv)}")
+                    return True
+        ZADNJA_GRESKA = "datoteka nije nađena ni u jednom folderu (ili Drive greška: " + \
+                        (", ".join(greske) or "nema pristupa") + ")"
         return False
-    except Exception:                               # noqa: BLE001 — slika ne ruši test
+    except Exception as e:                      # noqa: BLE001 — slika ne ruši test
+        ZADNJA_GRESKA = f"{type(e).__name__}: {e}"
         return False
+
+
+def zadnja_greska() -> str:
+    """Zašto se zadnja slika nije prikazala (prazno = prikazala se)."""
+    return ZADNJA_GRESKA
 
 
 def ocisti_kes() -> None:
@@ -190,4 +231,5 @@ def ocisti_kes() -> None:
 __all__ = [
     "SLIKE_SEKRET", "SA_SEKRET", "SA_SEKRET_TESTOVI", "folder_id", "sa_info",
     "sa_kandidati", "token", "nadji_id", "slika_bytes", "prikazi_sliku", "ocisti_kes",
+    "zadnja_greska", "ZADNJA_GRESKA", "folder_kandidati", "FOLDER_KLJUCEVI",
 ]

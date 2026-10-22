@@ -308,6 +308,10 @@ def prikazi_pomoc(st, sheet, test, zadaci, ucenik_id: str) -> None:
     if not _ukljuceno(st, test) or not zadaci:
         return
     if not ima_kljuc(st):
+        # 22.10.2026.: Caki je uključio pomoć, a blok se nije pojavio — zato se razlog sada
+        # VIDI umjesto da se tiho preskoči (učenik ga ne vidi, ali Caki u appu da).
+        st.caption("💡 Pomoć pri učenju je uključena, ali u Secrets portala nema "
+                   "`DEEPSEEK_API_KEY`.")
         return
 
     test_id = _tekst(test.get("test_id"))
