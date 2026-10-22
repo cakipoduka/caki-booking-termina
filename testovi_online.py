@@ -754,6 +754,39 @@ def prikazi_formule(st, formule, naslov: str = "📐 Formule") -> None:
             st.divider()
 
 
+def razdvoji_slike(vrijednost) -> list[str]:
+    """'a.png | b.png' -> ['a.png', 'b.png'] — isto pravilo kao baza (`SLIKE_RAZDJELNIK`).
+
+    22.10.2026. (Cakijev nalaz „slike se u testu ne vide, a u builderu se vide”): u zamrznutom
+    zadatku `slika` može sadržavati VIŠE datoteka spojenih s `|`. Portal je tražio cijeli taj
+    string kao jedno ime datoteke — i nije našao ništa.
+    """
+    izlaz = []
+    for dio in str(vrijednost or "").split("|"):
+        dio = dio.strip()
+        if dio and dio not in izlaz:
+            izlaz.append(dio)
+    return izlaz
+
+
+def pripremi_latex(tekst, zamotaj: bool = False) -> str:
+    """Pretvori LaTeX u oblik koji Streamlit (KaTeX) renderira.
+
+    `\\( … \\)` → `$…$`, `\\[ … \\]` → `$$…$$`. Ako je `zamotaj` i teksta nema `$`, a sadrži
+    LaTeX naredbu (npr. `\\alpha=43^{\\circ}`), zamotaj cijeli tekst u `$…$` — tako se prikazuju
+    ponuđeni odgovori, koji su u bazi spremljeni kao goli LaTeX.
+    """
+    t = _tekst(tekst)
+    if not t:
+        return ""
+    t = t.replace("\\(", "$").replace("\\)", "$")
+    t = t.replace("\\[", "$$").replace("\\]", "$$")
+    if zamotaj and "$" not in t:
+        if "\\" in t or "^{" in t or "_{" in t:
+            t = f"${t}$"
+    return t
+
+
 def _prikazi_sliku_zadatka(st, naziv) -> bool:
     """Prikaže sliku zadatka iz Drivea (modul `slike_zadataka`). Nikad ne ruši test.
 
@@ -810,9 +843,15 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
         for i, z in enumerate(zadaci):
             with st.container(border=True):
                 st.markdown(f"**Zadatak {i + 1}.** ({_broj(z.get('bodovi')):g} bod.)")
-                st.markdown(_tekst(z.get("tekst")))
-                if _tekst(z.get("slika")):
-                    if not _prikazi_sliku_zadatka(st, z.get("slika")):
+                # 22.10.2026.: LaTeX se u portal donosi u obliku \( … \) — pretvori prije prikaza.
+                st.markdown(pripremi_latex(z.get("tekst")))
+                _nazivi_slika = razdvoji_slike(z.get("slika"))
+                if _nazivi_slika:
+                    _sve_prikazane = True
+                    for _naziv_slike in _nazivi_slika:
+                        if not _prikazi_sliku_zadatka(st, _naziv_slike):
+                            _sve_prikazane = False
+                    if not _sve_prikazane:
                         # 22.10.2026.: tehnički razlog (Secrets/Drive) vide SAMO Caki, i to kad
                         # uključi TESTOVI_DIJAGNOSTIKA; učenik dobiva običnu, razumljivu poruku.
                         _razlog = ""
@@ -833,7 +872,9 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
                     slova = [""] + [chr(65 + k) for k in range(len(opcije))]
                     odgovori[i] = st.radio(
                         "Odgovor", slova, index=0, horizontal=False, key=_kljuc(test_id, i),
-                        format_func=lambda s, o=opcije: "— odaberi —" if not s else f"{s}) {o[ord(s) - 65]}",
+                        format_func=lambda s, o=opcije: (
+                            "— odaberi —" if not s
+                            else f"{s}) {pripremi_latex(o[ord(s) - 65], zamotaj=True)}"),
                     )
                 else:
                     odgovori[i] = kratki_odgovor_unos("Odgovor", key=_kljuc(test_id, i))
@@ -842,7 +883,7 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
         try:
             from ai_pomoc import dijagnostika_ukljucena            # noqa: PLC0415
             if dijagnostika_ukljucena(st):
-                _nazivi_slika = [_tekst(z.get("slika")) for z in zadaci if _tekst(z.get("slika"))]
+                _nazivi_slika = [n for z in zadaci for n in razdvoji_slike(z.get("slika"))]
                 if _nazivi_slika:
                     from slike_zadataka import dijagnostika_slika  # noqa: PLC0415
                     with st.expander("🔧 Provjera slika (samo za Cakija)"):

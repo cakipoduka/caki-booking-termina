@@ -81,6 +81,13 @@ def _tekst(vrijednost) -> str:
     return str(vrijednost or "").strip()
 
 
+def _za_prikaz(tekst: str) -> str:
+    r"""`\( … \)` → `$…$` — Streamlit renderira samo `$` oblike (22.10.2026.)."""
+    t = _tekst(tekst)
+    return (t.replace("\\(", "$").replace("\\)", "$")
+             .replace("\\[", "$$").replace("\\]", "$$"))
+
+
 def _normalizuj(tekst) -> str:
     """Ista ideja kao ocjenjivanje: bez razmaka, valuta, LaTeX ukrasa i velikih slova."""
     t = _tekst(tekst).lower()
@@ -380,7 +387,7 @@ def prikazi_pomoc(st, sheet, test, zadaci, ucenik_id: str) -> None:
 
         odgovor_spremljen = st.session_state.get(f"pom_odg_{test_id}")
         if odgovor_spremljen:
-            st.success(odgovor_spremljen)
+            st.success(_za_prikaz(odgovor_spremljen))
 
 
 __all__ = [
