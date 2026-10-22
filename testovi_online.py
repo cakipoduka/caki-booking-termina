@@ -764,6 +764,15 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
             else:
                 odgovori[i] = kratki_odgovor_unos("Odgovor", key=_kljuc(test_id, i))
 
+    # 22.10.2026.: 💡 Pomoć pri učenju (AI, maskiran kao profesor) — samo ako je za taj test
+    # dopušteno (`pomoc` = Da) ili ako je uključeno globalno (`AI_POMOC` u Secrets).
+    # Nikad ne otkriva rješenje (v. ai_pomoc.py: tri sloja) i ne ruši test ako padne.
+    try:
+        from ai_pomoc import prikazi_pomoc                     # noqa: PLC0415
+        prikazi_pomoc(st, sheet, test, zadaci, ucenik_id)
+    except Exception:                                           # noqa: BLE001
+        pass
+
     c1, c2 = st.columns([1, 1])
     predaj = c1.button("✅ Predaj test", type="primary", key=f"predaj_{test_id}")
     odustani = c2.button("Odustani (odgovori se ne spremaju)", key=f"odustani_{test_id}")
