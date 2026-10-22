@@ -137,21 +137,38 @@ def _u_upit(naziv: str) -> str:
 
 
 def nadji_id(naziv: str, folder: str, tok: str, transport=None) -> str:
-    """Drive ID datoteke po imenu unutar foldera (prazno ako je nema)."""
+    """Drive ID datoteke po imenu — prvo u zadanom folderu, pa **bilo gdje** na driveu.
+
+    22.10.2026. (Cakijev nalaz „slike se i dalje ne vide”): ako folder u Secrets nije dobro
+    postavljen (ili ga uopće nema), traženje po imenu unutar foldera ne nađe ništa. Zato se,
+    kad u folderu nema rezultata, radi **globalna pretraga po imenu** preko svih driveova na
+    koje servisni račun ima pristup (`corpora=allDrives`).
+    """
     naziv = _tekst(naziv)
-    if not naziv or not folder:
+    if not naziv:
         return ""
     if naziv in _KEŠ_ID:
         return _KEŠ_ID[naziv]
 
     transport = transport or _transport
-    upit = f"name = '{_u_upit(naziv)}' and '{folder}' in parents and trashed = false"
-    podaci = transport(f"{DRIVE_API}/files",
-                       {"q": upit, "fields": "files(id,name)", "pageSize": 5}, tok)
-    datoteke = (podaci or {}).get("files") or []
-    if not datoteke:
-        return ""
-    dobiveni = _tekst(datoteke[0].get("id"))
+
+    def _trazi(upit: str, dodatno: dict) -> str:
+        parametri = {"q": upit, "fields": "files(id,name)", "pageSize": 5,
+                     "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
+        parametri.update(dodatno)
+        podaci = transport(f"{DRIVE_API}/files", parametri, tok)
+        datoteke = (podaci or {}).get("files") or []
+        return _tekst(datoteke[0].get("id")) if datoteke else ""
+
+    dobiveni = ""
+    if folder:
+        dobiveni = _trazi(f"name = '{_u_upit(naziv)}' and '{folder}' in parents and trashed = false",
+                          {})
+    if not dobiveni:
+        # globalna pretraga: ime + da nije u smeću (bez ograničenja na folder)
+        dobiveni = _trazi(f"name = '{_u_upit(naziv)}' and trashed = false",
+                          {"corpora": "allDrives"})
+
     if dobiveni:
         if len(_KEŠ_ID) >= MAX_KES:
             _KEŠ_ID.clear()
@@ -192,8 +209,9 @@ def prikazi_sliku(st, naziv: str, folder: str = "", sa_info_dict=None,
     try:
         folderi = [folder] if folder else folder_kandidati(st)
         if not folderi:
-            ZADNJA_GRESKA = "u Secrets portala nema SLIKE_FOLDER_ID (ni po predmetu)"
-            return False
+            # 22.10.2026.: nema ključa u Secrets — ipak probaj GLOBALNU pretragu po imenu
+            # (servisni račun vidi cijeli medijski drive). Bolje naći sliku nego odustati.
+            folderi = [""]
         kandidati = [sa_info_dict] if sa_info_dict is not None else sa_kandidati(st)
         if not kandidati:
             ZADNJA_GRESKA = "nema servisnog računa u Secrets"
@@ -251,7 +269,8 @@ def dijagnostika_slika(st, nazivi, transport=None) -> list[str]:
         if za_probe:
             for naziv in za_probe:
                 try:
-                    bajtovi = slika_bytes(naziv, folder_kandidati(st)[0], token(sa_kandidati(st)[0]),
+                    _folderi = folder_kandidati(st) or [""]
+                    bajtovi = slika_bytes(naziv, _folderi[0], token(sa_kandidati(st)[0]),
                                           transport=transport)
                 except Exception as e:              # noqa: BLE001
                     izlaz.append(f"„{naziv}”: greška {type(e).__name__}")
