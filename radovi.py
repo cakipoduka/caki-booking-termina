@@ -147,12 +147,30 @@ def novi_id(postojeci=()) -> str:
 # ============================================================
 
 def osiguraj_tab(sheet):
+    """Tab `Radovi` + dopuna zaglavlja ako su dodani novi stupci (isto kao kod formula)."""
     try:
-        return sheet.worksheet(RADOVI_TAB)
+        ws = sheet.worksheet(RADOVI_TAB)
     except Exception:                                   # noqa: BLE001
         ws = sheet.add_worksheet(title=RADOVI_TAB, rows=500, cols=len(RADOVI_HEADERS))
         ws.append_row(RADOVI_HEADERS, value_input_option="RAW")
         return ws
+    try:
+        zaglavlje = [_tekst(h) for h in ws.row_values(1)]
+        fali = [h for h in RADOVI_HEADERS if h not in zaglavlje]
+        if fali:
+            if len(zaglavlje) + len(fali) > getattr(ws, "col_count", 0):
+                try:
+                    ws.add_cols(len(zaglavlje) + len(fali) - getattr(ws, "col_count", 0))
+                except Exception:                       # noqa: BLE001
+                    pass
+            for i, naziv in enumerate(fali, start=len(zaglavlje) + 1):
+                try:
+                    ws.update_cell(1, i, naziv)
+                except Exception:                       # noqa: BLE001
+                    break
+    except Exception:                                   # noqa: BLE001
+        pass
+    return ws
 
 
 def load_radovi(sheet) -> list[dict]:
@@ -185,7 +203,8 @@ def upisi_rad(sheet, *, test_id: str, ucenik_id: str, file_id: str, naziv: str,
         "status": "Novo",
         "link": _tekst(link) or DRIVE_WEB.format(file_id=_tekst(file_id)),
     }
-    ws.append_row([redak[h] for h in RADOVI_HEADERS], value_input_option="RAW")
+    _zaglavlje = [_tekst(h) for h in ws.row_values(1)] or list(RADOVI_HEADERS)
+    ws.append_row([redak.get(h, "") for h in _zaglavlje], value_input_option="RAW")
     return redak
 
 
