@@ -320,7 +320,7 @@ def dijagnostika_ukljucena(st) -> bool:
         return False
 
 
-def prikazi_pomoc(st, sheet, test, zadaci, ucenik_id: str) -> None:
+def prikazi_pomoc(st, sheet, test, zadaci, ucenik_id: str, dry_run: bool = False) -> None:
     """Blok „💡 Pomoć pri učenju" unutar rješavanja testa.
 
     Ništa ovdje ne smije srušiti test — sve greške se pretvaraju u kratku poruku.
@@ -335,10 +335,12 @@ def prikazi_pomoc(st, sheet, test, zadaci, ucenik_id: str) -> None:
         return
 
     test_id = _tekst(test.get("test_id"))
-    try:
-        log = load_log(sheet)
-    except Exception:                                   # noqa: BLE001
-        log = []
+    log = []
+    if not dry_run:                                     # 👁️ pregled ne čita ni ne piše log
+        try:
+            log = load_log(sheet)
+        except Exception:                               # noqa: BLE001
+            log = []
     iskoristeno = broj_pitanja(log, test_id, ucenik_id)
     ostalo = max(0, MAX_PITANJA - iskoristeno)
 
@@ -372,15 +374,16 @@ def prikazi_pomoc(st, sheet, test, zadaci, ucenik_id: str) -> None:
             filtrirano = izgleda_kao_rjesenje(odgovor, kljuc_iz_testa(zadatak))
             prikaz = GENERICKI if filtrirano else odgovor
 
-            try:
-                upisi_pitanje(
-                    sheet, test_id=test_id, ucenik_id=ucenik_id,
-                    zadatak_id=_tekst(zadatak.get("id")),
-                    zadatak=_tekst(zadatak.get("tekst")), razina=razina,
-                    pitanje=pitanje or f"{razina} (bez teksta)",
-                    odgovor=prikaz, filtrirano=filtrirano, model=MODEL)
-            except Exception:                           # noqa: BLE001 — log ne smije blokirati
-                pass
+            if not dry_run:                             # 👁️ pregled ne piše u AI log
+                try:
+                    upisi_pitanje(
+                        sheet, test_id=test_id, ucenik_id=ucenik_id,
+                        zadatak_id=_tekst(zadatak.get("id")),
+                        zadatak=_tekst(zadatak.get("tekst")), razina=razina,
+                        pitanje=pitanje or f"{razina} (bez teksta)",
+                        odgovor=prikaz, filtrirano=filtrirano, model=MODEL)
+                except Exception:                       # noqa: BLE001 — log ne smije blokirati
+                    pass
 
             st.session_state[f"pom_odg_{test_id}"] = prikaz
             st.rerun()

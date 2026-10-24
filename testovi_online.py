@@ -116,6 +116,22 @@ def sa_info_za_testove(st) -> dict:
 # Pomoćno
 # ============================================================
 
+def prikazi_pregled(st, test, ucenik=None, sada=None) -> None:
+    """👁️ IDENTIČAN pregled onoga što vidi učenik — za Cakija, prije objave (24.10.2026.).
+
+    Renderira **isti kod** kao rješavanje (`_prikazi_rjesavanje`): zadatke, slike, matematički unos
+    (MathLive), formule i 💡 pomoć. Razlika je samo u tome što se **ništa ne sprema** — nema
+    `Test_pocetak`, nema `Rezultati_testova`, nema zapisa u AI log.
+
+    `test_id` se u pregledu prefiksira (`PREGLED-…`) da se ključevi widgeta i AI log ne miješaju
+    sa stvarnim rješavanjem u istoj sesiji.
+    """
+    sada = (sada or datetime.now()).replace(tzinfo=None)
+    test = dict(test or {})
+    test["test_id"] = "PREGLED-" + _tekst(test.get("test_id"))
+    _prikazi_rjesavanje(st, None, test, ucenik or {"ime_djeteta": "Pretpregled"},
+                        "PREGLED", sada, dry_run=True)
+
 def _tekst(vrijednost) -> str:
     return str(vrijednost or "").strip()
 
@@ -865,7 +881,9 @@ def _prikazi_sliku_zadatka(st, naziv) -> bool:
         return False
 
 
-def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
+def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada,
+                         dry_run: bool = False) -> None:
+    """Ekran rješavanja. `dry_run=True` = 👁️ pretpregled za Cakija (ništa se ne sprema)."""
     zadaci = zadaci_iz_retka(test)
     test_id = _tekst(test.get("test_id"))
     trajanje = int(float(_tekst(test.get("trajanje_min")) or 45))
@@ -880,13 +898,17 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
 
     # 21.10.2026.: početak testa se pamti u Sheetu (tab Test_pocetak), ne samo u sesiji —
     # tako rok preživi osvježavanje stranice (F5), novi tab i prekid interneta.
-    pocetak = _pocetak_testa(st, sheet, test_id, ucenik_id, sada)
+    # 👁️ Pretpregled (24.10.2026.): ne piše `Test_pocetak` — vrijeme kreće sada.
+    pocetak = sada if dry_run else _pocetak_testa(st, sheet, test_id, ucenik_id, sada)
 
     rok = pocetak + timedelta(minutes=trajanje)
 
     st.markdown(f"### 📝 {_tekst(test.get('naziv'))}")
     st.caption(f"{len(zadaci)} zadataka · {_tekst(test.get('bodovi_ukupno'))} bodova · "
                f"vrijeme: {trajanje} minuta")
+    if dry_run:
+        st.info("👁️ **Pretpregled** — ovo je točno ono što učenik vidi. Ništa se ne "
+                "sprema: ni početak, ni odgovori, ni pomoć.")
     if sada > rok:
         st.error(f"⏰ Vrijeme je isteklo u {rok:%H:%M}. Odgovori se i dalje mogu predati, ali će "
                  f"rezultat biti označen kao predan po isteku vremena.")
@@ -980,6 +1002,12 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada) -> None:
         st.session_state.pop("_online_test_id", None)
         st.session_state.pop("_online_test_pocetak", None)
         st.rerun()
+
+    if predaj and dry_run:
+        _b, _m, _d = ocjeni(zadaci, odgovori)
+        st.success(f"🧪 Pretpregled: **{_b:g} / {_m:g}** bodova. Ništa nije spremljeno — učenik "
+                   f"bi ovdje vidio svoj rezultat i pregled rješenja.")
+        return
 
     if predaj:
         # 21.10.2026.: zaštita od dvostrukog upisa (dva klika, dva taba, dva uređaja).
