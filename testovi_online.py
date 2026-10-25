@@ -41,6 +41,8 @@ REZ_HEADERS = [
     "rezultat_id", "test_id", "naziv_testa", "ucenik_id", "ime_djeteta",
     "bodovi", "bodovi_max", "postotak", "odgovori_json", "detalji_json",
     "vrijeme_pocetka", "vrijeme_predaje", "trajanje_s", "status", "kreirano",
+    # 25.10.2026. — ručna provjera ocjena (dodano na kraj, stare knjige ostaju čitljive)
+    "provjera", "provjerio", "provjereno",
 ]
 
 STATUS_PREDANO = "Predano"
@@ -593,16 +595,27 @@ def ocjeni(zadaci, odgovori) -> tuple[float, float, list]:
         m = _broj(z.get("bodovi"))
         maks += m
         odgovor = _tekst((odgovori or {}).get(i))
-        tocno = je_tocan(z, odgovor)
-        b = m if tocno else 0.0
+        ocekivano = _tekst(z.get("odgovor"))
+        # 25.10.2026.: status "ceka" = traži Cakijevu provjeru (nema ključa ili je postupak)
+        if not odgovor:
+            status, b = "prazno", 0.0
+        elif not ocekivano:
+            status, b = "ceka", 0.0
+        elif je_tocan(z, odgovor):
+            status, b = "tocno", m
+        elif _tekst(z.get("tip")) == "prosireni_odgovor":
+            status, b = "ceka", 0.0
+        else:
+            status, b = "netocno", 0.0
         bodovi += b
         detalji.append({
             "id": _tekst(z.get("id")),
-            "tocno": tocno,
+            "tocno": status == "tocno",
+            "status": status,
             "bodovi": round(b, 2),
             "max": round(m, 2),
             "odgovor": odgovor,
-            "ocekivano": _tekst(z.get("odgovor")),
+            "ocekivano": ocekivano,
         })
     return round(bodovi, 2), round(maks, 2), detalji
 
@@ -650,7 +663,10 @@ def spremi_rezultat(sheet, *, test, ucenik_id: str, ime_djeteta: str, bodovi: fl
         "status": status,
         "kreirano": predaja.strftime("%Y-%m-%d %H:%M"),
     }
-    ws.append_row([redak[h] for h in REZ_HEADERS], value_input_option="RAW")
+    redak["provjera"] = "ceka" if any(d.get("status") == "ceka" for d in detalji) else ""
+    redak.setdefault("provjerio", "")
+    redak.setdefault("provjereno", "")
+    ws.append_row([redak.get(h, "") for h in REZ_HEADERS], value_input_option="RAW")
     return redak
 
 
@@ -743,6 +759,7 @@ def pregled_rjesenja(test, rezultat) -> list:
             "tvoj": _opis_odgovora(z, d.get("odgovor")),
             "tocan": _opis_odgovora(z, d.get("ocekivano") or z.get("odgovor")),
             "tocno": bool(d.get("tocno")),
+            "status": _tekst(d.get("status")),
             "bodovi": _broj(d.get("bodovi"), 0.0),
             "max": _broj(d.get("max"), _broj(z.get("bodovi"), 0.0)),
         })
@@ -764,7 +781,8 @@ def tabela_pregleda(test, rezultat):
         "Tvoj odgovor": r["tvoj"] or "— nije odgovoreno —",
         "Točno rješenje": r["tocan"] or "—",
         "Bodovi": f"{r['bodovi']:g} / {r['max']:g}",
-        "✓": "✅" if r["tocno"] else "❌",
+        # 25.10.2026.: "ceka" = još nije pregledano (ne prikazujemo ❌ prije Cakijeve provjere)
+        "✓": "✅" if r.get("status") == "tocno" else ("⏳" if r.get("status") == "ceka" else "❌"),
     } for r in redci])
 
 
