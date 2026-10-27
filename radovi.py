@@ -95,6 +95,24 @@ def _sa_info(st):
     return None
 
 
+def _razlog_greske(r) -> str:
+    """Dodatni opis Google greške iz odgovora (26.10.2026.) - npr. ' - storageQuotaExceeded:
+    Service Accounts do not have storage quota.' Bez ovoga je poruka samo broj (npr. 'Drive je
+    vratio 403.'), što ne govori je li uzrok prava, kvota ili nešto treće - Caki onda ne može
+    sam provjeriti ništa, mora pitati nas. Pokušava JSON ({"error": {"message", "errors": [...]}}),
+    inače vraća skraćeni sirovi tekst odgovora."""
+    try:
+        greska = (r.json() or {}).get("error") or {}
+        razlog = _tekst((greska.get("errors") or [{}])[0].get("reason"))
+        poruka = _tekst(greska.get("message")).rstrip(".")
+        if razlog or poruka:
+            return " - " + ": ".join(x for x in (razlog, poruka) if x)
+    except Exception:                                   # noqa: BLE001 - odgovor nije JSON
+        pass
+    tekst = _tekst(getattr(r, "text", ""))
+    return f" ({tekst[:200]})" if tekst else ""
+
+
 def predaj_na_drive(st, naziv: str, sadrzaj: bytes, folder: str = "", transport=None) -> dict:
     """Jedan upload na Drive (multipart). Vraća {'file_id', 'link'} ili baca RuntimeError."""
     folder = folder or folder_id(st)
@@ -124,7 +142,7 @@ def predaj_na_drive(st, naziv: str, sadrzaj: bytes, folder: str = "", transport=
                  "Content-Type": f"multipart/related; boundary={granica}"},
         data=tijelo, timeout=TIMEOUT_S)
     if r.status_code not in (200, 201):
-        raise RuntimeError(f"Drive je vratio {r.status_code}.")
+        raise RuntimeError(f"Drive je vratio {r.status_code}{_razlog_greske(r)}.")
     try:
         return {"file_id": _tekst(r.json().get("id")), "link": DRIVE_WEB.format(file_id=r.json()["id"])}
     except ValueError as e:
