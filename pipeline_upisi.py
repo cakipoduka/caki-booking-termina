@@ -5336,6 +5336,29 @@ def plan_kalendara(df_grupe, df_raspored_matura=None, df_blokovi=None, df_instru
     return out
 
 
+def razlika_plana(df_plan, plan: list) -> dict:
+    """Koliko se SPREMLJENI tab Kalendar_plan razlikuje od svježe izračunatog plana:
+    {novi, promijenjeni, uklonjeni, ukupno}. Sve nule = tab je u skladu s CRM-om.
+
+    `event_id` i `azurirano` se namjerno NE gledaju — njih piše push, a ne CRM; da ih gledamo,
+    plan bi ispadao "zastario" pri svakom izvršavanju stranice i bez ikakve stvarne promjene
+    (30.10.2026.)."""
+    polja = ("datum", "vrijeme", "ucionica", "naslov", "opis")
+    stari = {}
+    if df_plan is not None and not getattr(df_plan, "empty", True) and "kljuc" in df_plan.columns:
+        for _, r in df_plan.iterrows():
+            k = str(r.get("kljuc", "") or "").strip()
+            if k:
+                stari[k] = tuple(str(r.get(p, "") or "").strip() for p in polja)
+    svjezi = {z["kljuc"]: (z["datum"].isoformat(), z["vrijeme"], z["ucionica"], z["naslov"], z["opis"])
+              for z in (plan or [])}
+    novi = [k for k in svjezi if k not in stari]
+    uklonjeni = [k for k in stari if k not in svjezi]
+    promijenjeni = [k for k in svjezi if k in stari and svjezi[k] != stari[k]]
+    return {"novi": len(novi), "promijenjeni": len(promijenjeni), "uklonjeni": len(uklonjeni),
+            "ukupno": len(novi) + len(promijenjeni) + len(uklonjeni)}
+
+
 def spremi_plan_kalendara(sheet, plan: list) -> dict:
     """Prepiše tab Kalendar_plan. `event_id` postojećih ključeva se ČUVA, da Apps Script ažurira
     isti event umjesto da napravi novi. Vraća {dodano, zadrzano, maknuto}."""
