@@ -572,25 +572,126 @@ def dohvati_ucenika_po_id(df_ucenici: pd.DataFrame, ucenik_id: str):
 # DOLASCI — Termini / Dolasci / Gostovanja / Zamjene log
 # ============================================================
 
-def postavi_tabove_dolasci(sheet):
-    """Kreira Termini, Dolasci, Gostovanja, Zamjene log tabove ako ne postoje. Pokreni jednom ručno."""
-    postojeci = [ws.title for ws in sheet.worksheets()]
+# Zaglavlja tabova na jednom mjestu — koriste ih i postavljanje tabova i popravak pri spremanju.
+TERMINI_HEADERS = ["termin_id", "grupa_id", "datum", "nastavnik_odrzao", "sezona"]
+DOLASCI_HEADERS = ["dolazak_id", "termin_id", "grupa_id", "ucenik_id", "ime_djeteta", "status", "sezona"]
+GOSTOVANJA_HEADERS = ["gostovanje_id", "datum", "ucenik_id", "ime_djeteta", "maticna_grupa",
+                      "grupa_gostovanja", "sezona"]
+ZAMJENE_LOG_HEADERS = ["datum", "grupa_id", "redovni_nastavnik", "zamjena_nastavnik", "razlog", "iznos_obracuna"]
 
-    if "Termini" not in postojeci:
-        ws = sheet.add_worksheet(title="Termini", rows=1000, cols=6)
-        ws.append_row(["termin_id", "grupa_id", "datum", "nastavnik_odrzao", "sezona"])
 
-    if "Dolasci" not in postojeci:
-        ws = sheet.add_worksheet(title="Dolasci", rows=5000, cols=8)
-        ws.append_row(["dolazak_id", "termin_id", "grupa_id", "ucenik_id", "ime_djeteta", "status", "sezona"])
+def _kljuc_stupca(naziv) -> str:
+    """Naziv stupca za usporedbu: bez BOM-a/nevidljivih znakova, bez viška razmaka, malim slovima.
+    Tako ' Status ', 'STATUS' i 'status' vrijede kao isti stupac (31.10.2026.)."""
+    t = unicodedata.normalize("NFKC", str(naziv if naziv is not None else ""))
+    t = t.replace("\ufeff", "").replace("\u200b", "").replace("\xa0", " ")
+    return re.sub(r"\s+", " ", t).strip().lower()
 
-    if "Gostovanja" not in postojeci:
-        ws = sheet.add_worksheet(title="Gostovanja", rows=500, cols=8)
-        ws.append_row(["gostovanje_id", "datum", "ucenik_id", "ime_djeteta", "maticna_grupa", "grupa_gostovanja", "sezona"])
 
-    if "Zamjene log" not in postojeci:
-        ws = sheet.add_worksheet(title="Zamjene log", rows=500, cols=6)
-        ws.append_row(["datum", "grupa_id", "redovni_nastavnik", "zamjena_nastavnik", "razlog", "iznos_obracuna"])
+def _mapa_stupaca(headers) -> dict:
+    """{'status': 6, ...} — naziv stupca → redni broj stupca (1 = A). Kod dvostrukih imena vrijedi prvi."""
+    mapa = {}
+    for i, h in enumerate(headers, start=1):
+        k = _kljuc_stupca(h)
+        if k and k not in mapa:
+            mapa[k] = i
+    return mapa
+
+
+# 10-znakovni id (dolazak_id, termin_id), ISO datum, sezona, status, uuid
+_OZNAKA_PODATKA = re.compile(r"^(?:[a-z0-9]{10}|\d{4}-\d{2}-\d{2}|\d{4}/\d{2}|[012]"
+                             r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+
+
+def _izgleda_kao_podatak(red) -> bool:
+    """Je li red 1 zapis, a ne zaglavlje? (npr. netko je obrisao red zaglavlja pa je podatak došao gore)."""
+    return sum(1 for v in red if _OZNAKA_PODATKA.match(str(v).strip().lower())) >= 2
+
+
+def _osiguraj_sirinu(ws, potrebno: int):
+    """Dodaj stupce u mrežu ako ih je manje nego što zaglavlje traži (Sheets inače odbije upis)."""
+    try:
+        ima = int(getattr(ws, "col_count", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    if ima and ima < potrebno:
+        ws.add_cols(potrebno - ima)
+
+
+def zaglavlje_taba(ws, zadano, popravci: list | None = None):
+    """Vrati (headers, stupac) za tab: popis zaglavlja i {'naziv': redni broj stupca}.
+
+    31.10.2026. — zašto postoji: spremanje dolazaka je pucalo na `dolasci_headers.index("status")`
+    (ValueError: 'status' is not in list) kad tab Dolasci nema zaglavlje ili se stupac zove
+    drugačije. Sada se zaglavlje čita tolerantno (BOM, razmaci, velika/mala slova), a ako nešto
+    fali, POPRAVI se — bez brisanja podataka:
+      1) prazan red 1 (tab bez zaglavlja)      → upiše se cijelo zadano zaglavlje
+      2) red 1 očito nije zaglavlje (obrisano) → zaglavlje se umetne iznad podataka
+      3) fali samo koji stupac                 → doda se na desni kraj zaglavlja
+    Popravci se (ako je predana lista `popravci`) zabilježe kao čitljive poruke za aplikaciju."""
+    zadano = [str(h) for h in zadano]
+    headers = [str(h).strip() for h in ws.row_values(1)]
+    stupac = _mapa_stupaca(headers)
+    kljucevi_zadanog = {_kljuc_stupca(h) for h in zadano}
+    if kljucevi_zadanog <= set(stupac):
+        return headers, stupac
+
+    naslov = str(getattr(ws, "title", "") or "tab")
+    try:
+        if not any(_kljuc_stupca(h) for h in headers):
+            _osiguraj_sirinu(ws, len(zadano))
+            ws.update(range_name="A1", values=[zadano], value_input_option="RAW")
+            headers = list(zadano)
+            poruka = "nije imao zaglavlje — zaglavlje je upisano"
+        elif not (set(stupac) & kljucevi_zadanog) and _izgleda_kao_podatak(headers):
+            _osiguraj_sirinu(ws, len(zadano))
+            ws.insert_row(list(zadano), 1, value_input_option="RAW")
+            headers = list(zadano)
+            poruka = "zaglavlje je bilo obrisano — vraćeno je iznad podataka"
+        else:
+            nove = [h for h in zadano if _kljuc_stupca(h) not in stupac]
+            _osiguraj_sirinu(ws, len(headers) + len(nove))
+            ws.update(range_name=gspread.utils.rowcol_to_a1(1, len(headers) + 1),
+                      values=[nove], value_input_option="RAW")
+            headers = headers + nove
+            poruka = f"dodani stupci koji su falili: {', '.join(nove)}"
+    except Exception as e:  # noqa: BLE001 — Google prava / zaključan Sheet / mreža
+        raise ValueError(
+            f"Tab '{naslov}' nema zaglavlje koje aplikacija treba, a popravak nije uspio ({e}). "
+            "Otvori ⚙️ Postavke → ⚙️ Jednokratno postavljanje → ⚙️ Postavi Dolasci tabove (jednom).") from e
+
+    if popravci is not None:
+        popravci.append(f"{naslov}: {poruka}")
+    return headers, _mapa_stupaca(headers)
+
+
+def _red_po_zaglavlju(headers, vrijednosti: dict) -> list:
+    """Redak poredan po STVARNOM zaglavlju taba (radi i ako je netko promijenio redoslijed stupaca
+    ili velika/mala slova). Vrijednost koje tab nema u zaglavlju se preskače, ostalo ostaje prazno."""
+    kljucevi = {_kljuc_stupca(k): v for k, v in vrijednosti.items()}
+    return [kljucevi.get(_kljuc_stupca(h), "") for h in headers]
+
+
+def postavi_tabove_dolasci(sheet) -> list:
+    """Kreira Termini, Dolasci, Gostovanja, Zamjene log ako ne postoje; postojećima popravi zaglavlje
+    (tab bez zaglavlja, obrisano zaglavlje, stupci koji fale). Sigurno ponoviti — ništa se ne briše.
+    Vraća popis promjena (prazan popis = sve je već bilo u redu)."""
+    promjene = []
+    for naziv, headers, redaka in [
+        ("Termini", TERMINI_HEADERS, 1000),
+        ("Dolasci", DOLASCI_HEADERS, 5000),
+        ("Gostovanja", GOSTOVANJA_HEADERS, 500),
+        ("Zamjene log", ZAMJENE_LOG_HEADERS, 500),
+    ]:
+        try:
+            ws = sheet.worksheet(naziv)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sheet.add_worksheet(title=naziv, rows=redaka, cols=max(len(headers), 8))
+            ws.append_row(list(headers), value_input_option="RAW")
+            promjene.append(f"{naziv}: novi tab")
+            continue
+        zaglavlje_taba(ws, headers, popravci=promjene)      # popravak postojećeg taba
+    return promjene
 
 
 def load_termini(sheet) -> pd.DataFrame:
@@ -609,21 +710,23 @@ def pronadji_ili_kreiraj_termin(sheet, grupa_id: str, datum: str, nastavnik_odrz
     """Vraća termin_id za (grupa_id, datum) - reuse ako već postoji (npr. nastavnik uređuje isti dan),
     inače kreira novi. Ako nastavnik_odrzao != redovni_nastavnik, upisuje u Zamjene log (samo jednom)."""
     ws_termini = sheet.worksheet("Termini")
+    headers, stupac = zaglavlje_taba(ws_termini, TERMINI_HEADERS)      # popravi zaglavlje prije čitanja
     postojeci = ws_termini.get_all_records()
-    headers = ws_termini.row_values(1)
 
     for i, red in enumerate(postojeci, start=2):
         if str(red.get("grupa_id")) == str(grupa_id) and str(red.get("datum")) == str(datum):
             # Termin već postoji — ažuriraj nastavnika ako se promijenio
-            if str(red.get("nastavnik_odrzao")) != str(nastavnik_odrzao):
-                col = headers.index("nastavnik_odrzao") + 1
+            if str(red.get("nastavnik_odrzao")) != str(nastavnik_odrzao) and "nastavnik_odrzao" in stupac:
+                col = stupac["nastavnik_odrzao"]
                 ws_termini.update_cell(i, col, str(nastavnik_odrzao))
                 _mozda_upisi_zamjenu(sheet, grupa_id, datum, redovni_nastavnik, nastavnik_odrzao)
             return red.get("termin_id")
 
     # Novi termin
     termin_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-    ws_termini.append_row([termin_id, str(grupa_id), str(datum), str(nastavnik_odrzao), SEZONA])
+    ws_termini.append_row(_red_po_zaglavlju(headers, {
+        "termin_id": termin_id, "grupa_id": str(grupa_id), "datum": str(datum),
+        "nastavnik_odrzao": str(nastavnik_odrzao), "sezona": SEZONA}), value_input_option="RAW")
 
     if str(nastavnik_odrzao) != str(redovni_nastavnik):
         _mozda_upisi_zamjenu(sheet, grupa_id, datum, redovni_nastavnik, nastavnik_odrzao)
@@ -633,60 +736,70 @@ def pronadji_ili_kreiraj_termin(sheet, grupa_id: str, datum: str, nastavnik_odrz
 
 def _mozda_upisi_zamjenu(sheet, grupa_id, datum, redovni_nastavnik, zamjena_nastavnik):
     ws = sheet.worksheet("Zamjene log")
+    headers, _ = zaglavlje_taba(ws, ZAMJENE_LOG_HEADERS)
     postojeci = ws.get_all_records()
     for red in postojeci:
         if str(red.get("grupa_id")) == str(grupa_id) and str(red.get("datum")) == str(datum):
             return  # već zabilježeno, ne dupliciraj
-    ws.append_row([str(datum), str(grupa_id), str(redovni_nastavnik), str(zamjena_nastavnik), "", ""])
+    ws.append_row(_red_po_zaglavlju(headers, {
+        "datum": str(datum), "grupa_id": str(grupa_id), "redovni_nastavnik": str(redovni_nastavnik),
+        "zamjena_nastavnik": str(zamjena_nastavnik)}), value_input_option="RAW")
 
 
 def spremi_dolazak(sheet, termin_id: str, grupa_id: str, ucenik_id: str, ime_djeteta: str, status: str):
     """Upsert - ako već postoji zapis za (termin_id, ucenik_id), ažurira status umjesto duplog upisa.
     NAPOMENA: koristi spremi_cijeli_termin() za spremanje više učenika odjednom - puno manje API poziva."""
     ws = sheet.worksheet("Dolasci")
+    headers, stupac = zaglavlje_taba(ws, DOLASCI_HEADERS)             # popravi zaglavlje prije čitanja
     postojeci = ws.get_all_records()
-    headers = ws.row_values(1)
 
     for i, red in enumerate(postojeci, start=2):
         if str(red.get("termin_id")) == str(termin_id) and str(red.get("ucenik_id")) == str(ucenik_id):
-            col = headers.index("status") + 1
-            ws.update_cell(i, col, str(status))
+            ws.update_cell(i, stupac["status"], str(status))
             return
 
     dolazak_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-    ws.append_row([dolazak_id, str(termin_id), str(grupa_id), str(ucenik_id), str(ime_djeteta), str(status), SEZONA])
+    ws.append_row(_red_po_zaglavlju(headers, {
+        "dolazak_id": dolazak_id, "termin_id": str(termin_id), "grupa_id": str(grupa_id),
+        "ucenik_id": str(ucenik_id), "ime_djeteta": str(ime_djeteta), "status": str(status),
+        "sezona": SEZONA}), value_input_option="RAW")
 
 
 def spremi_cijeli_termin(sheet, grupa_id, datum, nastavnik_odrzao, redovni_nastavnik, roster_zapisi, gosti_zapisi):
     """Sprema termin + sve dolaske (roster i goste) u minimalnom broju API poziva - jedan Save klik = par poziva, ne desetci.
-    roster_zapisi / gosti_zapisi = liste dictova: {"ucenik_id":..., "ime_djeteta":..., "status":..., "maticna_grupa": (samo gosti)}"""
+    roster_zapisi / gosti_zapisi = liste dictova: {"ucenik_id":..., "ime_djeteta":..., "status":..., "maticna_grupa": (samo gosti)}
+
+    31.10.2026.: zaglavlja se čitaju preko zaglavlje_taba() — tab bez zaglavlja (ili sa 'Status' umjesto
+    'status') više ne ruši spremanje greškom ValueError: 'status' is not in list. Zaglavlje se popravi,
+    a redak se slaže po STVARNOM zaglavlju taba (ne po pretpostavljenom redoslijedu stupaca)."""
 
     # --- 1) Termin: jedan get_all_records + jedan append/update ---
     ws_termini = sheet.worksheet("Termini")
+    termini_headers, termini_stupac = zaglavlje_taba(ws_termini, TERMINI_HEADERS)
     termini_postojeci = ws_termini.get_all_records()
-    termini_headers = ws_termini.row_values(1)
 
     termin_id = None
     for i, red in enumerate(termini_postojeci, start=2):
         if str(red.get("grupa_id")) == str(grupa_id) and str(red.get("datum")) == str(datum):
             termin_id = red.get("termin_id")
-            if str(red.get("nastavnik_odrzao")) != str(nastavnik_odrzao):
-                col = termini_headers.index("nastavnik_odrzao") + 1
-                ws_termini.update_cell(i, col, str(nastavnik_odrzao))
+            if str(red.get("nastavnik_odrzao")) != str(nastavnik_odrzao) and "nastavnik_odrzao" in termini_stupac:
+                ws_termini.update_cell(i, termini_stupac["nastavnik_odrzao"], str(nastavnik_odrzao))
             break
 
     if termin_id is None:
         termin_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-        ws_termini.append_row([termin_id, str(grupa_id), str(datum), str(nastavnik_odrzao), SEZONA])
+        ws_termini.append_row(_red_po_zaglavlju(termini_headers, {
+            "termin_id": termin_id, "grupa_id": str(grupa_id), "datum": str(datum),
+            "nastavnik_odrzao": str(nastavnik_odrzao), "sezona": SEZONA}), value_input_option="RAW")
 
     if str(nastavnik_odrzao) != str(redovni_nastavnik):
         _mozda_upisi_zamjenu(sheet, grupa_id, datum, redovni_nastavnik, nastavnik_odrzao)
 
     # --- 2) Dolasci: jedan get_all_records, pa batch update + batch append ---
     ws_dolasci = sheet.worksheet("Dolasci")
+    dolasci_headers, dolasci_stupac = zaglavlje_taba(ws_dolasci, DOLASCI_HEADERS)
     dolasci_postojeci = ws_dolasci.get_all_records()
-    dolasci_headers = ws_dolasci.row_values(1)
-    col_status = dolasci_headers.index("status") + 1
+    col_status = dolasci_stupac["status"]
 
     postojeci_lookup = {}
     for i, red in enumerate(dolasci_postojeci, start=2):
@@ -707,7 +820,10 @@ def spremi_cijeli_termin(sheet, grupa_id, datum, nastavnik_odrzao, redovni_nasta
             })
         else:
             dolazak_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-            novi_redovi.append([dolazak_id, str(termin_id), str(grupa_id), uid, str(z["ime_djeteta"]), str(z["status"]), SEZONA])
+            novi_redovi.append(_red_po_zaglavlju(dolasci_headers, {
+                "dolazak_id": dolazak_id, "termin_id": str(termin_id), "grupa_id": str(grupa_id),
+                "ucenik_id": uid, "ime_djeteta": str(z["ime_djeteta"]), "status": str(z["status"]),
+                "sezona": SEZONA}))
 
     if batch_update_podaci:
         ws_dolasci.batch_update(batch_update_podaci)
@@ -717,6 +833,7 @@ def spremi_cijeli_termin(sheet, grupa_id, datum, nastavnik_odrzao, redovni_nasta
     # --- 3) Gostovanja: jedan get_all_records, pa batch append (samo novi) ---
     if gosti_zapisi:
         ws_gost = sheet.worksheet("Gostovanja")
+        gost_headers, _ = zaglavlje_taba(ws_gost, GOSTOVANJA_HEADERS)
         gost_postojeci = ws_gost.get_all_records()
         gost_postojeci_set = {
             (str(r.get("datum")), str(r.get("ucenik_id")), str(r.get("grupa_gostovanja")))
@@ -727,10 +844,10 @@ def spremi_cijeli_termin(sheet, grupa_id, datum, nastavnik_odrzao, redovni_nasta
             kljuc = (str(datum), str(z["ucenik_id"]), str(grupa_id))
             if kljuc not in gost_postojeci_set:
                 gostovanje_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-                novi_gosti.append([
-                    gostovanje_id, str(datum), str(z["ucenik_id"]), str(z["ime_djeteta"]),
-                    str(z["maticna_grupa"]), str(grupa_id), SEZONA
-                ])
+                novi_gosti.append(_red_po_zaglavlju(gost_headers, {
+                    "gostovanje_id": gostovanje_id, "datum": str(datum), "ucenik_id": str(z["ucenik_id"]),
+                    "ime_djeteta": str(z["ime_djeteta"]), "maticna_grupa": str(z["maticna_grupa"]),
+                    "grupa_gostovanja": str(grupa_id), "sezona": SEZONA}))
         if novi_gosti:
             ws_gost.append_rows(novi_gosti)
 
