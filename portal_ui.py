@@ -34,6 +34,7 @@ from pipeline_upisi import (
     portal_paketi,
     PAKETI_TAB,
     portal_naplata,
+    portal_uplate,
     portal_raspored_grupa,
     portal_raspored_matura,
     naziv_taba_rasporeda_mature,
@@ -376,7 +377,13 @@ def prikazi_portal():
     raspored = portal_raspored_grupa(df_rez, df_grupe, ucenik_id)
     raspored_matura = portal_raspored_matura(_ucitaj(naziv_taba_rasporeda_mature()), ucenik_id)   # 26.9.2026.
     tablica_dol, postotci = portal_dolasci(_ucitaj("Dolasci"), _ucitaj("Termini"), df_grupe, ucenik_id)
-    dokumenti, dug = portal_naplata(df_racuni, ucenik_id)
+    # 31.10.2026.: uplate po ponudi (npr. gotovina, dio ili sve) — ako taba još nema, prazno
+    try:
+        df_uplate = _ucitaj("Uplate")
+    except Exception:
+        df_uplate = pd.DataFrame()
+    dokumenti, dug = portal_naplata(df_racuni, ucenik_id, df_uplate)
+    uplate_tbl = portal_uplate(df_uplate, df_racuni, ucenik_id)
 
     # --- Online testovi (19.10.2026.): kratice iz Test Buildera; ako tabovi ne postoje, portal radi kao prije ---
     try:
@@ -532,8 +539,15 @@ def prikazi_portal():
                 st.success("Sve poslane ponude su plaćene. Hvala!")
             st.dataframe(dokumenti, hide_index=True, width="stretch", column_config={
                 "Iznos (€)": st.column_config.NumberColumn(format="%.2f"),
+                "Uplaćeno (€)": st.column_config.NumberColumn(format="%.2f"),
+                "Preostalo (€)": st.column_config.NumberColumn(format="%.2f"),
                 "Dokument": st.column_config.LinkColumn(display_text="PDF"),
             })
+            if not uplate_tbl.empty:
+                st.markdown("**Evidentirane uplate**")
+                st.dataframe(uplate_tbl, hide_index=True, width="stretch", column_config={
+                    "Iznos (€)": st.column_config.NumberColumn(format="%.2f"),
+                })
 
     with kartice["🙋 Moji podaci"]:
         # 21.10.2026. (Cakijev zahtjev): učenik/roditelj sam dopuni školu, razred i fakultet.

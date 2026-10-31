@@ -2504,10 +2504,14 @@ def zatrazi_brisanje(sheet, dokumenti: list, razlog: str = "", termini: str = "o
     svjezi_statusi = ws.col_values(headers.index("status") + 1)  # svježe, ne iz cachea
     rez = {"za_brisanje": 0, "otkazano": 0, "preskoceno": []}
     instrukcije_ids = []
+    df_upl = _load_opcionalno(sheet, UPLATE_TAB)   # 31.10.2026.: ponuda s uplatom se ne briše
     for d in dokumenti:
         row = int(d["_row"])
         status = svjezi_statusi[row - 1] if row - 1 < len(svjezi_statusi) else ""
         oznaka = f"{d.get('ime_djeteta', '')} {d.get('broj_dokumenta') or d.get('dokument_id')}".strip()
+        if uplaceno_centi(df_upl, d.get("dokument_id", "")) > 0:
+            rez["preskoceno"].append(f"{oznaka}: već ima evidentiranu uplatu — ostaje (povrat novca riješite ručno).")
+            continue
         if status == "Plaćeno":
             rez["preskoceno"].append(f"{oznaka}: već plaćeno — ostaje (povrat novca riješite ručno).")
             continue
@@ -2543,8 +2547,9 @@ def ispravi_dokument(sheet, df_racuni: pd.DataFrame, red) -> tuple:
     s istim stavkama, subjektom, načinom uplate i napomenom — admin je ispravi i pošalje.
     Vraća (novi_dokument_id, rezultat zatrazi_brisanje)."""
     grupa = dokumenti_grupe(df_racuni, red).copy()
-    if (grupa["status"] == "Plaćeno").any():
-        raise ValueError("Dio ove ponude (neka rata) je već plaćen — ispravak nije moguć. "
+    df_upl = _load_opcionalno(sheet, UPLATE_TAB)   # 31.10.2026.
+    if (grupa["status"] == "Plaćeno").any() or any(uplaceno_centi(df_upl, d) for d in grupa["dokument_id"]):
+        raise ValueError("Dio ove ponude (neka rata) je već plaćen ili ima uplatu — ispravak nije moguć. "
                          "Obrišite samo neplaćene rate i napravite novu ponudu ručno.")
     if (grupa["status"] == "Šalje se…").any():
         raise ValueError("Ponuda se upravo šalje u Solo — pokušajte ponovno za 5 minuta.")
@@ -2840,11 +2845,14 @@ def prikazi_datum(v) -> str:
     return "" if v is None or (isinstance(v, float) and math.isnan(v)) else str(v)
 
 
-def dug_ucenika(df_racuni: pd.DataFrame, ucenik_id: str) -> int:
-    """§24.4: dug = zbroj iznosa dokumenata u statusu Poslano ili Isteklo (centi)."""
+def dug_ucenika(df_racuni: pd.DataFrame, ucenik_id: str, df_uplate=None) -> int:
+    """§24.4: dug = zbroj iznosa dokumenata u statusu Poslano ili Isteklo (centi).
+    31.10.2026.: uz df_uplate (tab Uplate) oduzimaju se djelomične uplate (npr. gotovina)."""
     if df_racuni.empty:
         return 0
     df = df_racuni[(df_racuni["ucenik_id"] == ucenik_id) & (df_racuni["status"].isin(["Poslano", "Isteklo"]))]
+    if df_uplate is not None and not getattr(df_uplate, "empty", True):
+        return sum(preostalo_centi(r, df_uplate) for _, r in df.iterrows())
     return sum(u_cente(v) or 0 for v in df["iznos_ukupno"])
 
 
@@ -2994,8 +3002,9 @@ def portal_gotovina(df_prijave: pd.DataFrame, ucenik_id: str, sezona: str = SEZO
     return sorted(out, key=lambda x: (x["program"], x["opis"]))
 
 
-def portal_naplata(df_racuni: pd.DataFrame, ucenik_id: str):
-    """§24.4: (tablica poslanih dokumenata, dug u centima). Nacrti/odobreni/greške/otkazani se NE prikazuju."""
+def portal_naplata(df_racuni: pd.DataFrame, ucenik_id: str, df_uplate=None):
+    """§24.4: (tablica poslanih dokumenata, dug u centima). Nacrti/odobreni/greške/otkazani se NE prikazuju.
+    31.10.2026.: uz df_uplate još stupci Uplaćeno / Preostalo i status „🟠 Djelomično plaćeno”."""
     if df_racuni.empty or "status" not in df_racuni.columns:
         return pd.DataFrame(), 0
     r = df_racuni[(df_racuni["ucenik_id"] == ucenik_id) & (df_racuni["status"].isin(list(_PORTAL_STATUS_DOKUMENTA)))]
@@ -3022,7 +3031,154 @@ def portal_naplata(df_racuni: pd.DataFrame, ucenik_id: str):
         "Status": r["status"].map(_PORTAL_STATUS_DOKUMENTA),
         "Dokument": r["link_pdf"] if "link_pdf" in r.columns else "",
     })
-    return out.reset_index(drop=True), dug_ucenika(r, ucenik_id)   # dug samo od prikazanih dokumenata
+    if df_uplate is not None and not getattr(df_uplate, "empty", True):
+        uplaceno = [uplaceno_centi(df_uplate, d) for d in r["dokument_id"]]
+        if any(uplaceno):
+            preostalo = [0 if st_ == "Plaćeno" else max((u_cente(i) or 0) - u_, 0)
+                         for st_, i, u_ in zip(r["status"], r["iznos_ukupno"], uplaceno)]
+            out.insert(3, "Uplaćeno (€)", [u_ / 100 for u_ in uplaceno])
+            out.insert(4, "Preostalo (€)", [p_ / 100 for p_ in preostalo])
+            out["Status"] = [("🟠 Djelomično plaćeno" if st_ in ("Poslano", "Isteklo") and u_ > 0 else txt)
+                             for st_, u_, txt in zip(r["status"], uplaceno, out["Status"])]
+    return out.reset_index(drop=True), dug_ucenika(r, ucenik_id, df_uplate)   # dug samo od prikazanih dokumenata
+
+
+# ============================================================
+# 💵 UPLATE PO PONUDI — djelomične i cijele, npr. GOTOVINA (31.10.2026.)
+# ============================================================
+# Tab "Uplate": jedan redak = jedna uplata za jednu poslanu ponudu (dokument iz Racuni_i_ponude).
+# Ponuda ostaje "Poslano" dok nije cijela plaćena; kad zbroj uplata dosegne iznos ponude → "Plaćeno".
+# Račun se NE izdaje automatski (CRM ne izdaje račune — Caki ga izdaje ručno u Solu). Svaka uplata
+# GOTOVINOM bez upisanog broja računa stoji na popisu "💵 račun još nije izdan" dok se broj ne upiše.
+# Portal Moj CAKI vidi: datum, iznos, način (💵 Gotovina) i preostali dug — NIKAD internu napomenu.
+UPLATE_TAB = "Uplate"
+UPLATE_HEADERS = ["uplata_id", "dokument_id", "ucenik_id", "datum_uplate", "iznos", "nacin",
+                  "broj_racuna", "unio", "vrijeme_unosa", "napomena_interna"]
+NACINI_UPLATE_PONUDE = ["Gotovina", "Uplata na račun"]   # (NACINI_UPLATE je Solo šifrarnik)
+NACIN_GOTOVINA = "Gotovina"
+
+
+def load_uplate(sheet) -> pd.DataFrame:
+    """Tab Uplate (ako ga još nema → prazan DataFrame s pravim stupcima)."""
+    df = _load_opcionalno(sheet, UPLATE_TAB)
+    if df.empty:
+        return pd.DataFrame(columns=UPLATE_HEADERS + ["_row"])
+    for h in UPLATE_HEADERS:
+        if h not in df.columns:
+            df[h] = ""
+    return df
+
+
+def _ws_uplate(sheet):
+    try:
+        ws = sheet.worksheet(UPLATE_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=UPLATE_TAB, rows=500, cols=len(UPLATE_HEADERS))
+        ws.append_row(UPLATE_HEADERS)
+        return ws, list(UPLATE_HEADERS)
+    headers = ws.row_values(1)
+    nedostaju = [h for h in UPLATE_HEADERS if h not in headers]
+    if nedostaju:
+        if ws.col_count < len(headers) + len(nedostaju):
+            ws.add_cols(len(headers) + len(nedostaju) - ws.col_count)
+        ws.update(range_name=gspread.utils.rowcol_to_a1(1, len(headers) + 1), values=[nedostaju],
+                  value_input_option="RAW")
+        headers = headers + nedostaju
+    return ws, headers
+
+
+def uplate_dokumenta(df_uplate, dokument_id: str) -> pd.DataFrame:
+    if df_uplate is None or getattr(df_uplate, "empty", True) or "dokument_id" not in df_uplate.columns:
+        return pd.DataFrame(columns=UPLATE_HEADERS)
+    return df_uplate[df_uplate["dokument_id"].astype(str) == str(dokument_id)]
+
+
+def uplaceno_centi(df_uplate, dokument_id: str) -> int:
+    return sum(u_cente(v) or 0 for v in uplate_dokumenta(df_uplate, dokument_id)["iznos"])
+
+
+def preostalo_centi(red, df_uplate) -> int:
+    """Iznos ponude − već uplaćeno (nikad ispod 0)."""
+    return max((u_cente(red.get("iznos_ukupno")) or 0) - uplaceno_centi(df_uplate, red.get("dokument_id", "")), 0)
+
+
+def dodaj_uplatu(sheet, red: dict, iznos_centi: int, datum_uplate, nacin: str = NACIN_GOTOVINA,
+                 unio: str = "", napomena: str = "", df_uplate=None) -> dict:
+    """Evidentira uplatu za POSLANU ponudu (Poslano/Isteklo). Dio ili sve; ne smije prijeći preostali iznos.
+    Kad je ponuda cijela plaćena → status Plaćeno (isto kao gumb 💶 Označi plaćeno).
+    U Solo se NIŠTA ne šalje. Vraća {"uplata_id", "preostalo_centi", "placeno_sve"}."""
+    if str(red.get("status", "")) not in ("Poslano", "Isteklo"):
+        raise ValueError("Uplata se evidentira samo za poslanu ponudu (status Poslano ili Isteklo).")
+    if nacin not in NACINI_UPLATE_PONUDE:
+        raise ValueError(f"Nepoznat način uplate '{nacin}'.")
+    iznos_centi = int(iznos_centi or 0)
+    if iznos_centi <= 0:
+        raise ValueError("Iznos uplate mora biti veći od 0.")
+    if df_uplate is None:
+        df_uplate = load_uplate(sheet)
+    preostalo = preostalo_centi(red, df_uplate)
+    if iznos_centi > preostalo:
+        raise ValueError(f"Iznos ({centi_u_tekst(iznos_centi)} €) je veći od preostalog duga "
+                         f"({centi_u_tekst(preostalo)} €) za ovu ponudu.")
+    datum_txt = datum_uplate.strftime("%Y-%m-%d") if hasattr(datum_uplate, "strftime") else str(datum_uplate)[:10]
+    ws, headers = _ws_uplate(sheet)
+    uid = "U-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    _dodaj_red_po_nazivu(ws, {
+        "uplata_id": uid, "dokument_id": red.get("dokument_id", ""), "ucenik_id": red.get("ucenik_id", ""),
+        "datum_uplate": datum_txt, "iznos": iznos_centi / 100, "nacin": nacin, "broj_racuna": "",
+        "unio": str(unio or "")[:60], "vrijeme_unosa": sada_zagreb().strftime("%Y-%m-%d %H:%M:%S"),
+        "napomena_interna": str(napomena or "")[:500]}, headers)
+    ostatak = preostalo - iznos_centi
+    if ostatak == 0:
+        oznaci_dokument_placen(sheet, red)
+    return {"uplata_id": uid, "preostalo_centi": ostatak, "placeno_sve": ostatak == 0}
+
+
+def gotovina_bez_racuna(df_uplate, df_racuni=None) -> pd.DataFrame:
+    """Uplate GOTOVINOM kojima još nije upisan broj računa iz Sola (podsjetnik za admina).
+    Uz df_racuni dodaje ime učenika i broj ponude."""
+    if df_uplate is None or getattr(df_uplate, "empty", True):
+        return pd.DataFrame(columns=UPLATE_HEADERS)
+    u = df_uplate[(df_uplate["nacin"].astype(str) == NACIN_GOTOVINA)
+                  & (df_uplate["broj_racuna"].astype(str).replace("nan", "").str.strip() == "")].copy()
+    if df_racuni is not None and not getattr(df_racuni, "empty", True) and not u.empty:
+        dod = df_racuni.set_index(df_racuni["dokument_id"].astype(str))
+        for stupac in ("ime_djeteta", "broj_dokumenta", "solo_racun"):
+            if stupac in dod.columns:
+                u[stupac] = [dod[stupac].get(str(d), "") for d in u["dokument_id"]]
+    return u.sort_values("datum_uplate") if "datum_uplate" in u.columns else u
+
+
+def upisi_broj_racuna(sheet, uplata_id: str, broj_racuna: str) -> None:
+    """Admin je izdao račun u Solu → upiše njegov broj uz uplatu (podsjetnik nestaje)."""
+    broj = str(broj_racuna or "").strip()
+    if not broj:
+        raise ValueError("Upišite broj računa iz Sola.")
+    ws, headers = _ws_uplate(sheet)
+    df = _load_worksheet_df(ws)
+    red = df[df["uplata_id"].astype(str) == str(uplata_id)] if "uplata_id" in df.columns else df.iloc[0:0]
+    if red.empty:
+        raise ValueError(f"Uplata {uplata_id} nije pronađena.")
+    _azuriraj_polja(ws, int(red.iloc[0]["_row"]), {"broj_racuna": broj[:60]}, headers)
+
+
+def portal_uplate(df_uplate, df_racuni, ucenik_id: str) -> pd.DataFrame:
+    """Moj CAKI → 💶 Plaćanja: evidentirane uplate (datum, iznos, način). Samo za dokumente koje
+    roditelj ionako vidi; bez interne napomene, bez broja računa i bez toga tko je unio."""
+    if df_uplate is None or getattr(df_uplate, "empty", True) or df_racuni is None or df_racuni.empty:
+        return pd.DataFrame()
+    u = df_uplate[df_uplate["ucenik_id"].astype(str) == str(ucenik_id)]
+    vidljivi = df_racuni[(df_racuni["ucenik_id"] == ucenik_id)
+                         & (df_racuni["status"].isin(list(_PORTAL_STATUS_DOKUMENTA)))]
+    u = u[u["dokument_id"].astype(str).isin(vidljivi["dokument_id"].astype(str))]
+    if u.empty:
+        return pd.DataFrame()
+    u = u.sort_values("datum_uplate", ascending=False)
+    return pd.DataFrame({
+        "Datum uplate": [prikazi_datum(v)[:10] for v in u["datum_uplate"]],
+        "Iznos (€)": [(u_cente(v) or 0) / 100 for v in u["iznos"]],
+        "Način": ["💵 Gotovina" if str(n) == NACIN_GOTOVINA else "🏦 Uplata na račun" for n in u["nacin"]],
+    }).reset_index(drop=True)
 
 
 def portal_rezultati(df_rezultati: pd.DataFrame, ucenik_id: str) -> pd.DataFrame:
