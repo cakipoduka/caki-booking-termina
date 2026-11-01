@@ -442,7 +442,7 @@ def prikazi_portal():
         nazivi.append("📅 Odabir termina")
     if online_dostupni or moji_online_rezultati:
         nazivi.append(naziv_testovi)
-    nazivi += ["🗓️ Raspored", "✅ Dolasci", "💶 Plaćanja", "📊 Rezultati"]
+    nazivi += ["🗓️ Raspored", "✅ Dolasci", "💶 Plaćanja"]
     if osvrti:
         nazivi.append("📈 Napredak")
     nazivi.append("🙋 Moji podaci")
@@ -464,6 +464,19 @@ def prikazi_portal():
                 online_testovi.prikazi_testove(
                     st, _init_sheet_testovi(), df_online_testovi, df_online_rezultati, ucenik,
                     ucenik_id, programi_ucenika, sada_zagreb())
+
+            # 📊 Stari rezultati simulacija (prije su bili u zasebnom tabu `Rezultati`)
+            try:
+                _stari = portal_rezultati(_ucitaj("Rezultati"), ucenik_id)
+                if not _stari.empty:
+                    st.divider()
+                    st.markdown("#### 📊 Rezultati simulacija")
+                    st.dataframe(
+                        _stari, hide_index=True, width="stretch",
+                        column_config={"Postotak": st.column_config.ProgressColumn(
+                            min_value=0, max_value=100, format="%d %%")})
+            except Exception:                       # noqa: BLE001
+                pass
 
     if "📅 Odabir termina" in kartice:
         with kartice["📅 Odabir termina"]:
@@ -582,21 +595,13 @@ def prikazi_portal():
             st.info("🎓 Ove godine ste u 4. razredu — javite nam se za pripreme za Maturu ili za "
                     "ispite na fakultetu.")
 
-    with kartice["📊 Rezultati"]:
-        rezultati = portal_rezultati(_ucitaj("Rezultati"), ucenik_id)
-        if rezultati.empty:
-            st.info("Rezultati testova i simulacija prikazivat će se ovdje.")
-        else:
-            st.dataframe(rezultati, hide_index=True, width="stretch",
-                         column_config={"Postotak": st.column_config.ProgressColumn(min_value=0, max_value=100,
-                                                                                   format="%d %%")})
-        # 19.10.2026.: online testovi (odvojen tab Rezultati_testova) — isti popis kao u kartici 📝 Testovi
-        if moji_online_rezultati:
-            st.markdown("#### 📝 Online testovi")
-            st.dataframe(online_testovi.tabela_rezultata(moji_online_rezultati), hide_index=True,
-                         width="stretch",
-                         column_config={"Postotak": st.column_config.ProgressColumn(
-                             min_value=0, max_value=100, format="%d %%")})
+    # 01.11.2026.: tab `📊 Rezultati` uklonjen (duplirao je online testove iz `📝 Testovi`).
+    # Ostaju samo STARI rezultati simulacija — prikazuju se na kraju kartice `📝 Testovi`.
+    _stari_rezultati = None
+    try:
+        _stari_rezultati = portal_rezultati(_ucitaj("Rezultati"), ucenik_id)
+    except Exception:                                   # noqa: BLE001
+        _stari_rezultati = None
 
     if "📈 Napredak" in kartice:
         with kartice["📈 Napredak"]:
