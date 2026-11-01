@@ -1,3 +1,20 @@
+# ============================================================================
+# CAKI tema — kopirati kao:  caki-booking-termina/.streamlit/config.toml
+# Zamjenjuje postojeću datoteku (stara ima 3 retka, samo showSidebarNavigation).
+# ============================================================================
+# Mijenja SAMO izgled (boje, podlogu, font). Ne dira podatke ni logiku.
+# Povratak na staro: Discard u GitHub Desktopu ili git checkout te datoteke.
+#
+# ŠTO TEMA NE MOŽE (radi caki_stil.py): Inter, sjene, zaobljenja, raspored gumba.
+
+[theme]
+primaryColor = "#227AFF"                # CAKI plava
+backgroundColor = "#F5F7FB"             # svijetlo-siva podloga; bijele kartice se izdvajaju
+secondaryBackgroundColor = "#FFFFFF"    # kartice, unosi, sidebar
+textColor = "#273044"                   # Cakijeva osnovna boja teksta
+font = "sans serif"                     # Inter dolazi iz caki_stil.py
+
 [client]
-# Jedan portal (portal_ui.py) — bez izbornika stranica u sidebaru
+# Portal je JEDNA stranica s karticama — bez Streamlitovog izbornika stranica.
+# OVO NE DIRATI: postavka već postoji u staroj datoteci i mora ostati.
 showSidebarNavigation = false

@@ -74,6 +74,7 @@ from obavijesti import (  # 15.10.2026.: kartica 📣 Obavijesti (poruke od Caki
 )
 
 import secrets_json as _sj  # 21.10.2026.: tolerantno čitanje JSON-a iz Secrets
+import caki_stil as stil    # 31.10.2026.: CAKI tema (jedna datoteka, brisanjem se vraća staro)
 KONTAKT = "📞 +385 95 900 5611 · ✉️ info@cakipoduka.com"
 AKTIVNE_REZERVACIJE = ["Rezervirano", "Potvrđeno", "Čekanje"]
 
@@ -342,6 +343,7 @@ def _prikazi_obavijesti(sheet, ucenik, ucenik_id, obavijesti, linkovi, df_koment
 # ------------------------------------------------------------------ portal
 
 def prikazi_portal():
+    stil.primijeni()   # 31.10.2026.: CAKI tema — mora biti prije ijednog elementa
     sheet = _init_sheet()
 
     # 12.10.2026.: veliki brojevi u zaglavlju više se ne režu ("Srijeda 15:0…") — manji font i dopušten prijelom

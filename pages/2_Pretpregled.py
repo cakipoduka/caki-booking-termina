@@ -19,8 +19,10 @@ SECRETS: SHEET_ID, APP_PASSWORD, GOOGLE_SERVICE_ACCOUNT_JSON (ili _TESTOVI), DEE
 import streamlit as st
 
 import testovi_online as _online
+import caki_stil as stil                  # 31.10.2026.: CAKI tema
 
 st.set_page_config(page_title="CAKI — Pretpregled testa", page_icon="👁️", layout="wide")
+stil.primijeni()                          # 31.10.2026.: CAKI tema
 
 
 def _lozinka_pregleda() -> str:
