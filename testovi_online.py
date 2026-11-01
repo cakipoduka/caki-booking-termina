@@ -29,7 +29,13 @@ import json
 import re
 import secrets as _secrets
 import string
+import time
 from datetime import date, datetime, timedelta
+
+# 1.11.2026.: provjera kratkog odgovora preseljena u zajednički modul `provjera_odgovora.py`
+# (skida \mathrm/\text omotače, zna \frac78, \degree, \prime, \cup, jedinice, AI kao drugo mišljenje
+# i status `sumnja` → profesor). Isti bajt je i u `caki-baza-zadataka/` — v. zaglavlje modula.
+import provjera_odgovora as _provjera
 
 TEST_TAB = "Testovi_zakazani"          # piše ga Test Builder (caki-baza-zadataka/testovi_online.py)
 REZ_TAB = "Rezultati_testova"
@@ -418,131 +424,41 @@ def rezultati_ucenika(rezultati, ucenik_id: str) -> list[dict]:
 # ============================================================
 
 def normalizuj(tex) -> str:
-    """LaTeX/tekst u oblik pogodan za usporedbu: bez $, \\left, razmaka, s razlomkom kao (a)/(b)."""
-    t = _tekst(tex)
-    if not t:
-        return ""
-    t = t.replace("$", "")
-    t = t.replace("\\left", "").replace("\\right", "")
-    t = t.replace("\\displaystyle", "")
-    t = re.sub(r"\\[,;!:]", "", t)
-    t = t.replace("~", "")
-    t = t.replace("\\cdot", "*").replace("\\times", "*").replace("\\div", "/")
-    # dulje oznake prvo: \leq prije \le (inače ostane "<=q")
-    t = (t.replace("\\leq", "<=").replace("\\geq", ">=")
-         .replace("\\le", "<=").replace("\\ge", ">="))
-    t = t.replace("\\sqrt", "sqrt").replace("√", "sqrt")
-    t = t.replace("\\pi", "pi")
-    t = t.replace("−", "-").replace("–", "-").replace("—", "-")
-    t = t.replace("{,}", ".")
-    for _ in range(4):   # \frac{a}{b} -> (a)/(b), i ugniježđeno
-        novi = re.sub(r"\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"(\1)/(\2)", t)
-        if novi == t:
-            break
-        t = novi
-    t = re.sub(r"\s+", "", t)
-    return t.rstrip(".").lower()
+    """LaTeX/tekst u oblik pogodan za usporedbu: bez $, \\left, razmaka, s razlomkom kao (a)/(b).
+
+    1.11.2026.: tijelo je u `provjera_odgovora.normalizuj` (isto u oba repoa). Ovdje ostaje ime
+    zbog postojećih poziva i testova; ponašanje je ISTO plus skidanje `\\mathrm{}`/`\\text{}`.
+    """
+    return _provjera.normalizuj(tex)
 
 
 def _bez_varijable(izraz: str) -> str:
     """'x=2' -> '2', 'n:5' -> '5' — učenik često napiše ime nepoznanice."""
-    return re.sub(r"^[a-z]=|^[a-z]:", "", izraz.strip())
+    return _provjera._bez_varijable(izraz)
 
 
 def _kao_broj(izraz: str):
-    s = izraz.strip()
-    # decimalni zarez (hrvatski zapis): "2,5" -> "2.5"; samo kad je cijeli izraz broj/razlomak
-    if "," in s:
-        s = s.replace(",", ".")
-    m = re.fullmatch(r"\(?(-?\d+(?:\.\d+)?)\)?/\(?(-?\d+(?:\.\d+)?)\)?", s)
-    if m:
-        nazivnik = float(m.group(2))
-        return float(m.group(1)) / nazivnik if nazivnik else None
-    try:
-        return float(s)
-    except ValueError:
-        return None
+    return _provjera._kao_broj(izraz)
 
 
 def _vrijednost_izraza(tekst):
-    """Brojevna vrijednost izraza iz odgovora — za EKVIVALENTNE OBLIKE (22.10.2026.).
-
-    Zašto: učenik smije napisati drugi oblik istog rješenja — `2^{12}` = `4096`,
-    `\\sqrt{8}` = `2\\sqrt{2}`, `\\frac{2}{4}` = `0,5`. Stara usporedba to nije znala.
-    Namjerno strogo: pretvaraju se samo poznate LaTeX kratice, a računa se tek ako u izrazu
-    NEMA ničega osim brojki i operatora — inače None (ne znamo, ide dalje u usporedbu).
-    """
-    t = _tekst(tekst)
-    if not t:
-        return None
-    t = t.replace("$", "").replace("\\left", "").replace("\\right", "").replace("\\displaystyle", "")
-    t = re.sub(r"\\[,;!:]", "", t)
-    t = t.replace("\\cdot", "*").replace("\\times", "*").replace("\\div", "/")
-    t = t.replace("\u2212", "-").replace("\u00b7", "*")
-    for _ in range(3):
-        try:
-            novi = re.sub(r"\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"((\1)/(\2))", t)
-        except re.error:
-            return None
-        if novi == t:
-            break
-        t = novi
-    t = re.sub(r"\\sqrt\s*\{([^{}]*)\}", r"((\1)**0.5)", t)
-    t = re.sub(r"\^\{([^{}]*)\}", r"**(\1)", t)
-    t = re.sub(r"\^(\d+)", r"**\1", t)
-    t = t.replace("{,}", ".").replace(",", ".").replace("%", "")
-    t = re.sub(r"(?<=[\d)])\s*\(", "*(", t)          # implicitno množenje: 2(3) -> 2*(3)
-    t = re.sub(r"\)\s*\(", ")*(", t)
-    t = t.replace(" ", "")
-    if not re.fullmatch(r"[0-9+\-*/().]+", t or ""):
-        return None
-    try:
-        return float(eval(t, {"__builtins__": {}}, {}))   # noqa: S307 — samo brojke i operatori
-    except Exception:                                     # noqa: BLE001
-        return None
+    """Brojevna vrijednost izraza — za EKVIVALENTNE OBLIKE (`2^{12}` = `4096`, `\\sqrt{8}` = `2\\sqrt{2}`)."""
+    return _provjera._vrijednost_izraza(tekst)
 
 
 def _alt_kljucevi(kljuc) -> list:
-    """`3|4|5` -> ["3","4","5"] — VIŠE PRIHVAĆENIH RJEŠENJA; inače [kljuc]."""
-    dijelovi = [d.strip() for d in _tekst(kljuc).split("|") if d.strip()]
-    return dijelovi if len(dijelovi) > 1 else [_tekst(kljuc)]
+    """`3|4|5` -> ["3","4","5"], `65°50' ili 114°10'` -> dva oblika — VIŠE PRIHVAĆENIH RJEŠENJA."""
+    return _provjera._alt_kljucevi(kljuc)
 
 
 def _kratki_tocan_jedan(kljuc, odgovor) -> bool:
-    """Usporedba kratkog odgovora: jednak zapis, jednak broj ili jednak razlomak."""
-    a, b = normalizuj(kljuc), normalizuj(odgovor)
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    va, vb = _bez_varijable(a), _bez_varijable(b)
-    if va == vb:
-        return True
-    # postotak: "50%" i "50"
-    if va.rstrip("%") == vb.rstrip("%"):
-        return True
-    x, y = _kao_broj(va), _kao_broj(vb)
-    if x is not None and y is not None:
-        return abs(x - y) <= 1e-9 * max(1.0, abs(x), abs(y))
-    return False
+    """Usporedba kratkog odgovora za JEDAN oblik ključa (zapis, broj, razlomak, jedinica)."""
+    return _provjera._uporedi_jedan(kljuc, odgovor)[0] == _provjera.STATUS_TOCNO
 
 
 def kratki_tocan(kljuc, odgovor) -> bool:
-    """Kratki odgovor: isto kao prije + (22.10.2026.) VIŠE PRIHVAĆENIH RJEŠENJA (`a|b|c`) i
-    ekvivalentni brojevni oblici (`2^{12}` = `4096`, `\\sqrt{8}` = `2\\sqrt{2}`)."""
-    if not _tekst(odgovor):
-        return False
-    alternative = _alt_kljucevi(kljuc)
-    if any(_kratki_tocan_jedan(alt, odgovor) for alt in alternative):
-        return True
-    y = _vrijednost_izraza(odgovor)
-    if y is None:
-        return False
-    for alt in alternative:
-        x = _vrijednost_izraza(alt)
-        if x is not None and abs(x - y) <= 1e-9 * max(1.0, abs(x), abs(y)):
-            return True
-    return False
+    """Kratki odgovor: više prihvaćenih rješenja (`a|b|c`, `a ili b`) i ekvivalentni brojevni oblici."""
+    return _provjera.tocno(kljuc, odgovor)
 
 
 def _slovo_iz_kljuca(kljuc, opcije) -> str:
@@ -565,20 +481,43 @@ def _slovo_iz_kljuca(kljuc, opcije) -> str:
     return ""
 
 
+def je_tocan_izbor(zadatak, odgovor) -> bool:
+    """Višestruki izbor: uspoređuje se SLOVO (ako ključ nema slovo, tekst odabrane opcije)."""
+    tocno = _slovo_iz_kljuca(zadatak.get("odgovor"), opcije_zadatka(zadatak))
+    if tocno:
+        return _tekst(odgovor).upper()[:1] == tocno
+    opcije = opcije_zadatka(zadatak)
+    slovo = _tekst(odgovor).upper()[:1]
+    if "A" <= slovo <= "Z" and 0 <= ord(slovo) - 65 < len(opcije):
+        return kratki_tocan(zadatak.get("odgovor"), opcije[ord(slovo) - 65])
+    return False
+
+
 def je_tocan(zadatak, odgovor) -> bool:
+    """Brza provjera bez AI-ja (ostaje zbog postojećih poziva i testova)."""
     if not _tekst(odgovor):
         return False
     if _tekst(zadatak.get("tip")) == "visestruki_izbor" and zadatak.get("opcije"):
-        tocno = _slovo_iz_kljuca(zadatak.get("odgovor"), opcije_zadatka(zadatak))
-        if tocno:
-            return _tekst(odgovor).upper()[:1] == tocno
-        # nema slova u ključu — usporedi tekst odabrane opcije
-        opcije = opcije_zadatka(zadatak)
-        slovo = _tekst(odgovor).upper()[:1]
-        if "A" <= slovo <= "Z" and 0 <= ord(slovo) - 65 < len(opcije):
-            return kratki_tocan(zadatak.get("odgovor"), opcije[ord(slovo) - 65])
-        return False
+        return je_tocan_izbor(zadatak, odgovor)
     return kratki_tocan(zadatak.get("odgovor"), odgovor)
+
+
+def je_tocan_detaljno(zadatak, odgovor, *, pozovi=None, dopusti_ai=False) -> dict:
+    """`{"status", "izvor", "zasto"}` za JEDAN zadatak (1.11.2026.).
+
+    `status`: `tocno` · `netocno` · `prazno` · `ceka` (nema ključa) · **`sumnja`** (čeka Cakija).
+    `izvor` kaže KAKO je odlučeno (`zapis`, `broj`, `jedinica`, `ai`, `sumnja`, `slovo`) — to je
+    trag koji Caki vidi u Provjeri rješenja i obrana ako se učenik žali na ocjenu.
+    """
+    odgovor = _tekst(odgovor)
+    if not odgovor:
+        return {"status": "prazno", "izvor": "", "zasto": "nema odgovora"}
+    if _tekst(zadatak.get("tip")) == "visestruki_izbor" and zadatak.get("opcije"):
+        return {"status": "tocno" if je_tocan_izbor(zadatak, odgovor) else "netocno",
+                "izvor": "slovo", "zasto": ""}
+    return _provjera.odluci(zadatak.get("odgovor"), odgovor,
+                            tekst=_tekst(zadatak.get("tekst")),
+                            pozovi=pozovi, dopusti_ai=dopusti_ai)
 
 
 def opcije_zadatka(zadatak) -> list:
@@ -586,27 +525,36 @@ def opcije_zadatka(zadatak) -> list:
     return [o for o in opcije if _tekst(o)]
 
 
-def ocjeni(zadaci, odgovori) -> tuple[float, float, list]:
-    """Vraća (bodovi, bodovi_max, detalji). `odgovori` je dict {redni_broj: odgovor}."""
+def ocjeni(zadaci, odgovori, *, pozovi=None, dopusti_ai: bool = False, max_ai: int = 4,
+           budzet_s: float = 20.0) -> tuple[float, float, list]:
+    """Vraća (bodovi, bodovi_max, detalji). `odgovori` je dict {redni_broj: odgovor}.
+
+    1.11.2026. (Cakijev nalaz — `\\mathrm{8.8605}` prema `8.8605`): statusi su `tocno`,
+    `netocno`, `prazno`, `ceka` i **`sumnja`**. `sumnja` NIJE nula — zadatak čeka Cakijevu
+    odluku u 🧑‍🏫 Provjeri rješenja. AI se zove samo za odgovore koji su „blizu"
+    (`provjera_odgovora.blizu`), najviše `max_ai` puta i ukupno najviše `budzet_s` sekundi:
+    predaja testa ne smije visjeti zbog mreže, a bez AI-ja sve „blizu" ide profesoru.
+    """
     bodovi = 0.0
     maks = 0.0
     detalji = []
+    kreni = time.monotonic()
+    ai_pozvan = 0
     for i, z in enumerate(zadaci or []):
         m = _broj(z.get("bodovi"))
         maks += m
         odgovor = _tekst((odgovori or {}).get(i))
         ocekivano = _tekst(z.get("odgovor"))
-        # 25.10.2026.: status "ceka" = traži Cakijevu provjeru (nema ključa ili je postupak)
-        if not odgovor:
-            status, b = "prazno", 0.0
-        elif not ocekivano:
-            status, b = "ceka", 0.0
-        elif je_tocan(z, odgovor):
-            status, b = "tocno", m
-        elif _tekst(z.get("tip")) == "prosireni_odgovor":
-            status, b = "ceka", 0.0
-        else:
-            status, b = "netocno", 0.0
+        smije_ai = bool(dopusti_ai and pozovi and ai_pozvan < max_ai
+                        and (time.monotonic() - kreni) < budzet_s)
+        if smije_ai and _provjera.blizu(ocekivano, odgovor):
+            ai_pozvan += 1
+        rez = je_tocan_detaljno(z, odgovor, pozovi=pozovi, dopusti_ai=smije_ai)
+        status = rez["status"]
+        # 25.10.2026.: "ceka" = postupak se ne ocjenjuje automatski (nema ključa ili je prosireni)
+        if status == "netocno" and _tekst(z.get("tip")) == "prosireni_odgovor":
+            status = "ceka"
+        b = m if status == "tocno" else 0.0
         bodovi += b
         detalji.append({
             "id": _tekst(z.get("id")),
@@ -616,8 +564,28 @@ def ocjeni(zadaci, odgovori) -> tuple[float, float, list]:
             "max": round(m, 2),
             "odgovor": odgovor,
             "ocekivano": ocekivano,
+            "izvor": rez.get("izvor", ""),
+            "zasto": rez.get("zasto", ""),
         })
     return round(bodovi, 2), round(maks, 2), detalji
+
+
+def _ai_pozivac(st):
+    """`pozovi` za AI provjeru odgovora ili `None` (nema ključa / Caki isključio).
+
+    Uključeno je kad u Secrets portala postoji `DEEPSEEK_API_KEY`; isključuje se s
+    `AI_PROVJERA_ODGOVORA = "Ne"`. AI se zove SAMO za odgovore koji su „blizu" (najviše 4 po
+    testu), pa cijena ostaje sitna — a bez njega ti odgovori idu profesoru, ne u nulu.
+    """
+    try:
+        if _tekst(st.secrets.get("AI_PROVJERA_ODGOVORA")).lower() in ("ne", "0", "false"):
+            return None
+    except Exception:                                   # noqa: BLE001 — nema Secrets
+        return None
+    try:
+        return _provjera.napravi_pozivac(st.secrets)
+    except Exception:                                   # noqa: BLE001
+        return None
 
 
 # ============================================================
@@ -663,7 +631,10 @@ def spremi_rezultat(sheet, *, test, ucenik_id: str, ime_djeteta: str, bodovi: fl
         "status": status,
         "kreirano": predaja.strftime("%Y-%m-%d %H:%M"),
     }
-    redak["provjera"] = "ceka" if any(d.get("status") == "ceka" for d in detalji) else ""
+    # 1.11.2026.: "sumnja" (blizu zapis, nije odlučeno) je OTVORENA kao i "ceka" — rezultat
+    # ide u 🧑‍🏫 Provjeru rješenja, a ne u konačnu ocjenu s nulom.
+    otvoreno = any(_tekst(d.get("status")) in _provjera.OTVORENI_STATUSI for d in detalji or [])
+    redak["provjera"] = "ceka" if otvoreno else ""
     redak.setdefault("provjerio", "")
     redak.setdefault("provjereno", "")
     ws.append_row([redak.get(h, "") for h in REZ_HEADERS], value_input_option="RAW")
@@ -1037,7 +1008,9 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada,
             st.session_state.pop("_online_test_pocetak", None)
             return
 
-        bodovi, maks, detalji = ocjeni(zadaci, odgovori)
+        _pozivac = _ai_pozivac(st)
+        bodovi, maks, detalji = ocjeni(zadaci, odgovori, pozovi=_pozivac,
+                                       dopusti_ai=_pozivac is not None)
         status = STATUS_ISTEKLO if sada > rok + timedelta(seconds=60) else STATUS_PREDANO
         try:
             spremi_rezultat(sheet, test=test, ucenik_id=ucenik_id,
@@ -1054,6 +1027,9 @@ def _prikazi_rjesavanje(st, sheet, test, ucenik, ucenik_id, sada,
         st.session_state["_online_rezultat"] = {
             "naziv": _tekst(test.get("naziv")), "bodovi": bodovi,
             "maks": maks, "status": status,
+            # 1.11.2026.: koliko zadataka čeka Cakijevu provjeru (sumnja/ceka) — da učenik zna
+            # da bodovi još nisu konačni i zašto.
+            "ceka": sum(1 for d in detalji if _tekst(d.get("status")) in _provjera.OTVORENI_STATUSI),
         }
         st.cache_data.clear()
         st.rerun()
@@ -1069,6 +1045,10 @@ def prikazi_testove(st, sheet, testovi, rezultati, ucenik, ucenik_id: str, progr
     if poruka:
         st.success(f"✅ Test „{poruka['naziv']}” je predan: **{poruka['bodovi']:g} / {poruka['maks']:g}** "
                    f"bodova ({poruka['status']}).")
+        if poruka.get("ceka"):
+            n = int(poruka["ceka"])
+            st.info(f"⏳ {n} " + ("zadatak čeka" if n == 1 else "zadataka čekaju") +
+                    " provjeru profesora — bodovi se još mogu popraviti.")
         if poruka["maks"] and poruka["bodovi"] == poruka["maks"]:
             st.balloons()
 

@@ -4,3 +4,7 @@ google-auth
 pandas
 reportlab
 streamlit-mathlive==0.0.3
+# 1.11.2026.: `ai_pomoc.py` (pomoć učeniku) i `provjera_odgovora.py` (AI provjera odgovora) zovu
+# DeepSeek preko `requests`. Dolazio je posredno kroz streamlit — sada je izričit, da AI provjera
+# ne padne tiho ako se to promijeni.
+requests>=2.31
