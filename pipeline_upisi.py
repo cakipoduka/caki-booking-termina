@@ -3002,16 +3002,33 @@ def portal_gotovina(df_prijave: pd.DataFrame, ucenik_id: str, sezona: str = SEZO
     return sorted(out, key=lambda x: (x["program"], x["opis"]))
 
 
+def _vidljivo_na_portalu(red, df_racuni: pd.DataFrame) -> bool:
+    """Smije li roditelj u Moj CAKI vidjeti ovaj (Poslano/Isteklo/Plaćeno) dokument?
+    2.11.2026. (Cakijeva odluka): ponuda se vidi ČIM JE U SOLU (ima broj dokumenta) — ne čeka se više
+    ručni mail (prije: tek uz mail_poslan, pa je 42 od 85 poslanih ponuda bilo skriveno).
+    Iznimka ostaje: rata čija grupa još nije cijela poslana u Solo (neka rata je još Nacrt/Odobreno/
+    Šalje se…/Greška) se ne prikazuje, da roditelj ne vidi pola plana otplate."""
+    if str(red.get("status", "")) == "Plaćeno":
+        return True
+    if _cisto(red.get("mail_poslan")).strip():
+        return True
+    if not _cisto(red.get("broj_dokumenta")).strip():
+        return False
+    grupa = _cisto(red.get("rata_grupa_id")).strip()
+    if grupa and "rata_grupa_id" in df_racuni.columns:
+        ostali = df_racuni[df_racuni["rata_grupa_id"].astype(str) == grupa]["status"].astype(str)
+        if ostali.isin(list(STATUSI_PRIJE_SOLA) + ["Šalje se…"]).any():
+            return False
+    return True
+
+
 def portal_naplata(df_racuni: pd.DataFrame, ucenik_id: str, df_uplate=None):
     """§24.4: (tablica poslanih dokumenata, dug u centima). Nacrti/odobreni/greške/otkazani se NE prikazuju.
     31.10.2026.: uz df_uplate još stupci Uplaćeno / Preostalo i status „🟠 Djelomično plaćeno”."""
     if df_racuni.empty or "status" not in df_racuni.columns:
         return pd.DataFrame(), 0
     r = df_racuni[(df_racuni["ucenik_id"] == ucenik_id) & (df_racuni["status"].isin(list(_PORTAL_STATUS_DOKUMENTA)))]
-    # Poslane ponude kojima mail još NIJE ni pokušan (npr. druga rata iste grupe čeka slanje) se ne
-    # prikazuju — roditelj ih vidi tek kad dobije mail sa svim ratama. Plaćene se prikazuju uvijek.
-    if "mail_poslan" in r.columns:
-        r = r[(r["status"] == "Plaćeno") | (r["mail_poslan"].astype(str).str.strip().replace("nan", "") != "")]
+    r = r[[_vidljivo_na_portalu(x, df_racuni) for _, x in r.iterrows()]] if not r.empty else r
     if r.empty:
         return pd.DataFrame(), 0
 
