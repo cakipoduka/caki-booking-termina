@@ -7078,3 +7078,126 @@ def tekst_bez_termina(bez: list) -> str:
             if datumi else " Datum početka nastave javit ćemo.")
     return (f"⏳ Prijava je zaprimljena za: {imena}. Termin (dan, vrijeme i učionica) još nije određen — "
             f"javit ćemo vam raspored prije početka nastave.{kada}")
+
+
+# ============================================================
+# ✅ ZADACI — obaveze CAKI centra (2.11.2026., Cakijev zahtjev)
+# ============================================================
+# Tab "Zadaci" (nastaje sam kod prvog zadatka). Zadatak: tekst, hitnost (boja), kategorija, za koga
+# (Caki / Neira / profesor — više imena zarezom), po želji rok i učenik. Nedovršeni gore po hitnosti,
+# pa po roku; gotovi dolje. Ništa se ne briše: "obriši" samo sakrije (skriveno = Da).
+# Profesor u svom portalu vidi SAMO zadatke u kojima je naveden (bez financija i kontakata).
+ZADACI_TAB = "Zadaci"
+ZADACI_HEADERS = ["zadatak_id", "tekst", "hitnost", "kategorija", "za", "rok", "ucenik_id", "ime_djeteta",
+                  "status", "kreirao", "kreirano", "zavrsio", "zavrseno", "skriveno"]
+HITNOSTI_ZADATKA = ["Hitno", "Važno", "Normalno", "Kad stignemo"]
+KATEGORIJE_ZADATAKA = ["Učenici i roditelji", "Financije", "Nastava i raspored", "Ostalo / centar"]
+ADMINI_ZADATAKA = ["Caki", "Neira"]
+ZADATAK_OTVOREN, ZADATAK_GOTOV = "Otvoreno", "Gotovo"
+
+
+def load_zadaci(sheet) -> pd.DataFrame:
+    """Tab Zadaci (bez skrivenih). Ako ga još nema → prazan DataFrame s pravim stupcima."""
+    df = _load_opcionalno(sheet, ZADACI_TAB)
+    if df.empty:
+        return pd.DataFrame(columns=ZADACI_HEADERS + ["_row"])
+    for h in ZADACI_HEADERS:
+        if h not in df.columns:
+            df[h] = ""
+        df[h] = df[h].astype(str).replace({"nan": "", "None": ""})
+    return df[df["skriveno"].str.strip().str.lower() != "da"]
+
+
+def _za_lista(za) -> list:
+    if isinstance(za, (list, tuple, set)):
+        return [str(x).strip() for x in za if str(x).strip()]
+    return [x.strip() for x in str(za or "").split(",") if x.strip()]
+
+
+def dodaj_zadatak(sheet, tekst: str, hitnost: str = "Normalno", kategorija: str = "", za=("Caki",),
+                  rok=None, ucenik_id: str = "", ime_djeteta: str = "", kreirao: str = "") -> str:
+    tekst = re.sub(r"\s+", " ", str(tekst or "")).strip()
+    if not tekst:
+        raise ValueError("Upiši što treba napraviti.")
+    if hitnost not in HITNOSTI_ZADATKA:
+        raise ValueError(f"Nepoznata hitnost '{hitnost}'.")
+    za_l = _za_lista(za)
+    if not za_l:
+        raise ValueError("Odaberi za koga je zadatak.")
+    rok_txt = rok.strftime("%Y-%m-%d") if hasattr(rok, "strftime") else str(rok or "")[:10]
+    _osiguraj_tab_stupce(sheet, ZADACI_TAB, ZADACI_HEADERS)
+    ws = sheet.worksheet(ZADACI_TAB)
+    zid = "Z-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    _dodaj_red_po_nazivu(ws, {
+        "zadatak_id": zid, "tekst": tekst[:500], "hitnost": hitnost, "kategorija": str(kategorija or "").strip()[:60],
+        "za": ", ".join(za_l), "rok": rok_txt, "ucenik_id": str(ucenik_id or ""), "ime_djeteta": str(ime_djeteta or ""),
+        "status": ZADATAK_OTVOREN, "kreirao": str(kreirao or "")[:40],
+        "kreirano": sada_zagreb().strftime("%Y-%m-%d %H:%M:%S")})
+    return zid
+
+
+def _redak_zadatka(sheet, zadatak_id: str):
+    ws = sheet.worksheet(ZADACI_TAB)
+    headers = ws.row_values(1)
+    df = _load_worksheet_df(ws)
+    red = df[df["zadatak_id"].astype(str) == str(zadatak_id)] if "zadatak_id" in df.columns else df.iloc[0:0]
+    if red.empty:
+        raise ValueError("Zadatak nije pronađen — osvježi stranicu.")
+    return ws, headers, red.iloc[0]
+
+
+def oznaci_zadatak(sheet, zadatak_id: str, gotovo: bool, tko: str = "") -> None:
+    """✓ gotovo (tko i kada se zapišu) ili natrag u otvorene."""
+    ws, headers, r = _redak_zadatka(sheet, zadatak_id)
+    polja = ({"status": ZADATAK_GOTOV, "zavrsio": str(tko or "")[:40],
+              "zavrseno": sada_zagreb().strftime("%Y-%m-%d %H:%M:%S")} if gotovo
+             else {"status": ZADATAK_OTVOREN, "zavrsio": "", "zavrseno": ""})
+    _azuriraj_polja(ws, int(r["_row"]), polja, headers)
+
+
+def sakrij_zadatak(sheet, zadatak_id: str) -> None:
+    """"Obriši" — zadatak se sakrije (ostaje u tabu radi povijesti)."""
+    ws, headers, r = _redak_zadatka(sheet, zadatak_id)
+    _azuriraj_polja(ws, int(r["_row"]), {"skriveno": "Da"}, headers)
+
+
+def zadatak_kasni(red, danas: date | None = None) -> bool:
+    danas = danas or sada_zagreb().date()
+    rok = pd.to_datetime(str(red.get("rok", "") or "")[:10], format="%Y-%m-%d", errors="coerce")
+    return str(red.get("status", "")) != ZADATAK_GOTOV and pd.notna(rok) and rok.date() < danas
+
+
+def poredaj_zadatke(df: pd.DataFrame) -> pd.DataFrame:
+    """Otvoreni: hitnost → rok (bez roka na kraj) → kada su upisani; gotovi ispod, najnoviji prvi."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=ZADACI_HEADERS)
+    d = df.copy()
+    d["_gotov"] = (d["status"] == ZADATAK_GOTOV).astype(int)
+    d["_h"] = d["hitnost"].map({h: i for i, h in enumerate(HITNOSTI_ZADATKA)}).fillna(len(HITNOSTI_ZADATKA))
+    d["_rok"] = d["rok"].where(d["rok"].str.strip() != "", "9999-99-99")
+    otv = d[d["_gotov"] == 0].sort_values(["_h", "_rok", "kreirano"], kind="stable")
+    got = d[d["_gotov"] == 1].sort_values("zavrseno", ascending=False, kind="stable")
+    return pd.concat([otv, got]).drop(columns=["_gotov", "_h", "_rok"])
+
+
+def zadaci_za(df: pd.DataFrame, osoba: str = "", profesori: bool = False, ucenik_id: str = "",
+              kategorija: str = "") -> pd.DataFrame:
+    """Filtar: osoba (ime u "za"), profesori=True (bilo tko osim Caki/Neira), učenik, kategorija."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=ZADACI_HEADERS)
+    d = df
+    if osoba:
+        d = d[d["za"].apply(lambda z: osoba in _za_lista(z))]
+    if profesori:
+        d = d[d["za"].apply(lambda z: any(x not in ADMINI_ZADATAKA for x in _za_lista(z)))]
+    if ucenik_id:
+        d = d[d["ucenik_id"].astype(str) == str(ucenik_id)]
+    if kategorija:
+        d = d[d["kategorija"] == kategorija]
+    return d
+
+
+def kategorije_zadataka(df: pd.DataFrame) -> list:
+    """Zadane kategorije + one koje su već upisane (nova kategorija se samo upiše kod zadatka)."""
+    vec = [] if df is None or df.empty else [k for k in df["kategorija"].dropna().astype(str).str.strip().unique() if k]
+    return KATEGORIJE_ZADATAKA + sorted(k for k in vec if k not in KATEGORIJE_ZADATAKA)
