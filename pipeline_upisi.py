@@ -175,13 +175,16 @@ def load_prijave(sheet) -> pd.DataFrame:
 # --- Uređivanje kontakt podataka učenika ---
 
 def azuriraj_ucenika(sheet, row_number: int, polja: dict):
-    """polja = {"ime_djeteta": "...", "mobitel_djeteta": "...", ...}"""
+    """polja = {"ime_djeteta": "...", "mobitel_djeteta": "...", ...}
+
+    2.11.2026.: sva polja JEDNIM pozivom i kao čisti tekst (RAW). Prije je svako polje bio poseban
+    poziv prema Googleu (spremanje je moglo zapeti na kvoti), a Sheets je broj 0911234567
+    pretvarao u 911234567 (izgubila se nula). Stupci kojih nema u tabu se preskaču, kao i prije."""
     ws = sheet.worksheet("Učenici")
     headers = ws.row_values(1)
-    for naziv_polja, vrijednost in polja.items():
-        if naziv_polja in headers:
-            col = headers.index(naziv_polja) + 1
-            ws.update_cell(row_number, col, vrijednost)
+    polja = {k: ("" if v is None else v if isinstance(v, (int, float)) else str(v))
+             for k, v in polja.items() if k in headers}
+    _azuriraj_polja(ws, int(row_number), polja, headers)
 
 
 def ocisti_duplikat_flag(sheet, row_number: int):
