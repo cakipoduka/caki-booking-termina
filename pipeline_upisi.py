@@ -3073,7 +3073,7 @@ def portal_naplata(df_racuni: pd.DataFrame, ucenik_id: str, df_uplate=None):
 # Portal Moj CAKI vidi: datum, iznos, način (💵 Gotovina) i preostali dug — NIKAD internu napomenu.
 UPLATE_TAB = "Uplate"
 UPLATE_HEADERS = ["uplata_id", "dokument_id", "ucenik_id", "datum_uplate", "iznos", "nacin",
-                  "broj_racuna", "unio", "vrijeme_unosa", "napomena_interna"]
+                  "broj_racuna", "unio", "vrijeme_unosa", "napomena_interna", "ponisteno"]
 NACINI_UPLATE_PONUDE = ["Gotovina", "Uplata na račun"]   # (NACINI_UPLATE je Solo šifrarnik)
 NACIN_GOTOVINA = "Gotovina"
 
@@ -3107,8 +3107,18 @@ def _ws_uplate(sheet):
     return ws, headers
 
 
+def aktivne_uplate(df_uplate) -> pd.DataFrame:
+    """Uplate bez poništenih (2.11.2026.: krivo upisana uplata se poništava, ne briše)."""
+    if df_uplate is None or getattr(df_uplate, "empty", True):
+        return pd.DataFrame(columns=UPLATE_HEADERS)
+    if "ponisteno" not in df_uplate.columns:
+        return df_uplate
+    return df_uplate[df_uplate["ponisteno"].astype(str).str.strip().str.lower() != "da"]
+
+
 def uplate_dokumenta(df_uplate, dokument_id: str) -> pd.DataFrame:
-    if df_uplate is None or getattr(df_uplate, "empty", True) or "dokument_id" not in df_uplate.columns:
+    df_uplate = aktivne_uplate(df_uplate)
+    if df_uplate.empty or "dokument_id" not in df_uplate.columns:
         return pd.DataFrame(columns=UPLATE_HEADERS)
     return df_uplate[df_uplate["dokument_id"].astype(str) == str(dokument_id)]
 
@@ -3157,7 +3167,8 @@ def dodaj_uplatu(sheet, red: dict, iznos_centi: int, datum_uplate, nacin: str = 
 def gotovina_bez_racuna(df_uplate, df_racuni=None) -> pd.DataFrame:
     """Uplate GOTOVINOM kojima još nije upisan broj računa iz Sola (podsjetnik za admina).
     Uz df_racuni dodaje ime učenika i broj ponude."""
-    if df_uplate is None or getattr(df_uplate, "empty", True):
+    df_uplate = aktivne_uplate(df_uplate)
+    if df_uplate.empty:
         return pd.DataFrame(columns=UPLATE_HEADERS)
     u = df_uplate[(df_uplate["nacin"].astype(str) == NACIN_GOTOVINA)
                   & (df_uplate["broj_racuna"].astype(str).replace("nan", "").str.strip() == "")].copy()
@@ -3182,10 +3193,51 @@ def upisi_broj_racuna(sheet, uplata_id: str, broj_racuna: str) -> None:
     _azuriraj_polja(ws, int(red.iloc[0]["_row"]), {"broj_racuna": broj[:60]}, headers)
 
 
+def ponisti_uplatu(sheet, uplata_id: str, razlog: str = "") -> dict:
+    """Krivo upisana uplata → poništena (ostaje zapisana radi povijesti, ali se više ne broji).
+    Ako je ponuda zbog nje bila ✅ Plaćeno, a sada više nije sve uplaćeno → natrag u Poslano.
+    U Solu se ništa ne mijenja. Vraća {"dokument_id", "vraceno_u_poslano"}."""
+    ws, headers = _ws_uplate(sheet)
+    df = _load_worksheet_df(ws)
+    red = df[df["uplata_id"].astype(str) == str(uplata_id)] if "uplata_id" in df.columns else df.iloc[0:0]
+    if red.empty:
+        raise ValueError(f"Uplata {uplata_id} nije pronađena.")
+    r = red.iloc[0]
+    if str(r.get("ponisteno", "")).strip().lower() == "da":
+        raise ValueError("Ova uplata je već poništena.")
+    napomena = " | ".join(x for x in (str(r.get("napomena_interna", "") or "").strip(),
+                                      f"poništeno {sada_zagreb().strftime('%d.%m.%Y.')}"
+                                      + (f": {razlog.strip()}" if str(razlog or "").strip() else "")) if x)
+    _azuriraj_polja(ws, int(r["_row"]), {"ponisteno": "Da", "napomena_interna": napomena[:500]}, headers)
+    dok = str(r.get("dokument_id", ""))
+    vraceno = False
+    df_r = load_racuni(sheet)
+    d = df_r[df_r["dokument_id"].astype(str) == dok] if "dokument_id" in df_r.columns else df_r.iloc[0:0]
+    if not d.empty and str(d.iloc[0]["status"]) == "Plaćeno":
+        if uplaceno_centi(load_uplate(sheet), dok) < (u_cente(d.iloc[0].get("iznos_ukupno")) or 0):
+            _azuriraj_polja(sheet.worksheet(LEDGER_TAB), int(d.iloc[0]["_row"]), {"status": "Poslano", "datum_placanja": ""})
+            vraceno = True
+    return {"dokument_id": dok, "vraceno_u_poslano": vraceno}
+
+
+def vrati_na_neplaceno(sheet, red: dict) -> None:
+    """Ponuda krivo označena kao ✅ Plaćeno (gumb 💶 Označi plaćeno) → natrag u Poslano.
+    Samo u CRM-u (Solo se ne dira). Za Instrukcije se poništava i potvrda uplate na terminima."""
+    if str(red.get("status", "")) != "Plaćeno":
+        raise ValueError("Ponuda nije označena kao plaćena.")
+    ws = sheet.worksheet(LEDGER_TAB)
+    _azuriraj_polja(ws, int(red["_row"]), {"status": "Poslano", "datum_placanja": ""})
+    if red.get("program_tip") == "Instrukcije":
+        ws_i, h_i, retci = _termini_dokumenta(sheet, red["dokument_id"])
+        for ri in retci:
+            _azuriraj_polja(ws_i, ri, {"uplata_potvrdjena_admin": ""}, h_i)
+
+
 def portal_uplate(df_uplate, df_racuni, ucenik_id: str) -> pd.DataFrame:
     """Moj CAKI → 💶 Plaćanja: evidentirane uplate (datum, iznos, način). Samo za dokumente koje
     roditelj ionako vidi; bez interne napomene, bez broja računa i bez toga tko je unio."""
-    if df_uplate is None or getattr(df_uplate, "empty", True) or df_racuni is None or df_racuni.empty:
+    df_uplate = aktivne_uplate(df_uplate)
+    if df_uplate.empty or df_racuni is None or df_racuni.empty:
         return pd.DataFrame()
     u = df_uplate[df_uplate["ucenik_id"].astype(str) == str(ucenik_id)]
     vidljivi = df_racuni[(df_racuni["ucenik_id"] == ucenik_id)
@@ -4553,6 +4605,23 @@ def spremi_statuse_predmeta(sheet, statusi: dict, subjekt: str = "") -> int:
             polja["solo_racun"] = subjekt
         if polja:
             izmjene[broj] = polja
+    _upisi_prijave(ws, h, izmjene)
+    return len(izmjene)
+
+
+def postavi_status_instrukcija(sheet, statusi: dict) -> int:
+    """2.11.2026.: status prijave INSTRUKCIJA ({redak_id: 'Čeka poziv'|'Potvrdio'|'Otkazano'…}) — bez ponude,
+    bez subjekta. Ostali programi se ovdje ne mijenjaju (za njih je spremi_statuse_predmeta)."""
+    ws, h, retci = _svjeze_prijave(sheet)
+    izmjene = {}
+    for rid, novi in statusi.items():
+        if novi not in STATUSI_PREDMETA or rid not in retci:
+            continue
+        broj, red = retci[rid]
+        if str(red.get("program_tip", "") or "").strip() != "Instrukcije":
+            continue
+        if red.get("status_kontakta", "") != novi:
+            izmjene[broj] = {"status_kontakta": novi}
     _upisi_prijave(ws, h, izmjene)
     return len(izmjene)
 
