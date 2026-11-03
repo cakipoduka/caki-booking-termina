@@ -74,7 +74,8 @@ from obavijesti import (  # 15.10.2026.: kartica 📣 Obavijesti (poruke od Caki
 )
 
 import secrets_json as _sj  # 21.10.2026.: tolerantno čitanje JSON-a iz Secrets
-import caki_stil as stil    # 31.10.2026.: CAKI tema (jedna datoteka, brisanjem se vraća staro)
+import caki_stil as stil    # 31.10.2026.: CAKI tema (jedna datoteka, brisanjem se vraća staro)  # noqa: F401
+import caki_tema as tema    # 3.11.2026.: tema kao CRM admin + traka kartica (iscrtava se samo odabrana)
 KONTAKT = "📞 +385 95 900 5611 · ✉️ info@cakipoduka.com"
 AKTIVNE_REZERVACIJE = ["Rezervirano", "Potvrđeno", "Čekanje"]
 
@@ -343,7 +344,7 @@ def _prikazi_obavijesti(sheet, ucenik, ucenik_id, obavijesti, linkovi, df_koment
 # ------------------------------------------------------------------ portal
 
 def prikazi_portal():
-    stil.primijeni()   # 31.10.2026.: CAKI tema — mora biti prije ijednog elementa
+    tema.primijeni()   # 3.11.2026.: tema kao CRM admin — mora biti prije ijednog elementa
     sheet = _init_sheet()
 
     # 12.10.2026.: veliki brojevi u zaglavlju više se ne režu ("Srijeda 15:0…") — manji font i dopušten prijelom
@@ -352,11 +353,16 @@ def prikazi_portal():
 [data-testid="stMetricValue"] > div { white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.25; }
 </style>""", unsafe_allow_html=True)
 
-    st.title("📘 Moj CAKI")
-    st.caption("Odabir termina, raspored, dolasci, instrukcije i plaćanja — sve na jednom mjestu.")
-
     query_id = st.query_params.get("ucenik_id", "")
-    ucenik_id = st.text_input("Šifra učenika (dobili ste je u mailu)", value=query_id).strip().upper()
+    # 3.11.2026. (redizajn): kad je šifra već u linku, polje za šifru je sklopljeno (manje nereda);
+    # bez šifre u linku portal počinje naslovom i poljem za šifru, kao dosad.
+    if query_id:
+        with st.expander("🔑 Druga šifra učenika"):
+            ucenik_id = st.text_input("Šifra učenika (dobili ste je u mailu)", value=query_id).strip().upper()
+    else:
+        st.title("📘 Moj CAKI")
+        st.caption("Odabir termina, raspored, dolasci, instrukcije i plaćanja — sve na jednom mjestu.")
+        ucenik_id = st.text_input("Šifra učenika (dobili ste je u mailu)", value=query_id).strip().upper()
     if not ucenik_id:
         st.info("Upišite šifru učenika.")
         st.stop()
@@ -424,9 +430,11 @@ def prikazi_portal():
     except Exception:
         osvrti = []
 
-    # --- Zaglavlje: tko je i najvažnije u 3 broja ---
-    with st.container(border=True):
-        st.markdown(f"### 👋 {ucenik['ime_djeteta']}")
+    # --- Zaglavlje: tko je i najvažnije u 3 broja (3.11.2026.: bijela kartica kao u CRM-u) ---
+    with tema.kutija("mc_zaglavlje"):
+        import html as _h
+        tema.html_(f'<div class="kc-pozdrav">Moj CAKI · {_h.escape(ucenik_id)}</div>'
+                   f'<div class="kc-h1">👋 {_h.escape(str(ucenik["ime_djeteta"]))}</div>')
         m1, m2, m3 = st.columns([2.4, 1, 1.5])
         prvi = raspored if not raspored.empty else raspored_matura
         m1.metric("📅 Grupa", f"{prvi.iloc[0]['Dan']} {prvi.iloc[0]['Vrijeme']}" if not prvi.empty else "—",
@@ -435,7 +443,7 @@ def prikazi_portal():
         m2.metric("✅ Dolasci", f"{ukupno_dol} %" if ukupno_dol is not None else "—")
         m3.metric("💶 Za uplatu", f"{centi_u_tekst(dug)} €" if dug else "0,00 €")
     if bez_termina:
-        st.warning("📅 **Odaberite termin nastave** — kartica *Odabir termina* ispod.")
+        st.warning("📅 **Odaberite termin nastave** — kartica *📅 Odabir termina* ispod.")
 
     naziv_obav = f"📣 Obavijesti ({len(obavijesti)})" if obavijesti else "📣 Obavijesti"
     naziv_testovi = f"📝 Testovi ({za_rjesavanje})" if za_rjesavanje else "📝 Testovi"
@@ -450,13 +458,19 @@ def prikazi_portal():
     nazivi.append("🙋 Moji podaci")
     if komponente and not bez_termina:
         nazivi.append("📅 Odabir termina")
-    kartice = dict(zip(nazivi, st.tabs(nazivi)))
+    # 3.11.2026. (Claude, redizajn): traka kartica od gumba — iscrtava se SAMO odabrana kartica
+    # (st.tabs je na svaki klik računao i čitao sve kartice → sporije i više čitanja Sheeta).
+    aktivna = tema.nav(nazivi, "mc", zadano="📅 Odabir termina" if bez_termina else None)
+    kartice = {n_: None for n_ in nazivi}
 
-    with kartice[naziv_obav]:
+    def _je(n_):
+        return re.sub(r"\s*\(\d+\)$", "", n_) == aktivna
+
+    if _je(naziv_obav):
         _prikazi_obavijesti(sheet, ucenik, ucenik_id, obavijesti, linkovi, df_komentari, obav_greska)
 
     if naziv_testovi in kartice:
-        with kartice[naziv_testovi]:
+        if _je(naziv_testovi):
             if online_greska:
                 st.info(online_greska)
             else:
@@ -481,10 +495,10 @@ def prikazi_portal():
                 pass
 
     if "📅 Odabir termina" in kartice:
-        with kartice["📅 Odabir termina"]:
+        if _je("📅 Odabir termina"):
             _prikazi_odabir_termina(sheet, ucenik, ucenik_id, komponente, df_grupe, df_rez)
 
-    with kartice["🗓️ Raspored"]:
+    if _je("🗓️ Raspored"):
         razdoblja, praznici = _ucitaj_razdoblja(), _ucitaj_praznike()
         # 21.10.2026.: predmeti Mature koji su prijavljeni, a termin im još nije određen (npr. HRV i ENG
         # koji počinju u siječnju) — roditelj mora vidjeti da je prijava zaprimljena.
@@ -530,7 +544,7 @@ def prikazi_portal():
             st.markdown("#### 📦 Paket sati")
             st.dataframe(paketi, hide_index=True, width="stretch")
 
-    with kartice["✅ Dolasci"]:
+    if _je("✅ Dolasci"):
         if tablica_dol.empty:
             st.info("Još nema evidentiranih dolazaka.")
         else:
@@ -540,7 +554,7 @@ def prikazi_portal():
                                                help="Udio termina na kojima je učenik bio prisutan (uživo ili online).")
             st.dataframe(tablica_dol, hide_index=True, width="stretch")
 
-    with kartice["💶 Plaćanja"]:
+    if _je("💶 Plaćanja"):
         # 21.10.2026. (Cakijev nalaz): program plaćen gotovinom nema dokument u Solu, pa se dosad
         # u portalu nije vidjelo da je plaćen. Prikazuje se samo oznaka — bez iznosa.
         for g_ in portal_gotovina(df_prijave, ucenik_id):
@@ -564,7 +578,7 @@ def prikazi_portal():
                     "Iznos (€)": st.column_config.NumberColumn(format="%.2f"),
                 })
 
-    with kartice["🙋 Moji podaci"]:
+    if _je("🙋 Moji podaci"):
         # 21.10.2026. (Cakijev zahtjev): učenik/roditelj sam dopuni školu, razred i fakultet.
         # Mijenjaju se SAMO ta četiri polja — ime, kontakti i programi ostaju na adminu.
         st.caption("Dopunite podatke o školi i razredu. Ostale podatke (ime, kontakt, programe) "
@@ -606,7 +620,7 @@ def prikazi_portal():
         _stari_rezultati = None
 
     if "📈 Napredak" in kartice:
-        with kartice["📈 Napredak"]:
+        if _je("📈 Napredak"):
             # 21.10.2026.: profesor piše osvrt iz 👩‍🎓 Moji učenici (baza fraza). Ovdje je samo prikaz;
             # roditelj vidi isključivo poruke namijenjene SVOM djetetu i samo one koje su poslane.
             st.caption("Osvrti profesora na napredak — uz svaki piše razdoblje na koje se odnosi.")

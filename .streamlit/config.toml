@@ -8,11 +8,15 @@
 # ŠTO TEMA NE MOŽE (radi caki_stil.py): Inter, sjene, zaobljenja, raspored gumba.
 
 [theme]
-primaryColor = "#227AFF"                # CAKI plava
-backgroundColor = "#F5F7FB"             # svijetlo-siva podloga; bijele kartice se izdvajaju
-secondaryBackgroundColor = "#FFFFFF"    # kartice, unosi, sidebar
-textColor = "#273044"                   # Cakijeva osnovna boja teksta
-font = "sans serif"                     # Inter dolazi iz caki_stil.py
+# 3.11.2026. (Claude, redizajn): iste boje kao CRM admin (caki-upisi-crm-main) — font IBM Plex Sans dolazi iz caki_tema.py
+primaryColor = "#1d64b8"
+backgroundColor = "#f4f5f7"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1b2230"
+font = "sans serif"
+borderColor = "#d3d8df"
+showWidgetBorder = true
+baseRadius = "8px"
 
 [client]
 # Portal je JEDNA stranica s karticama — bez Streamlitovog izbornika stranica.

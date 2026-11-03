@@ -6267,7 +6267,11 @@ def uredi_termin_instrukcija(sheet, termin_id: str, polja: dict, nastavnik: str 
     smije, razlog = smije_ispraviti_termin(r, nastavnik, rok_sati=rok_sati)
     if not smije:
         raise ValueError(razlog)
-    novo = {k: v for k, v in polja.items() if k in POLJA_ISPRAVKA and v is not None}
+    # 3.11.2026.: admin (nastavnik='') smije promijeniti i profesora termina; profesor ne
+    dopusteno = POLJA_ISPRAVKA + (("nastavnik",) if not nastavnik else ())
+    novo = {k: v for k, v in polja.items() if k in dopusteno and v is not None}
+    if "nastavnik" in novo and not str(novo["nastavnik"]).strip():
+        del novo["nastavnik"]
     if not novo:
         return {}
     if "status_termina" in novo and novo["status_termina"] not in STATUSI_TERMINA:
@@ -6291,6 +6295,31 @@ def uredi_termin_instrukcija(sheet, termin_id: str, polja: dict, nastavnik: str 
     _azuriraj_polja(ws, int(r["_row"]), {k: v for k, v in novo.items() if k in headers or k in POLJA_ISPRAVKA},
                     headers)
     return novo
+
+
+STATUSI_TERMINA_OTKAZANI = ("Otkazan na vrijeme", "Otkazan kasno")
+
+
+def isti_termini(df_instr, ucenik_id: str, datum, vrijeme: str = "", bez_id: str = "") -> pd.DataFrame:
+    """3.11.2026.: termini istog učenika na isti dan (i u isto vrijeme, ako je zadano), bez otkazanih.
+    Služi za upozorenje „ovaj termin već postoji" — da se slučajno ne upiše dvaput."""
+    if df_instr is None or getattr(df_instr, "empty", True) or "ucenik_id" not in df_instr.columns:
+        return pd.DataFrame()
+    d = _datum(datum)
+    if d is None:
+        return pd.DataFrame()
+    df = df_instr[df_instr["ucenik_id"].astype(str).str.strip() == str(ucenik_id).strip()]
+    if df.empty:
+        return df
+    maska = df["datum"].apply(_datum) == d
+    if vrijeme and "vrijeme" in df.columns:
+        v = str(vrijeme).strip().lstrip("0")
+        maska &= df["vrijeme"].astype(str).str.strip().str.lstrip("0").isin(["", v])
+    if "status_termina" in df.columns:
+        maska &= ~df["status_termina"].astype(str).isin(STATUSI_TERMINA_OTKAZANI)
+    if bez_id and "termin_id" in df.columns:
+        maska &= df["termin_id"].astype(str) != str(bez_id)
+    return df[maska]
 
 
 def obrisi_termin_instrukcija(sheet, termin_id: str, nastavnik: str = "",
