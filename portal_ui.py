@@ -183,7 +183,7 @@ def _gumb_link(naziv: str, url: str):
     try:
         st.link_button(naziv, url, width="stretch")
     except TypeError:
-        st.link_button(naziv, url, use_container_width=True)
+        st.link_button(naziv, url, width="stretch")
 
 
 def _poruka(vrsta: str, tekst: str):
