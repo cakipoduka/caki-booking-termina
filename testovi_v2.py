@@ -34,6 +34,12 @@ import radovi_v2 as radovi
 import tablice
 import zavrsetak
 
+# 05.11.2026. (Claude): NE treba dodatna st.cache_data predmemorija ovdje za "dvostruko
+# čitanje" (brojač + prikaz zovu testovi_za_ucenika() odvojeno). `tablice.ucitaj()` VEĆ ima
+# svoju TTL predmemoriju (tablice.py, CACHE_TTL_S = 30 s, ključ (id(sheet), tab), deli se preko
+# cijelog procesa) — dva poziva unutar istog prikaza kartice pogode isti cache, nema dva
+# stvarna Google poziva. Provjereno čitanjem koda prije nego se ovo "popravilo" nepotrebno.
+
 # KRITIČNO (05.11.2026., Claude — uočeno prije isporuke, nije od Cakija prijavljen bug):
 # `tablice.PISANJE` je sigurnosni prekidač za upis u ŽIVU bazu, zadano False. U caki-testovi
 # ga na True postavlja `app.py` (admin app) pri učitavanju — ali app.py se OVDJE ne učitava
@@ -137,7 +143,13 @@ def _kartica(st, sheet, stavka: dict, ucenik_id: str) -> None:
                             _veza, _greska = drive.ucitaj(_bajtovi, radovi.sef_datoteke(_datoteka.name),
                                                           folder=_folder)
                             if _greska:
-                                st.warning(_greska + " Pošalji kao poveznicu ispod.")
+                                # 05.11.2026. (Claude): `drive.ucitaj` vrati tehničnu poruku
+                                # (npr. "RADOVI_FOLDER_ID") — učeniku ne pokazujemo ime secreta,
+                                # samo da rad ide dalje (poveznica/sirovi sadržaj kao zamjena).
+                                st.warning("Fotografija trenutno nije poslana na Drive — "
+                                           "rad će se ipak spremiti. Pošalji i poveznicu "
+                                           "ispod ako imaš (npr. s mobitela).")
+                                st.caption(f"Tehnički detalj (za Cakija): {_greska}")
                         radovi.dodaj_ucenikov_rad(
                             sheet, pokusaj_id=_pid, ucenik_id=ucenik_id,
                             veza=_veza or model.tekst(_link),
