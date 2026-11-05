@@ -58,6 +58,7 @@ from pipeline_upisi import (
 )
 from sat_biljeska import za_roditelja as sat_za_roditelja  # 17.10.2026.: teme i zadaca po satu
 import testovi_online as online_testovi  # 19.10.2026.: online testovi (objavljeni iz Test Buildera)
+import testovi_v2 as v2_testovi  # 05.11.2026.: most prema caki-testovi (v2) — isti CRM Sheet, nove tablice
 import komentar_napretka as osvrt_napretka  # 21.10.2026.: 📈 Napredak — osvrti profesora roditelju
 from obavijesti import (  # 15.10.2026.: kartica 📣 Obavijesti (poruke od Cakija, linkovi, komentari)
     MAX_KOMENTAR,
@@ -410,6 +411,18 @@ def prikazi_portal():
     za_rjesavanje = len([t for t in online_dostupni if not t["rjeseno"]])
     moji_online_rezultati = online_testovi.rezultati_ucenika(df_online_rezultati, ucenik_id)
 
+    # --- 05.11.2026.: CAKI testovi v2 (caki-testovi) — ISTI CRM Sheet, nove tablice
+    # (Definicije_testova/Dodjele_ispita/Pokusaji). Moj CAKI ostaje JEDINI ulaz za učenika
+    # (Cakijeva odluka 05.11.2026., v. TRACKER §5) — v2 se NE otvara kao zaseban portal, nego
+    # se iscrtava OVDJE, unutar iste kartice 📝 Testovi, uz v1. Potpuno defanzivno: ako v2
+    # tabovi ne postoje ili Sheet zapne, broji 0 i ne dira v1 ponašanje.
+    try:
+        v2_za_rjesavanje = v2_testovi.broj_za_rjesavanje(_init_sheet_testovi(), ucenik_id)
+        v2_ima_testova = bool(v2_testovi.testovi_za_ucenika(_init_sheet_testovi(), ucenik_id))
+    except Exception:                                   # noqa: BLE001
+        v2_za_rjesavanje, v2_ima_testova = 0, False
+    za_rjesavanje += v2_za_rjesavanje
+
     # --- Obavijesti (15.10.2026.): ako tabovi ne postoje / Google zapne, ostatak portala radi dalje ---
     try:
         # 21.10.2026.: uz predmete šaljemo i GRUPE učenika (dan × termin × učionica), pa gumb
@@ -450,7 +463,7 @@ def prikazi_portal():
     nazivi = [naziv_obav]
     if komponente and bez_termina:
         nazivi.append("📅 Odabir termina")
-    if online_dostupni or moji_online_rezultati:
+    if online_dostupni or moji_online_rezultati or v2_ima_testova:
         nazivi.append(naziv_testovi)
     nazivi += ["🗓️ Raspored", "✅ Dolasci", "💶 Plaćanja"]
     if osvrti:
@@ -480,6 +493,13 @@ def prikazi_portal():
                 online_testovi.prikazi_testove(
                     st, _init_sheet_testovi(), df_online_testovi, df_online_rezultati, ucenik,
                     ucenik_id, programi_ucenika, sada_zagreb())
+
+            # 05.11.2026.: CAKI testovi v2 — isti ucenik_id, drugi tabovi u istom Sheetu.
+            # Ako nešto zapne, ne prikazuje ništa (ne ruši v1 prikaz iznad).
+            try:
+                v2_testovi.prikazi_testove(st, _init_sheet_testovi(), ucenik_id)
+            except Exception as _e_v2:                          # noqa: BLE001
+                st.caption(f"⚠️ CAKI testovi v2 trenutno nisu dostupni ({_e_v2}).")
 
             # 📊 Stari rezultati simulacija (prije su bili u zasebnom tabu `Rezultati`)
             try:
