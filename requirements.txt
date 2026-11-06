@@ -8,3 +8,7 @@ streamlit-mathlive==0.0.3
 # DeepSeek preko `requests`. Dolazio je posredno kroz streamlit — sada je izričit, da AI provjera
 # ne padne tiho ako se to promijeni.
 requests>=2.31
+
+# 05.11.2026.: v2 most šalje radove u Drive (drive.py uvozi googleapiclient.discovery).
+# Bez ovog paketa učenik dobije „Google API za Drive nije dostupan u ovoj aplikaciji."
+google-api-python-client>=2.120
