@@ -538,8 +538,11 @@ def prikazi_pregled_rjesenja(st, zadaci: list[dict], odgovori: dict, *,
                              pokazi_rjesenja: bool, pokazi_video: bool,
                              pokazi_bodove: bool, sheet=None,
                              pokusaj: dict | None = None, ucenik_id: str = "",
-                             kljuc: str = "pregled") -> None:
+                             kljuc: str = "pregled", uloga: str = "ucenik") -> None:
     """Nakon testa: CIJELI zadatak ponovno, s tvojim odgovorom i ispravkom — po Student View-u.
+
+    `uloga`: `ucenik` (Moj CAKI — može podnijeti žalbu) ili `profesor` (caki-testovi — vidi
+    učenikovu žalbu i odgovara na nju; obrazac „Žalba na ocjenu" se profesoru ne prikazuje).
 
     20.11.2026. (Cakijev zahtjev): učenik ne pamti zadatke, pa mu sam ispravak ne znači ništa.
     Zato se ovdje vraća puni tekst, **slika** i **svi ponuđeni odgovori** s označenim njegovim
@@ -634,24 +637,100 @@ def prikazi_pregled_rjesenja(st, zadaci: list[dict], odgovori: dict, *,
                 st.markdown(f"🎬 **Video:** [{red['video']['naslov']}]({red['video']['url']})")
             if sheet is not None and pokusaj:
                 try:
-                    import zalbe as _zalbe
+                    if uloga == "profesor":
+                        _zalba_profesor(st, sheet, pokusaj, z, _ocj, kljuc=f"{kljuc}_{i}")
+                    else:
+                        _zalba_ucenik(st, sheet, pokusaj, z, ucenik_id, kljuc=f"{kljuc}_{i}")
+                except Exception as _e_zal:            # noqa: BLE001
+                    st.caption(f"⚖️ Žalba trenutno nije dostupna ({type(_e_zal).__name__}).")
 
-                    _zid = model.tekst(z.get("id"))
-                    _smije, _zasto = _zalbe.moze_podnijeti(sheet, pokusaj, _zid)
-                    if _smije:
-                        with st.form(f"{kljuc}_zalba_{i}"):
-                            _razlog = st.text_area(
-                                "⚖️ Žalba na ocjenu ovog zadatka (objasni što smatraš pogrešnim)",
-                                height=80, key=f"{kljuc}_zalba_tekst_{i}")
-                            if st.form_submit_button("Pošalji žalbu"):
-                                try:
-                                    _zalbe.podnesi(sheet, pokusaj=pokusaj, zadatak_id=_zid,
-                                                   razlog=_razlog, ucenik_id=ucenik_id)
-                                    st.success("Žalba je poslana profesoru.")
-                                except Exception as _e_z:      # noqa: BLE001
-                                    st.error(f"Žalba nije poslana: {_e_z}")
-                    elif model.tekst(_zasto):
-                        st.caption(f"⚖️ {_zasto}")
-                except Exception:                      # noqa: BLE001
-                    pass
 
+# ============================================================ ⚖️ ŽALBA UZ ZADATAK (24.11.2026.)
+# Učenik podnosi JEDNU žalbu po zadatku; profesor JEDNOM odgovara i odlučuje o bodovima.
+
+def _zalba_ucenik(st, sheet, pokusaj: dict, zadatak: dict, ucenik_id: str, *, kljuc: str) -> None:
+    """Moj CAKI: obrazac za žalbu, ili stanje već podnesene žalbe s odgovorom profesora."""
+    import zalbe as _zalbe
+
+    _zid = model.tekst(zadatak.get("id"))
+    _zalba = _zalbe.za_zadatak(sheet, model.tekst(pokusaj.get("pokusaj_id")), _zid)
+    if _zalba:
+        st.markdown(f"⚖️ **Tvoja žalba:** {model.tekst(_zalba.get('razlog')) or '—'}")
+        if _zalbe.je_otvorena(_zalba):
+            st.caption("Čeka odgovor profesora.")
+        else:
+            (st.success if model.tekst(_zalba.get("status")) == _zalbe.STATUS_PRIHVACENA
+             else st.warning)(
+                f"**Odgovor profesora:** {model.tekst(_zalba.get('odgovor')) or '—'}  \n"
+                f"**Odluka:** {_zalbe.opis_odluke(_zalba)}")
+        return
+    _smije, _zasto = _zalbe.moze_podnijeti(sheet, pokusaj, _zid)
+    if not _smije:
+        if model.tekst(_zasto):
+            st.caption(f"⚖️ {_zasto}")
+        return
+    with st.form(f"{kljuc}_zalba"):
+        _razlog = st.text_area("⚖️ Žalba na ocjenu ovog zadatka (objasni što smatraš pogrešnim)",
+                               height=80, key=f"{kljuc}_zalba_tekst")
+        st.caption("Žalba se podnosi jednom po zadatku; profesor odgovara i odlučuje o bodovima.")
+        if st.form_submit_button("Pošalji žalbu"):
+            try:
+                _zalbe.podnesi(sheet, pokusaj=pokusaj, zadatak_id=_zid, razlog=_razlog,
+                               ucenik_id=ucenik_id)
+                st.success("Žalba je poslana profesoru.")
+            except Exception as _e_z:                   # noqa: BLE001
+                st.error(f"Žalba nije poslana: {_e_z}")
+
+
+def _zalba_profesor(st, sheet, pokusaj: dict, zadatak: dict, ocjena: dict, *, kljuc: str) -> None:
+    """caki-testovi: ako je učenik podnio žalbu na ovaj zadatak — prikaži je i omogući odgovor."""
+    import zalbe as _zalbe
+
+    _zalba = _zalbe.za_zadatak(sheet, model.tekst(pokusaj.get("pokusaj_id")),
+                               model.tekst(zadatak.get("id")))
+    if not _zalba:
+        return                                         # bez žalbe profesor ovdje nema što raditi
+    prikazi_zalbu_profesoru(st, sheet, _zalba, kljuc=kljuc,
+                            max_bodovi=(ocjena or {}).get("max"))
+
+
+def prikazi_zalbu_profesoru(st, sheet, zalba: dict, *, kljuc: str, max_bodovi=None,
+                            profesor: str = "caki") -> None:
+    """Jedna žalba: tekst učenika + (ako je otvorena) jedan odgovor i odluka o bodovima.
+
+    Koristi se u pregledu po učeniku i u popisu otvorenih žalbi (📊 Rezultati).
+    """
+    import zalbe as _zalbe
+
+    _zid = model.tekst(zalba.get("zalba_id"))
+    _kada = model.datum_hr(model.tekst(zalba.get("podnesena"))[:10]) or "—"
+    if _zalbe.je_otvorena(zalba):
+        st.warning(f"⚖️ **Žalba učenika** ({_kada}): "
+                   f"{model.tekst(zalba.get('razlog')) or '—'}")
+        _puni = f" ({model.broj(max_bodovi, 0):g} b.)" if max_bodovi not in (None, "") else ""
+        with st.form(f"{kljuc}_odgovor_{_zid}"):
+            _odg = st.text_area("Odgovor učeniku (jednom — učenik ga vidi u Moj CAKI)",
+                                height=80, key=f"{kljuc}_odg_tekst_{_zid}")
+            _odluka = st.radio("Odluka o bodovima",
+                               [f"✅ Priznajem bodove{_puni}", "❌ Ne priznajem"],
+                               index=None, horizontal=True, key=f"{kljuc}_odluka_{_zid}")
+            if st.form_submit_button("Odgovori i zaključi žalbu"):
+                if _odluka is None:
+                    st.error("Odaberi odluku o bodovima.")
+                else:
+                    _ok, _poruka = _zalbe.zakljuci(sheet, _zid, priznaj=_odluka.startswith("✅"),
+                                                   odgovor=_odg, profesor=profesor)
+                    if _ok:
+                        st.success(_poruka)
+                        try:
+                            st.cache_data.clear()
+                        except Exception:              # noqa: BLE001
+                            pass
+                        st.rerun()
+                    else:
+                        st.error(_poruka)
+    else:
+        _kada_o = model.datum_hr(model.tekst(zalba.get("odgovoreno"))[:10]) or "—"
+        st.info(f"⚖️ **Žalba učenika** ({_kada}): {model.tekst(zalba.get('razlog')) or '—'}  \n"
+                f"**Tvoj odgovor** ({_kada_o}): {model.tekst(zalba.get('odgovor')) or '—'}  \n"
+                f"**Odluka:** {_zalbe.opis_odluke(zalba)} — zaključeno.")

@@ -80,11 +80,14 @@ def moze_podnijeti(sheet, pokusaj: dict, zadatak_id: str, *, sada=None) -> tuple
         return False, "Nedostaje zadatak."
     pid = model.tekst(pokusaj.get("pokusaj_id"))
 
+    # 24.11.2026. (Caki): JEDNA žalba po zadatku, bez rasprave. Prije se nakon odgovora mogla
+    # podnijeti nova (blokirala je samo žalba koja još čeka).
     for z in _svi(sheet):
         if (model.tekst(z.get("pokusaj_id")) == pid
-                and model.tekst(z.get("zadatak_id")) == zid
-                and model.tekst(z.get("status")) == STATUS_PODNESENA):
-            return False, "Žalba za taj zadatak je već podnesena i čeka odgovor."
+                and model.tekst(z.get("zadatak_id")) == zid):
+            if model.tekst(z.get("status")) == STATUS_PODNESENA:
+                return False, "Žalba za taj zadatak je već podnesena i čeka odgovor."
+            return False, "Žalba za taj zadatak je riješena."
 
     do = model.tekst(pokusaj.get("rok_zalbe")) or rok_do(pokusaj.get("predaja"))
     if do:
@@ -104,6 +107,8 @@ def podnesi(sheet, *, pokusaj: dict, zadatak_id: str, razlog: str,
     smije, razlog_odbijanja = moze_podnijeti(sheet, pokusaj, zadatak_id, sada=sada)
     if not smije:
         raise ValueError(razlog_odbijanja)
+    if not model.tekst(razlog):
+        raise ValueError("Napiši ukratko što smatraš pogrešnim.")
     izmjene = [model.tekst(z.get("zalba_id")) for z in _svi(sheet)]
     red = {
         "zalba_id": tablice.novi_id(izmjene, "Z26-"),
@@ -172,3 +177,54 @@ def osiguraj(sheet) -> bool:
         return True
     except Exception:                                   # noqa: BLE001
         return False
+
+
+# ============================================================ 24.11.2026. — odgovor profesora
+# Caki: „Nakon žalbe prof. mora vidjeti žalbu u caki-testovi i moći odgovoriti na nju. Samo
+# jednom, bez dugačke rasprave; nakon odgovora traži se odluka o bodovima — priznaju se ili ne —
+# i zaključuje se konačno stanje bodova na tom zadatku."
+
+def za_zadatak(sheet, pokusaj_id: str, zadatak_id: str) -> dict | None:
+    """Žalba za jedan zadatak jednog pokušaja (najnovija), ili None."""
+    pid, zid = model.tekst(pokusaj_id), model.tekst(zadatak_id)
+    nadjene = [z for z in _svi(sheet)
+               if model.tekst(z.get("pokusaj_id")) == pid and model.tekst(z.get("zadatak_id")) == zid]
+    return nadjene[-1] if nadjene else None
+
+
+def je_otvorena(zalba: dict | None) -> bool:
+    return bool(zalba) and model.tekst(zalba.get("status")) == STATUS_PODNESENA
+
+
+def opis_odluke(zalba: dict | None) -> str:
+    """Kratko, za učenika i profesora: „bodovi priznati" / „bodovi nisu priznati" / „čeka odgovor"."""
+    status = model.tekst((zalba or {}).get("status"))
+    return {STATUS_PRIHVACENA: "bodovi priznati", STATUS_ODBIJENA: "bodovi nisu priznati",
+            STATUS_PODNESENA: "čeka odgovor"}.get(status, "")
+
+
+def zakljuci(sheet, zalba_id: str, *, priznaj: bool, odgovor: str, profesor: str = "caki") -> tuple[bool, str]:
+    """Profesor JEDNOM odgovara na žalbu i odlučuje o bodovima. Vraća (uspjelo, poruka).
+
+    - Odgovor je obavezan (učenik mora znati zašto).
+    - Već odgovorena žalba se ne mijenja (bez rasprave).
+    - `priznaj=True` → zadatak dobiva **pune bodove**, trag ide u `Izmjene_ocjena`
+      (povod `zalba`) i preračunava se zbroj pokušaja; `False` → bodovi ostaju.
+    """
+    odgovor = model.tekst(odgovor)
+    if not odgovor:
+        return False, "Napiši odgovor učeniku."
+    zid = model.tekst(zalba_id)
+    zalba = next((z for z in _svi(sheet) if model.tekst(z.get("zalba_id")) == zid), None)
+    if not zalba:
+        return False, "Žalba ne postoji."
+    if not je_otvorena(zalba):
+        return False, f"Žalba je već zaključena ({opis_odluke(zalba)})."
+    if priznaj:
+        if not prihvati_i_ispravi(sheet, zid, tocno=True, obrazlozenje=odgovor,
+                                  profesor=profesor):
+            return False, "Bodovi se ne mogu upisati — taj zadatak nema ocjenu u Ocjene_zadataka."
+        return True, "Žalba zaključena: bodovi priznati."
+    if not odgovori(sheet, zid, prihvati=False, odgovor=odgovor, tko=profesor):
+        return False, "Odgovor nije zapisan."
+    return True, "Žalba zaključena: bodovi nisu priznati."
