@@ -30,6 +30,20 @@ import radovi_v2 as radovi  # noqa: E402
 import tablice  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _cisti_cache():
+    """`tablice.ucitaj` pamti tablice (st.cache_data); bez ovoga lažni Sheet jednog testa curi u
+    drugi. U caki-testovi to radi conftest.py — ovdje je u datoteci (v. zaglavlje)."""
+    import streamlit as st
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    tablice._ocisti_cache()          # vlastita predmemorija po id(sheet) — id se ponovo koristi
+    yield
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    tablice._ocisti_cache()
+
+
 @pytest.fixture
 def upis_dozvoljen():
     staro = tablice.PISANJE
@@ -127,3 +141,61 @@ def test_zatvoren_test_pokazuje_zadatke_i_zalbu(tmp_path):
     zalbe = tablice.ucitaj(at.session_state["_sheet"], "Zalbe")
     assert [(z["pokusaj_id"], z["zadatak_id"], z["status"]) for z in zalbe] == [
         ("P1", "Z1", "podnesena")]
+
+
+# ------------------------------------------------------------------ 24.11.: v1/v2 imena modula
+# U portalu `radovi.py` i `ai_pomoc.py` su STARI v1 moduli; v2 su `radovi_v2.py` i
+# `ai_pomoc_v2.py`. Caki 24.11.: „Nije poslano — C..jpg: AttributeError: module 'radovi' has no
+# attribute 'dodaj_ucenikov_rad'" — slika je već bila na Driveu, pukao je zapis u tablicu.
+
+class _DriveServis:
+    def files(self):
+        return self
+
+    def create(self, **kw):
+        self.kw = kw
+        return self
+
+    def execute(self):
+        return {"id": "1", "webViewLink": "https://drive.google.com/file/d/1"}
+
+
+def test_zavrsetak_koristi_radovi_v2():
+    import zavrsetak
+    assert zavrsetak._radovi_modul().__name__ == "radovi_v2"
+
+
+def test_posalji_postupak_nakon_testa_zapise_rad(upis_dozvoljen):
+    import zavrsetak
+    s = fake_gspread.FakeSpreadsheet()
+    s.dodaj("Radovi", tablice.ZAGLAVLJA["Radovi"], [])
+    rez = zavrsetak.posalji_postupak(
+        s, pokusaj={"pokusaj_id": "P1"}, ucenik_id="OH3229",
+        datoteke=[{"naziv": "C.jpg", "bajtovi": b"jpg"}], folder="F", servis=_DriveServis())
+    assert rez["greske"] == [], rez["greske"]
+    [r] = tablice.ucitaj(s, "Radovi")
+    assert r["pokusaj_id"] == "P1" and r["veza"] == "https://drive.google.com/file/d/1"
+
+
+def test_posalji_poveznicu_nakon_testa(upis_dozvoljen):
+    import zavrsetak
+    s = fake_gspread.FakeSpreadsheet()
+    s.dodaj("Radovi", tablice.ZAGLAVLJA["Radovi"], [])
+    zavrsetak.posalji_poveznicu(s, pokusaj={"pokusaj_id": "P1"}, ucenik_id="OH3229",
+                                veza="https://photos/x")
+    assert tablice.ucitaj(s, "Radovi")[0]["veza"] == "https://photos/x"
+
+
+def test_ai_sloj_ocjenjivanja_koristi_ai_pomoc_v2(monkeypatch):
+    import ai_pomoc_v2
+    import ocjenjivanje
+    pozvano = []
+
+    def lazni_pitaj(poruke, *, kljuc, tajna, **kw):
+        pozvano.append(1)
+        return '{"jednako": true, "sigurnost": "visoka", "zasto": "isto"}', ""
+
+    monkeypatch.setattr(ai_pomoc_v2, "pitaj", lazni_pitaj)
+    rez = ocjenjivanje.ai_provjeri_izraz("1/2", "0.5", "x", kljuc="k", tajna="t")
+    assert pozvano, "AI se nije ni pozvao (učitan je v1 ai_pomoc bez `pitaj`)"
+    assert rez is not None and rez.get("tocno") is True

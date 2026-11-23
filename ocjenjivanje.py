@@ -484,7 +484,13 @@ def ai_provjeri_izraz(tocan, odgovor, tekst: str = "", *, pozovi=None,
                                           f"UČENIK: {model.tekst(odgovor)}"}]
     try:
         if pozovi is None:
-            import ai_pomoc
+            # 24.11.2026.: u Moj CAKI je `ai_pomoc.py` STARI v1 modul (nema `pitaj`), a v2 je
+            # `ai_pomoc_v2.py`. S `import ai_pomoc` AI sloj ocjenjivanja u portalu nikad nije
+            # radio (greška se tiho gutala → sve „sumnje" išle profesoru). Prvo v2 ime.
+            try:
+                import ai_pomoc_v2 as ai_pomoc
+            except ImportError:
+                import ai_pomoc
 
             odgovor_ai, greska = ai_pomoc.pitaj(poruke, kljuc=kljuc, tajna=tajna)
         else:

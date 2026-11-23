@@ -119,6 +119,21 @@ def _naziv(datoteka: dict, redni: int) -> str:
     return naziv
 
 
+def _radovi_modul():
+    """v2 modul za radove: `radovi_v2` u Moj CAKI, `radovi` u caki-testovi.
+
+    24.11.2026.: u portalu je `radovi.py` STARI v1 modul (drugačije funkcije), a v2 je kopiran
+    kao `radovi_v2.py`. Ovdje je pisalo `import radovi` pa je slanje postupka nakon testa u
+    portalu pucalo: „module 'radovi' has no attribute 'dodaj_ucenikov_rad'" — iako je slika
+    već bila na Driveu. Ista datoteka mora raditi u oba repoa, zato se prvo traži v2 ime.
+    """
+    try:
+        import radovi_v2 as modul
+    except ImportError:
+        import radovi as modul
+    return modul
+
+
 def posalji_postupak(sheet, *, pokusaj: dict, ucenik_id: str, datoteke, folder: str,
                      servis=None, prilozio: str = "") -> dict:
     """Pošalji slike/PDF postupka u Drive i zapiši ih uz pokušaj (tab `Radovi`).
@@ -130,7 +145,7 @@ def posalji_postupak(sheet, *, pokusaj: dict, ucenik_id: str, datoteke, folder: 
     jedne datoteke ne smije izgubiti ostale (Cakijevo pravilo: rad se ne smije izgubiti).
     """
     import drive
-    import radovi
+    radovi = _radovi_modul()
 
     pid = model.tekst((pokusaj or {}).get("pokusaj_id"))
     if not pid:
@@ -157,7 +172,7 @@ def posalji_postupak(sheet, *, pokusaj: dict, ucenik_id: str, datoteke, folder: 
 
 def posalji_poveznicu(sheet, *, pokusaj: dict, ucenik_id: str, veza: str, naziv: str = "") -> dict:
     """Rezervni put kad upload ne radi: učenik zalijepi poveznicu na fotografiju/sken."""
-    import radovi
+    radovi = _radovi_modul()
 
     pid = model.tekst((pokusaj or {}).get("pokusaj_id"))
     if not pid:
