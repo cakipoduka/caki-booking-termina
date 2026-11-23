@@ -15,7 +15,11 @@ from __future__ import annotations
 
 import model
 
-SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+# 21.11.2026.: bilo je `drive.file`. Ta dozvola smije pisati SAMO u mape koje je aplikacija sama
+# stvorila — u ručno napravljenu mapu `02_Radovi_ucenika` Google odbija upis (404 notFound), pa
+# je učenik dobivao „Fotografija nije poslana na Drive". Puna `drive` dozvola vrijedi samo za ono
+# što je servisnom računu podijeljeno, dakle i dalje ne vidi ništa drugo.
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 MAKS_BAJTOVA = 25 * 1024 * 1024          # 25 MB — dovoljno za fotografiju ili sken
 
 
@@ -97,4 +101,44 @@ def ucitaj(bajtovi: bytes, naziv: str, *, folder: str, servis=None) -> tuple[str
         ).execute()
         return model.tekst((rezultat or {}).get("webViewLink")), ""
     except Exception as e:                             # noqa: BLE001
-        return "", f"Slanje u Drive nije uspjelo: {type(e).__name__}."
+        return "", f"Slanje u Drive nije uspjelo: {opis_greske(e)}"
+
+
+# Poznati razlozi odbijanja (polje `reason` u Googleovom odgovoru) → što napraviti.
+_RAZLOZI = {
+    "notFound": "mapa za radove nije dostupna servisnom računu (provjeri RADOVI_FOLDER_ID i je li "
+                "servisni račun član dijeljenog diska)",
+    "storageQuotaExceeded": "servisni račun nema prostor na Driveu — mapa mora biti na DIJELJENOM "
+                            "disku (Shared Drive), ne u nečijem „Moj disk\"",
+    "insufficientFilePermissions": "servisni račun nema pravo pisanja u mapu (treba uloga "
+                                   "Contributor/Content manager ili jača)",
+    "insufficientPermissions": "aplikacija nema dozvolu za Drive (scope)",
+    "forbidden": "Google je odbio upis (prava na mapi)",
+}
+
+
+def opis_greske(e: Exception) -> str:
+    """Pretvori grešku Google API-ja u rečenicu koja kaže ZAŠTO (ne samo „HttpError").
+
+    Prije je poruka bila samo ime vrste greške, pa se iz aplikacije nije moglo znati je li kriv
+    folder, prava ili kvota.
+    """
+    import json
+
+    status, razlog = "", ""
+    odgovor = getattr(e, "resp", None)
+    if odgovor is not None:
+        status = model.tekst(getattr(odgovor, "status", ""))
+    sadrzaj = getattr(e, "content", b"") or b""
+    try:
+        podaci = json.loads(sadrzaj.decode("utf-8") if isinstance(sadrzaj, bytes) else sadrzaj)
+        gr = (podaci or {}).get("error") or {}
+        razlog = model.tekst(((gr.get("errors") or [{}])[0] or {}).get("reason")) \
+            or model.tekst(gr.get("status"))
+    except Exception:                                  # noqa: BLE001 — sadržaj nije JSON
+        pass
+    if razlog in _RAZLOZI:
+        return f"{_RAZLOZI[razlog]} [{status} {razlog}]".replace("[ ", "[")
+    if status or razlog:
+        return f"{type(e).__name__} [{status} {razlog}]".replace(" ]", "]").replace("[ ", "[")
+    return f"{type(e).__name__}."
