@@ -161,8 +161,19 @@ def rok_dodjele(dodjela: dict, definicija: dict, danas=None) -> dict:
             "od_iso": od.strftime("%Y-%m-%d"), "do_iso": do.strftime("%Y-%m-%d")}
 
 
+STATUSI_ZATVOREN = ("zatvoren", "arhiviran")
+
+
 def stanje_roka(dodjela: dict, definicija: dict, danas=None) -> str:
-    """`nije_poceo` · `otvoren` · `zatvoren` — za popis testova i za blokadu rješavanja."""
+    """`nije_poceo` · `otvoren` · `zatvoren` — za popis testova i za blokadu rješavanja.
+
+    23.11.2026. (Caki): **zatvoren test je zatvoren, bez obzira na datum.** Prije se gledao samo
+    datum, pa je učenik dodan na dan testa (pravilo „dodan poslije roka → rok je dan dodjele")
+    i dalje imao otvoren rok nakon što je Caki zatvorio test. Rješenja i žalba se zato nisu
+    pojavila u Moj CAKI. Status `zatvoren`/`arhiviran` sada uvijek znači `zatvoren`.
+    """
+    if model.tekst((definicija or {}).get("status")) in STATUSI_ZATVOREN:
+        return "zatvoren"
     danas = model.datum(danas) or model.sada().date()
     r = rok_dodjele(dodjela, definicija, danas)
     if danas < r["od"]:
@@ -287,6 +298,100 @@ def premjesti_iz_crm_taba(sheet) -> dict:
     return izlaz
 
 # ---------------------------------------------------------------- čišćenje (zadatak 06)
+def opseg_uklanjanja(sheet, dodjela_id: str) -> dict:
+    """Što bi se obrisalo kad se učenik ukloni s testa (samo čita — za dijalog prije brisanja)."""
+    from provedba import pokusaji_ucenika
+
+    did = model.tekst(dodjela_id)
+    pokusaji = pokusaji_ucenika(sheet, did) if did else []
+    pids = {model.tekst(p.get("pokusaj_id")) for p in pokusaji if model.tekst(p.get("pokusaj_id"))}
+
+    def _broj(tab: str) -> int:
+        try:
+            return sum(1 for r in tablice.ucitaj(sheet, tab)
+                       if model.tekst(r.get("pokusaj_id")) in pids)
+        except Exception:                               # noqa: BLE001 — tab još ne postoji
+            return 0
+
+    return {
+        "dodjela_id": did,
+        "pokusaji": len(pokusaji),
+        "predano": sum(1 for p in pokusaji if model.je_predan(p)),
+        "ocjene": _broj(tablice.TAB_OCJENE) if pids else 0,
+        "izmjene": _broj(tablice.TAB_IZMJENE_OCJENA) if pids else 0,
+        "zalbe": _broj(tablice.TAB_ZALBE) if pids else 0,
+        "radovi": _broj(tablice.TAB_RADOVI) if pids else 0,
+        "ima_rezultat": bool(pokusaji),
+    }
+
+
+def ukloni_ucenika(sheet, dodjela_id: str, *, s_rezultatom: bool = False,
+                   korisnik: str = "") -> dict:
+    """Makni JEDNOG učenika s testa (Caki 23.11.2026.: „slučajno dodan").
+
+    - Učenik **bez pokušaja** → briše se samo dodjela.
+    - Učenik **s pokušajem** → odbija se, osim ako je `s_rezultatom=True` (izričita potvrda u
+      sučelju). Tada se briše sve što pripada tom učeniku na tom testu, od lišća prema korijenu:
+      ocjene, izmjene ocjena, žalbe, priloženi radovi → pokušaj → dodjela. Isto pravilo kao kod
+      brisanja cijelog testa (odluka 20.11.: rezultat se ne ostavlja bez dodjele).
+    - Ostali učenici i sam test se ne diraju. `Statistika_zadataka` (zbirna za cijeli test) se
+      ne dira — preračuna se kad se ponovo pokrene analiza.
+    """
+    from provedba import pokusaji_ucenika
+
+    did = model.tekst(dodjela_id)
+    izlaz = {"uklonjeno": False, "razlog": "", "brojevi": {}}
+    if not did:
+        izlaz["razlog"] = "Nedostaje dodjela."
+        return izlaz
+    dodjela = next((d for d in tablice.ucitaj(sheet, tablice.TAB_DODJELE)
+                    if model.tekst(d.get("dodjela_id")) == did), None)
+    if not dodjela:
+        izlaz["razlog"] = f"Dodjela {did} ne postoji (možda je već uklonjena)."
+        return izlaz
+
+    pokusaji = pokusaji_ucenika(sheet, did)
+    if pokusaji and not s_rezultatom:
+        izlaz["razlog"] = ("Učenik je već počeo ili predao test. Ukloniti ga možeš samo zajedno s "
+                           "rezultatom — označi „obriši i rezultat”.")
+        return izlaz
+
+    brojevi = {"ocjene": 0, "izmjene": 0, "zalbe": 0, "radovi": 0, "pokusaji": 0}
+
+    def _brisi(tab: str, uvjeti: dict) -> int:
+        try:
+            return tablice.obrisi_gdje(sheet, tab, uvjeti)
+        except Exception:                               # noqa: BLE001 — tab možda ne postoji
+            return 0
+
+    for p in pokusaji:
+        pid = model.tekst(p.get("pokusaj_id"))
+        if not pid:
+            continue
+        brojevi["ocjene"] += _brisi(tablice.TAB_OCJENE, {"pokusaj_id": pid})
+        brojevi["izmjene"] += _brisi(tablice.TAB_IZMJENE_OCJENA, {"pokusaj_id": pid})
+        brojevi["zalbe"] += _brisi(tablice.TAB_ZALBE, {"pokusaj_id": pid})
+        brojevi["radovi"] += _brisi(tablice.TAB_RADOVI, {"pokusaj_id": pid})
+        brojevi["pokusaji"] += _brisi(tablice.TAB_POKUSAJI, {"pokusaj_id": pid})
+
+    if not tablice.obrisi(sheet, tablice.TAB_DODJELE, "dodjela_id", did):
+        izlaz["razlog"] = "Rezultat je obrisan, ali dodjela nije nađena."
+        izlaz["brojevi"] = brojevi
+        return izlaz
+
+    try:
+        tablice.zapisi_radnju(
+            sheet, korisnik or "caki", "uklonjen_ucenik",
+            f"{model.tekst(dodjela.get('definicija_id'))}/{model.tekst(dodjela.get('ucenik_id'))}",
+            "bez rezultata" if not pokusaji else
+            f"s rezultatom: pokušaji {brojevi['pokusaji']}, ocjene {brojevi['ocjene']}, "
+            f"izmjene {brojevi['izmjene']}, žalbe {brojevi['zalbe']}, radovi {brojevi['radovi']}")
+    except Exception:                                   # noqa: BLE001
+        pass
+    izlaz.update({"uklonjeno": True, "brojevi": brojevi})
+    return izlaz
+
+
 def obrisi_dodjelu(sheet, dodjela_id: str, *, sila: bool = False) -> dict:
     """Obriši jednu dodjelu. Bez `sila` odbija ako za nju postoji pokušaj."""
     did = model.tekst(dodjela_id)
@@ -336,4 +441,26 @@ def pocisti_neispravne(sheet, poznati_ucenici) -> dict:
                                    "definicija_id": model.tekst(d.get("definicija_id"))})
         else:
             izlaz["preskoceno"] += 1
+    return izlaz
+
+def provjeri_sifre(poznati_ucenici, unesene_sifre) -> dict:
+    """Podijeli ručno upisane šifre na poznate (postoje u CRM `Učenici`) i nepoznate.
+
+    §0 (zadatak 06): `OH` je nekad tiho prolazio i postao dodjela bez učenika. Sada se nepoznate
+    šifre vraćaju odvojeno i objava se blokira dok se ne isprave.
+
+    Vraća {"poznate": [...], "nepoznate": [...], "prazno": bool}.
+    """
+    poznati = {model.tekst(u).upper() for u in (poznati_ucenici or []) if model.tekst(u)}
+    izlaz = {"poznate": [], "nepoznate": [], "prazno": not poznati}
+    videno = set()
+    for s in unesene_sifre or []:
+        sifra = model.tekst(s).upper()
+        if not sifra or sifra in videno:
+            continue
+        videno.add(sifra)
+        if not poznati or sifra in poznati:
+            izlaz["poznate"].append(sifra)
+        else:
+            izlaz["nepoznate"].append(sifra)
     return izlaz

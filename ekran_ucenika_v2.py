@@ -460,22 +460,176 @@ def _posalji_slike(st, sheet, definicija: dict, dodjela: dict, pokusaj: dict, uc
                     st.rerun()
 
 
+def _skini_mathrm(tekst: str) -> str:
+    """Skini `\mathrm{...}` (i `\text{...}`) omotače — zadrži unutrašnjost.
+
+    MathLive sprema odgovor kao `\mathrm{\frac{...}}`; za prikaz nam treba samo `\frac{...}`.
+    """
+    import re
+
+    s = model.tekst(tekst)
+    for omotac in (r"\\mathrm", r"\\text", r"\\operatorname"):
+        while True:
+            m = re.search(omotac + r"\{", s)
+            if not m:
+                break
+            dubina = 0
+            kraj = None
+            for i in range(m.end() - 1, len(s)):
+                if s[i] == "{":
+                    dubina += 1
+                elif s[i] == "}":
+                    dubina -= 1
+                    if dubina == 0:
+                        kraj = i
+                        break
+            if kraj is None:
+                break
+            s = s[:m.start()] + s[m.end():kraj] + s[kraj + 1:]
+    return s
+
+
+def _odgovor_za_prikaz(tekst: str) -> str:
+    """Učenikov odgovor u čitljivom obliku.
+
+    U bazi se odgovor često sprema kao `\mathrm{\frac{3-a}{3a}}` (LaTeX omotač iz MathLivea).
+    Skidamo omotač i omatamo u `$…$` da Streamlit/KaTeX prikaže razlomak, a ne sirovi kod.
+    """
+    sirovo = model.tekst(tekst)
+    if not sirovo:
+        return ""
+    unutra = _skini_mathrm(sirovo)
+    if not unutra:
+        unutra = sirovo
+    if unutra.count("$") >= 2:                    # već je matematički
+        return unutra
+    ima_latex = any(x in unutra for x in ("\\", "^{", "_{", "\\frac", "\\sqrt"))
+    if ima_latex or unutra != sirovo:
+        return f"${unutra}$"
+    return unutra
+
+
+def _ocjene_pokusaja(sheet, pokusaj: dict) -> dict:
+    """Mapa zadatak_id → {tocno, bodovi, max, komentar} za JEDAN pokušaj."""
+    izlaz = {}
+    if sheet is None or not pokusaj:
+        return izlaz
+    pid = model.tekst(pokusaj.get("pokusaj_id"))
+    if not pid:
+        return izlaz
+    try:
+        import tablice as _t
+
+        for r in _t.ucitaj(sheet, _t.TAB_OCJENE):
+            if model.tekst(r.get("pokusaj_id")) != pid:
+                continue
+            izlaz[model.tekst(r.get("zadatak_id"))] = {
+                "tocno": model.tekst(r.get("tocno")).lower() in ("da", "true", "točno", "tocno"),
+                "bodovi": model.broj(r.get("bodovi"), 0),
+                "max": model.broj(r.get("max"), 0),
+                "komentar": model.tekst(r.get("komentar")),
+            }
+    except Exception:                               # noqa: BLE001
+        return {}
+    return izlaz
+
+
 def prikazi_pregled_rjesenja(st, zadaci: list[dict], odgovori: dict, *,
                              pokazi_rjesenja: bool, pokazi_video: bool,
                              pokazi_bodove: bool, sheet=None,
-                             pokusaj: dict | None = None, ucenik_id: str = "") -> None:
-    """Nakon testa: što je učenik odgovorio, točan odgovor i 🎬 video — po Student View-u."""
-    for i, z in enumerate(zadaci or []):
+                             pokusaj: dict | None = None, ucenik_id: str = "",
+                             kljuc: str = "pregled") -> None:
+    """Nakon testa: CIJELI zadatak ponovno, s tvojim odgovorom i ispravkom — po Student View-u.
+
+    20.11.2026. (Cakijev zahtjev): učenik ne pamti zadatke, pa mu sam ispravak ne znači ništa.
+    Zato se ovdje vraća puni tekst, **slika** i **svi ponuđeni odgovori** s označenim njegovim
+    odabirom i točnim — prije se vidjelo samo „Tvoj odgovor: B" i „Točno: C", bez teksta opcija.
+    """
+    _ocjene = _ocjene_pokusaja(sheet, pokusaj) if (sheet is not None and pokusaj) else {}
+    _popis = list(zadaci or [])
+
+    def _stanje(i, z) -> str:
+        _o = _ocjene.get(model.tekst(z.get("id"))) or {}
+        if not model.tekst((odgovori or {}).get(str(i))):
+            return "prazno"
+        if not _o:
+            return "nepoznato"
+        return "tocno" if _o.get("tocno") else "netocno"
+
+    _stanja = [_stanje(i, z) for i, z in enumerate(_popis)]
+    _netocnih = sum(1 for s in _stanja if s == "netocno")
+    _praznih = sum(1 for s in _stanja if s == "prazno")
+
+    if len(_popis) > 1:
+        _izbori = [f"Svi zadaci ({len(_popis)})"]
+        if _netocnih:
+            _izbori.append(f"Netočni ({_netocnih})")
+        if _praznih:
+            _izbori.append(f"Bez odgovora ({_praznih})")
+        _filtar = st.radio("Prikaži", _izbori, horizontal=True, key=f"{kljuc}_filtar",
+                           label_visibility="collapsed") if len(_izbori) > 1 else _izbori[0]
+        _otvori = st.toggle("Otvori sve zadatke", value=True, key=f"{kljuc}_otvori",
+                            help="Isključi ako ti je lakše otvarati zadatak po zadatak.")
+    else:
+        _filtar, _otvori = "", True
+
+    for i, z in enumerate(_popis):
+        if _filtar.startswith("Netočni") and _stanja[i] != "netocno":
+            continue
+        if _filtar.startswith("Bez odgovora") and _stanja[i] != "prazno":
+            continue
         red = rjesavanje.pregled_zadatka(
             z, model.tekst((odgovori or {}).get(str(i))),
             pokazi_rjesenje=pokazi_rjesenja, pokazi_video=pokazi_video,
             pokazi_bodove=pokazi_bodove)
         oznaka = "🎬 video" if red["video"] else "pregled"
-        with st.expander(f"Zadatak {i + 1} — {oznaka}"):
+        _ocj = _ocjene.get(model.tekst(z.get("id"))) or {}
+        if _ocj and pokazi_bodove:
+            if _ocj.get("tocno"):
+                oznaka = f"✔ točno · {_ocj['bodovi']:g}/{_ocj['max']:g} boda"
+            elif not model.tekst((odgovori or {}).get(str(i))):
+                oznaka = "⚪ bez odgovora · 0 bodova"
+            else:
+                oznaka = f"✘ netočno · {_ocj['bodovi']:g}/{_ocj['max']:g} boda"
+        with st.expander(f"Zadatak {i + 1} — {oznaka}", expanded=_otvori):
             prikazi_tekst_s_tabelama(red["tekst"])
-            st.caption(f"Tvoj odgovor: **{red['moj_odgovor'] or '— (prazno)'}**")
-            if red["pokazi_rjesenje"]:
-                st.success(f"Točno: {red['tocan_odgovor']}")
+
+            # slika ide odmah uz tekst, isto kao za vrijeme rješavanja
+            if red["slika"]:
+                try:
+                    slike_zadataka.prikazi_sliku_html(st, red["slika"])
+                except Exception:                      # noqa: BLE001 — slika ne smije srušiti pregled
+                    st.caption("🖼️ Slika uz ovaj zadatak trenutno nije dostupna.")
+
+            if red["opcije"]:
+                st.markdown("**Ponuđeni odgovori**")
+                for _o in red["opcije"]:
+                    _tekst_o = rjesavanje.pripremi_latex(_o["tekst"], zamotaj=True)
+                    if _o["tocna"] and _o["moja"]:
+                        st.markdown(f"✅ **{_o['slovo']})** {_tekst_o} — *tvoj odgovor, točno*")
+                    elif _o["tocna"]:
+                        st.markdown(f"✅ **{_o['slovo']})** {_tekst_o} — *točan odgovor*")
+                    elif _o["moja"]:
+                        st.markdown(f"❌ **{_o['slovo']})** {_tekst_o} — *tvoj odgovor*")
+                    else:
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;**{_o['slovo']})** {_tekst_o}",
+                                    unsafe_allow_html=True)
+                if red["bez_odgovora"]:
+                    st.caption("Na ovaj zadatak nisi odgovorio.")
+            else:
+                _moj = _odgovor_za_prikaz(red["moj_odgovor"])
+                if _moj:
+                    st.markdown(f"**Tvoj odgovor:** {_moj}")
+                else:
+                    st.caption("Tvoj odgovor: — (prazno)")
+
+            if _ocj and pokazi_bodove and model.tekst(_ocj.get("komentar")):
+                st.info(f"💬 Komentar profesora: {_ocj['komentar']}")
+            if red["pokazi_rjesenje"] and not red["opcije"]:
+                st.success(f"Točno: {_odgovor_za_prikaz(red['tocan_odgovor'])}")
+            elif red["pokazi_rjesenje"] and red["tocan_tekst"]:
+                st.success(f"Točno: {red['tocan_odgovor']}) "
+                           f"{rjesavanje.pripremi_latex(red['tocan_tekst'], zamotaj=True)}")
             if red["video"]:
                 st.markdown(f"🎬 **Video:** [{red['video']['naslov']}]({red['video']['url']})")
             if sheet is not None and pokusaj:
@@ -485,10 +639,10 @@ def prikazi_pregled_rjesenja(st, zadaci: list[dict], odgovori: dict, *,
                     _zid = model.tekst(z.get("id"))
                     _smije, _zasto = _zalbe.moze_podnijeti(sheet, pokusaj, _zid)
                     if _smije:
-                        with st.form(f"zalba_{i}"):
+                        with st.form(f"{kljuc}_zalba_{i}"):
                             _razlog = st.text_area(
                                 "⚖️ Žalba na ocjenu ovog zadatka (objasni što smatraš pogrešnim)",
-                                height=80, key=f"zalba_tekst_{i}")
+                                height=80, key=f"{kljuc}_zalba_tekst_{i}")
                             if st.form_submit_button("Pošalji žalbu"):
                                 try:
                                     _zalbe.podnesi(sheet, pokusaj=pokusaj, zadatak_id=_zid,

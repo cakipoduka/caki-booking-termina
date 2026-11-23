@@ -100,7 +100,10 @@ def _pregled_rjesenja(st, sheet, dodjela: dict, definicija: dict, pokusaj: dict)
     ekran_ucenika.prikazi_pregled_rjesenja(
         st, definicije.zadaci(definicija), provedba.odgovori(pokusaj),
         pokazi_rjesenja=True, pokazi_video=smije_video, pokazi_bodove=smije_bodove,
-        sheet=sheet, pokusaj=pokusaj, ucenik_id=model.tekst(dodjela.get("ucenik_id")))
+        sheet=sheet, pokusaj=pokusaj, ucenik_id=model.tekst(dodjela.get("ucenik_id")),
+        # 23.11.2026.: jedinstven ključ po dodjeli — više testova na istoj stranici inače dobije
+        # iste ključeve obrazaca za žalbu (StreamlitDuplicateElementKey).
+        kljuc=f"v2b_pregled_{model.tekst(dodjela.get('dodjela_id'))}")
 
 
 def _kartica(st, sheet, stavka: dict, ucenik_id: str) -> None:
@@ -134,31 +137,28 @@ def _kartica(st, sheet, stavka: dict, ucenik_id: str) -> None:
                                              key=f"v2b_rad_{kljuc}")
                 _link = st.text_input("…ili zalijepi poveznicu (npr. s mobitela)",
                                       key=f"v2b_rad_link_{kljuc}")
+                _poruka_kljuc = f"v2b_rad_poruka_{kljuc}"
                 if st.button("📤 Pošalji rad", key=f"v2b_rad_salji_{kljuc}"):
+                    # 23.11.2026. (Caki: „4 puta pokušao, nije prošlo, a izvještaj kaže ‚čeka
+                    # pregled'"): prije se rad zapisivao i kad Drive odbije sliku (redak bez slike),
+                    # a poruku s razlogom odmah je brisao `st.rerun()`. Odluka je sada u
+                    # `radovi.posalji_ucenikov_rad` (ista kao u caki-testovi); poruka preživi rerun.
                     try:
-                        _veza = ""
-                        if _datoteka is not None:
-                            _bajtovi = _datoteka.getvalue()
-                            _folder = drive.folder_id(st.secrets)
-                            _veza, _greska = drive.ucitaj(_bajtovi, radovi.sef_datoteke(_datoteka.name),
-                                                          folder=_folder)
-                            if _greska:
-                                # 05.11.2026. (Claude): `drive.ucitaj` vrati tehničnu poruku
-                                # (npr. "RADOVI_FOLDER_ID") — učeniku ne pokazujemo ime secreta,
-                                # samo da rad ide dalje (poveznica/sirovi sadržaj kao zamjena).
-                                st.warning("Fotografija trenutno nije poslana na Drive — "
-                                           "rad će se ipak spremiti. Pošalji i poveznicu "
-                                           "ispod ako imaš (npr. s mobitela).")
-                                st.caption(f"Tehnički detalj (za Cakija): {_greska}")
-                        radovi.dodaj_ucenikov_rad(
+                        _rez = radovi.posalji_ucenikov_rad(
                             sheet, pokusaj_id=_pid, ucenik_id=ucenik_id,
-                            veza=_veza or model.tekst(_link),
-                            sadrzaj=(_datoteka.getvalue() if (_datoteka and not _veza) else None),
-                            naziv=(_datoteka.name if _datoteka else "Poveznica"))
-                        st.success("Rad je poslan profesoru. ✅")
-                        st.rerun()
+                            bajtovi=_datoteka.getvalue() if _datoteka is not None else None,
+                            naziv_datoteke=_datoteka.name if _datoteka is not None else "Poveznica",
+                            poveznica=_link, folder=drive.folder_id(st.secrets))
                     except Exception as e:              # noqa: BLE001
-                        st.error(f"Rad nije poslan: {e}")
+                        _rez = {"ok": False, "poruka": f"Rad nije poslan: {e}", "tehnicki": ""}
+                    st.session_state[_poruka_kljuc] = _rez
+                    if _rez["ok"]:
+                        st.rerun()
+                _rez_p = st.session_state.get(_poruka_kljuc)
+                if _rez_p:
+                    (st.success if _rez_p["ok"] else st.error)(_rez_p["poruka"])
+                    if _rez_p.get("tehnicki"):
+                        st.caption(f"Tehnički detalj (za Cakija): {_rez_p['tehnicki']}")
 
         if pokusaj and zavrsetak.je_zavrsen(pokusaj):
             if zavrsetak.predan_po_isteku(pokusaj):

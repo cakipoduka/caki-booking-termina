@@ -154,7 +154,9 @@ def test_opis_greske_nepoznat_razlog():
 
 
 def test_opis_greske_obicna_iznimka():
-    assert drive.opis_greske(ValueError("x")) == "ValueError."
+    # 23.11.: uz ime greške ide i njezina poruka (prije samo „ValueError.")
+    assert drive.opis_greske(ValueError("x")) == "ValueError: x"
+    assert drive.opis_greske(ValueError()) == "ValueError."
 
 
 def test_ucitaj_vraca_razlog_iz_googlea():

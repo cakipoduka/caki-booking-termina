@@ -708,6 +708,68 @@ def obrisi(sheet, tab: str, kljuc: str, vrijednost: str) -> bool:
     return True
 
 
+def obrisi_gdje(sheet, tab: str, uvjeti: dict) -> int:
+    """Obriše SVE retke koji zadovoljavaju sve parove `stupac -> vrijednost`. Vrati broj obrisanih.
+
+    Zašto postoji (20.11.2026.): `obrisi()` briše JEDAN redak i pri svakom pozivu iznova čita
+    cijeli tab. Brisanje testa s rezultatima dira stotine redaka — `Ocjene_zadataka` ima jedan
+    redak po zadatku i po pokušaju, pa test s 24 zadatka i 12 pokušaja ima 288 redaka samo tamo.
+    Red-po-red to bi bilo 288 čitanja i 288 brisanja, dakle zajamčena greška 429 („kvota") i
+    test obrisan dopola. Ovdje se tab čita JEDNOM, a susjedni redci brišu u bloku.
+
+    Zašto rječnik, a ne jedan ključ: `Ocjene_zadataka` i `Statistika_zadataka` nemaju jedinstven
+    stupac (ključ je `pokusaj_id` + `zadatak_id`, odnosno `zadatak_id` + `definicija_id`).
+    Brisanje po `zadatak_id` samom odnijelo bi redak drugog testa.
+
+    Ako tab ne poznaje ijedan traženi stupac, **ne briše se ništa** (vrati 0) — radije ništa nego
+    pogrešan redak.
+    """
+    _zaboravi(sheet, tab)
+    _provjeri_pisanje()
+    if not uvjeti:
+        return 0
+
+    ws = osiguraj(sheet, tab)
+    vrijednosti = _retry(ws.get_all_values) or []
+    if len(vrijednosti) < 2:
+        return 0
+
+    zaglavlje = [ime_stupca(h) for h in vrijednosti[0]]
+    stupci = {}
+    for stupac, trazeno in uvjeti.items():
+        ime = ime_stupca(stupac)
+        if ime not in zaglavlje:
+            return 0
+        stupci[zaglavlje.index(ime)] = _kao_tekst(trazeno)
+
+    redci = [br for br, red in enumerate(vrijednosti[1:], start=2)
+             if all(i < len(red) and _kao_tekst(red[i]) == v for i, v in stupci.items())]
+    if not redci:
+        return 0
+
+    # Od DNA prema vrhu — inače se brojevi redaka pomaknu pod rukom nakon prvog brisanja.
+    blokovi: list = []
+    for br in sorted(redci, reverse=True):
+        if blokovi and blokovi[-1][0] == br + 1:
+            blokovi[-1][0] = br
+        else:
+            blokovi.append([br, br])
+
+    import inspect
+    try:
+        prima_raspon = len(inspect.signature(ws.delete_rows).parameters) > 1
+    except (TypeError, ValueError):                     # ugrađena metoda bez potpisa
+        prima_raspon = False
+
+    for pocetak, kraj in blokovi:
+        if prima_raspon:
+            _retry(ws.delete_rows, pocetak, kraj)
+        else:
+            for _ in range(kraj - pocetak + 1):
+                _retry(ws.delete_rows, pocetak)
+    return len(redci)
+
+
 # ------------------------------------------------------------------ oznake (ID-evi)
 
 def _zadnji_broj(postojeci, prefiks: str) -> int:

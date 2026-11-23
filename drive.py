@@ -23,6 +23,86 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 MAKS_BAJTOVA = 25 * 1024 * 1024          # 25 MB — dovoljno za fotografiju ili sken
 
 
+# Redoslijed ključeva u Secrets. VAŽNO (23.11.2026.): ako aplikacija ima OBA ključa, Drive koristi
+# `_TESTOVI`, a Sheet (portal) obični `GOOGLE_SERVICE_ACCOUNT_JSON` — to mogu biti DVA RAZLIČITA
+# servisna računa. Zato poruka o grešci sada kaže kojim je računom pokušano.
+KLJUCEVI_RACUNA = ("GOOGLE_SERVICE_ACCOUNT_JSON_TESTOVI", "GOOGLE_SERVICE_ACCOUNT_JSON")
+
+
+def vjerodajnice(st=None) -> tuple[dict, str]:
+    """(JSON servisnog računa, ime ključa iz kojeg je pročitan). Baca `ValueError` ako nema ni jednog."""
+    import secrets_json as _sj
+
+    if st is None:
+        import streamlit as st
+    for kljuc in KLJUCEVI_RACUNA:
+        try:
+            ima = st.secrets.get(kljuc)
+        except Exception:                              # noqa: BLE001
+            ima = None
+        if ima:
+            return _sj.ucitaj(st, kljuc), kljuc
+    raise ValueError("U Secrets nema servisnog računa (" + " ni ".join(KLJUCEVI_RACUNA) + ").")
+
+
+def racun(st=None) -> dict:
+    """Koji servisni račun Drive koristi: {'email', 'kljuc', 'greska'} — e-mail računa nije tajna."""
+    try:
+        podaci, kljuc = vjerodajnice(st)
+        return {"email": model.tekst(podaci.get("client_email")), "kljuc": kljuc, "greska": ""}
+    except Exception as e:                             # noqa: BLE001
+        return {"email": "", "kljuc": "", "greska": model.tekst(e)[:300]}
+
+
+def _racun_za_poruku() -> str:
+    r = racun()
+    return f" · račun: {r['email']} (iz {r['kljuc']})" if r["email"] else ""
+
+
+def provjeri_pristup(folder: str, *, servis=None) -> dict:
+    """Dijagnostika bez upisa: vidi li servisni račun mapu i smije li u nju dodavati?
+
+    Vraća {'ok', 'poruka', 'email', 'kljuc'}. Ne stvara nikakvu datoteku.
+    """
+    izlaz = {"ok": False, "poruka": "", "email": "", "kljuc": ""}
+    if not model.tekst(folder):
+        izlaz["poruka"] = "RADOVI_FOLDER_ID nije postavljen u Secrets."
+        return izlaz
+    if servis is None:
+        r = racun()
+        izlaz.update({"email": r["email"], "kljuc": r["kljuc"]})
+        if r["greska"]:
+            izlaz["poruka"] = f"Servisni račun se ne može pročitati: {r['greska']}"
+            return izlaz
+        try:
+            from google.oauth2.service_account import Credentials
+            from googleapiclient.discovery import build
+
+            podaci, _ = vjerodajnice()
+            servis = build("drive", "v3", cache_discovery=False,
+                           credentials=Credentials.from_service_account_info(podaci, scopes=SCOPES))
+        except Exception as e:                         # noqa: BLE001
+            izlaz["poruka"] = f"Drive se ne može otvoriti: {type(e).__name__}: {model.tekst(e)[:300]}"
+            return izlaz
+    try:
+        m = servis.files().get(fileId=folder, supportsAllDrives=True,
+                               fields="id, name, driveId, capabilities(canAddChildren)").execute()
+    except Exception as e:                             # noqa: BLE001
+        izlaz["poruka"] = f"Mapa nije dostupna: {opis_greske(e)}"
+        return izlaz
+    m = m or {}
+    if not (m.get("capabilities") or {}).get("canAddChildren"):
+        izlaz["poruka"] = (f"Mapa „{model.tekst(m.get('name'))}” je vidljiva, ali račun u nju NE smije "
+                           "dodavati datoteke (treba uloga Contributor / Content manager).")
+        return izlaz
+    gdje = "na dijeljenom disku" if m.get("driveId") else "u nečijem „Moj disk” — servisni račun tamo nema prostora"
+    izlaz["ok"] = bool(m.get("driveId"))
+    izlaz["poruka"] = (f"Mapa „{model.tekst(m.get('name'))}” je dostupna i račun smije dodavati, {gdje}."
+                       if izlaz["ok"] else
+                       f"Mapa „{model.tekst(m.get('name'))}” je {gdje}. Premjesti je na dijeljeni disk.")
+    return izlaz
+
+
 def folder_id(secrets) -> str:
     try:
         return model.tekst(secrets.get("RADOVI_FOLDER_ID"))
@@ -76,16 +156,13 @@ def ucitaj(bajtovi: bytes, naziv: str, *, folder: str, servis=None) -> tuple[str
         except Exception:                              # noqa: BLE001 — paket nije instaliran
             return "", "Google API za Drive nije dostupan u ovoj aplikaciji."
         try:
-            import secrets_json as _sj
-            import streamlit as st
-
-            podaci = _sj.ucitaj(st, "GOOGLE_SERVICE_ACCOUNT_JSON_TESTOVI") \
-                if model.tekst(st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON_TESTOVI")) \
-                else _sj.ucitaj(st, "GOOGLE_SERVICE_ACCOUNT_JSON")
+            podaci, kljuc = vjerodajnice()
             kredencijali = Credentials.from_service_account_info(podaci, scopes=SCOPES)
             servis = build("drive", "v3", credentials=kredencijali, cache_discovery=False)
         except Exception as e:                         # noqa: BLE001
-            return "", f"Drive se ne može otvoriti: {type(e).__name__}."
+            # 23.11.2026.: prije samo ime greške („ValueError") — sad i poruka, jer
+            # `secrets_json` u poruci kaže TOČNO što ne valja u Secrets.
+            return "", f"Drive se ne može otvoriti: {type(e).__name__}: {model.tekst(e)[:300]}"
     try:
         from googleapiclient.http import MediaInMemoryUpload
 
@@ -101,7 +178,7 @@ def ucitaj(bajtovi: bytes, naziv: str, *, folder: str, servis=None) -> tuple[str
         ).execute()
         return model.tekst((rezultat or {}).get("webViewLink")), ""
     except Exception as e:                             # noqa: BLE001
-        return "", f"Slanje u Drive nije uspjelo: {opis_greske(e)}"
+        return "", f"Slanje u Drive nije uspjelo: {opis_greske(e)}{_racun_za_poruku()}"
 
 
 # Poznati razlozi odbijanja (polje `reason` u Googleovom odgovoru) → što napraviti.
@@ -113,6 +190,10 @@ _RAZLOZI = {
     "insufficientFilePermissions": "servisni račun nema pravo pisanja u mapu (treba uloga "
                                    "Contributor/Content manager ili jača)",
     "insufficientPermissions": "aplikacija nema dozvolu za Drive (scope)",
+    "accessNotConfigured": "Google Drive API nije uključen u Google Cloud projektu servisnog "
+                           "računa (console.cloud.google.com → APIs → Google Drive API → Enable)",
+    "SERVICE_DISABLED": "Google Drive API nije uključen u Google Cloud projektu servisnog "
+                        "računa (console.cloud.google.com → APIs → Google Drive API → Enable)",
     "forbidden": "Google je odbio upis (prava na mapi)",
 }
 
@@ -125,7 +206,7 @@ def opis_greske(e: Exception) -> str:
     """
     import json
 
-    status, razlog = "", ""
+    status, razlog, poruka = "", "", ""
     odgovor = getattr(e, "resp", None)
     if odgovor is not None:
         status = model.tekst(getattr(odgovor, "status", ""))
@@ -135,10 +216,18 @@ def opis_greske(e: Exception) -> str:
         gr = (podaci or {}).get("error") or {}
         razlog = model.tekst(((gr.get("errors") or [{}])[0] or {}).get("reason")) \
             or model.tekst(gr.get("status"))
+        poruka = model.tekst(gr.get("message"))
+        # „Drive API nije uključen" Google šalje u `details[].reason` (SERVICE_DISABLED)
+        for detalj in gr.get("details") or []:
+            if model.tekst((detalj or {}).get("reason")) == "SERVICE_DISABLED":
+                razlog = "SERVICE_DISABLED"
     except Exception:                                  # noqa: BLE001 — sadržaj nije JSON
         pass
     if razlog in _RAZLOZI:
         return f"{_RAZLOZI[razlog]} [{status} {razlog}]".replace("[ ", "[")
     if status or razlog:
-        return f"{type(e).__name__} [{status} {razlog}]".replace(" ]", "]").replace("[ ", "[")
-    return f"{type(e).__name__}."
+        dodatak = f" — {poruka[:200]}" if poruka else ""
+        return (f"{type(e).__name__} [{status} {razlog}]".replace(" ]", "]").replace("[ ", "[")
+                + dodatak)
+    tekst = model.tekst(e)
+    return f"{type(e).__name__}: {tekst[:200]}" if tekst else f"{type(e).__name__}."

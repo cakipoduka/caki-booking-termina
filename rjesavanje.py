@@ -106,13 +106,27 @@ def pregled_zadatka(zadatak: dict, odgovor: str, *,
     """
     import banka
 
-    tocan = model.tekst((zadatak or {}).get("odgovor"))
+    z = zadatak or {}
+    tocan = model.tekst(z.get("odgovor"))
     moj = model.tekst(odgovor)
     video = banka.video_za(zadatak) if pokazi_video else None
+
+    # 20.11.2026. (Caki): učenik nakon testa ne pamti zadatke, pa mu „Tvoj odgovor: B" i
+    # „Točno: C" ne znače ništa — mora vidjeti CIJELI zadatak: sliku i sve ponuđene odgovore,
+    # s označenim svojim odabirom i točnim. Zato pregled odavde nosi i `slika` i `opcije`.
+    opcije = opcije_pregleda(z, moj, pokazi_rjesenje=pokazi_rjesenje)
+    tocna_opcija = next((o for o in opcije if o["tocna"]), None)
+
     return {
-        "tekst": model.tekst((zadatak or {}).get("tekst")),
+        "tekst": model.tekst(z.get("tekst")),
+        "tip": model.tekst(z.get("tip")),
+        "slika": model.tekst(z.get("slika")),
+        "opcije": opcije,
         "moj_odgovor": moj,
+        "bez_odgovora": not moj,
         "tocan_odgovor": tocan if pokazi_rjesenje else "",
+        # Kod višestrukog izbora „Točno: C" je beskorisno bez teksta te opcije.
+        "tocan_tekst": tocna_opcija["tekst"] if tocna_opcija else "",
         "pokazi_rjesenje": bool(pokazi_rjesenje),
         "video": video if pokazi_rjesenje else None,
         "pokazi_video": bool(pokazi_video and pokazi_rjesenje),
@@ -120,6 +134,30 @@ def pregled_zadatka(zadatak: dict, odgovor: str, *,
         "izvor_ocjene": model.tekst(izvor_ocjene),
         "ceka_profesora": model.tekst(izvor_ocjene) == "?",
     }
+
+
+def opcije_pregleda(zadatak: dict, odgovor: str, *, pokazi_rjesenje: bool) -> list[dict]:
+    """Ponuđeni odgovori s oznakama: `{slovo, tekst, moja, tocna}`.
+
+    Slova se dodjeljuju po redoslijedu kao i pri rješavanju (A, B, C…), jer se kod višestrukog
+    izbora sprema SLOVO, a ne tekst (v. `ocjenjivanje.tocan_izbor`).
+
+    `tocna` ostaje `False` za sve dok Student View ne dopusti rješenja — inače bi pregled
+    odao točan odgovor prije isteka roka.
+    """
+    z = zadatak or {}
+    popis = [model.tekst(o) for o in (z.get("opcije") or [])]
+    if model.tekst(z.get("tip")) != "visestruki_izbor" or len(popis) < 2:
+        return []
+
+    slovo_moje = model.tekst(odgovor).upper()[:1]
+    slovo_tocno = model.tekst(z.get("odgovor")).upper()[:1] if pokazi_rjesenje else ""
+    return [{
+        "slovo": chr(65 + i),
+        "tekst": tekst,
+        "moja": chr(65 + i) == slovo_moje,
+        "tocna": bool(slovo_tocno) and chr(65 + i) == slovo_tocno,
+    } for i, tekst in enumerate(popis)]
 
 
 def poruka_o_cekanju(broj: int) -> str:

@@ -158,3 +158,59 @@ def dodaj_ucenikov_rad(sheet, *, pokusaj_id: str, ucenik_id: str, veza: str = ""
     return dodaj_vezu(sheet, pokusaj_id=pokusaj_id, ucenik_id=ucenik_id, veza=veza,
                       naziv=naziv or "Učenikov rad", izvor="fotografija",
                       prilozio=model.tekst(ucenik_id).upper())
+
+
+def posalji_ucenikov_rad(sheet, *, pokusaj_id: str, ucenik_id: str, bajtovi: bytes | None = None,
+                         naziv_datoteke: str = "", poveznica: str = "", folder: str = "",
+                         ucitaj=None) -> dict:
+    """Učenik šalje rad iz portala: datoteku (→ Drive) i/ili poveznicu. Vraća
+    {'ok', 'poruka', 'tehnicki', 'rad'}.
+
+    23.11.2026. (Caki: „4 puta pokušao dodati sliku, nije prošlo, a u izvještaju za roditelje
+    piše ime datoteke i ‚čeka pregled'"). Prije se, kad Drive odbije sliku, svejedno zapisivao
+    redak s imenom datoteke, bez slike i bez poveznice: sama slika se nigdje ne čuva. Profesor
+    je vidio „rad priložen", a rada nije bilo. Sada vrijedi:
+
+    - Drive primio datoteku → zapis s poveznicom na Drive.
+    - Drive odbio, ali učenik je dao poveznicu → zapis s poveznicom + upozorenje za datoteku.
+    - Drive odbio i nema poveznice → **ništa se ne zapisuje**, učenik dobije jasnu poruku.
+    """
+    izlaz = {"ok": False, "poruka": "", "tehnicki": "", "rad": None}
+    poveznica = model.tekst(poveznica)
+    if not model.tekst(pokusaj_id):
+        izlaz["poruka"] = "Rad možeš priložiti kad test počne."
+        return izlaz
+    if not bajtovi and not poveznica:
+        izlaz["poruka"] = "Odaberi fotografiju ili PDF, ili zalijepi poveznicu."
+        return izlaz
+
+    veza_drive, greska = "", ""
+    if bajtovi:
+        if ucitaj is None:
+            import drive
+            ucitaj = drive.ucitaj
+        veza_drive, greska = ucitaj(bajtovi, sef_datoteke(naziv_datoteke), folder=folder)
+
+    if veza_drive:
+        izlaz["rad"] = dodaj_upload(sheet, pokusaj_id=pokusaj_id, ucenik_id=ucenik_id,
+                                    sadrzaj=bajtovi, naziv=naziv_datoteke or "Učenikov rad",
+                                    veza=veza_drive, prilozio=model.tekst(ucenik_id).upper())
+        izlaz.update({"ok": True, "poruka": "Rad je poslan profesoru. ✅"})
+        return izlaz
+
+    if poveznica:
+        izlaz["rad"] = dodaj_vezu(sheet, pokusaj_id=pokusaj_id, ucenik_id=ucenik_id,
+                                  veza=poveznica, naziv=naziv_datoteke or "Učenikov rad",
+                                  izvor="fotografija", prilozio=model.tekst(ucenik_id).upper(),
+                                  napomena=f"Drive: {greska}"[:300] if greska else "")
+        izlaz.update({"ok": True, "tehnicki": greska,
+                      "poruka": ("Poveznica je poslana profesoru. ✅"
+                                 + (" Fotografija se nije učitala — poveznica je dovoljna."
+                                    if greska else ""))})
+        return izlaz
+
+    izlaz.update({"tehnicki": greska,
+                  "poruka": ("Fotografija NIJE poslana i rad nije zapisan. Pokušaj ponovo za "
+                             "minutu ili zalijepi poveznicu na fotografiju (npr. s Google Drivea "
+                             "na mobitelu) i pošalji nju.")})
+    return izlaz

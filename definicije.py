@@ -352,7 +352,9 @@ def smije_urediti(sheet, definicija: dict, *, danas=None) -> tuple[bool, str]:
       2. **postoji ijedan pokušaj** (u tijeku ili predan) → **ne** — bez obzira na status, jer bi
          učenici dobili drugi test od onoga što su počeli (dokaz se ne može rekonstruirati);
       3. **nacrt / zatvoren bez pokušaja** → da;
-      4. **objavljen, rok nije počeo** → da; **rok je počeo** → ne.
+      4. **objavljen, rok nije počeo** → da; **rok je počeo, a nitko nije otvorio test**
+         → **da** (20.11.2026., Caki: prije je ovdje bilo `ne`, pa se test nije mogao
+         popraviti ni kad ga nitko nije ni vidio).
     """
     d = definicija or {}
     did = model.tekst(d.get("definicija_id"))
@@ -377,17 +379,144 @@ def smije_urediti(sheet, definicija: dict, *, danas=None) -> tuple[bool, str]:
     od, _do = rok_dijela(d)
     danas = _danas(danas)
     if od and danas and danas >= od:
-        return False, f"Rok je počeo {model.datum_hr(od)} — učenici ga mogu rješavati."
+        # 20.11.2026. (Caki): prije je ovdje stajao `return False` i test se nije mogao
+        # popraviti ni kad ga NITKO nije otvorio. Dokaz čuva `Pokusaji.zadaci_json` (snimka
+        # pitanja koja je učenik stvarno vidio), a bez ijednog pokušaja nema što pokvariti.
+        return True, (f"⚠️ Rok je počeo {model.datum_hr(od)}, ali **nitko nije otvorio test** — "
+                      "smije se mijenjati. Tko ga počne poslije izmjene, dobiva novu "
+                      "verziju.")
     return True, ("Rok još nije počeo — smije se mijenjati."
                   if od else "Bez roka i bez pokušaja — smije se mijenjati.")
 
 
 
-def obrisi(sheet, definicija_id: str, *, korisnik: str = "") -> tuple[bool, str]:
+META_POLJA = ("naziv", "trajanje_min", "rok_od", "rok_do", "ai_pomoc", "napomena", "status")
+
+
+def smije_urediti_metapodatke(sheet, definicija: dict, *, danas=None) -> tuple[bool, str]:
+    """Smiju li se mijenjati OKVIRNI podaci testa (`META_POLJA`): naziv, trajanje, rok, AI?
+
+    Razlika prema `smije_urediti` (ona čuva ZADATKE): ovdje se zadaci ne diraju, pa pokušaji
+    ne blokiraju. Produljiti rok testu koji učenici pišu je normalan posao, a ne kvarenje
+    dokaza (20.11.2026., Caki: prije je obrazac bio zaključan skroz).
+
+      1. **arhiviran** → ne (prvo "Vrati iz arhive");
+      2. sve ostalo → da; ako ima pokušaja, poruka je upozorenje, ne zabrana.
+    """
+    d = definicija or {}
+    if model.tekst(d.get("status")) == "arhiviran":
+        return False, "Test je u arhivi — vrati ga iz arhive pa ga onda mijenjaj."
+    pokusaji = pokusaji_testa(sheet, model.tekst(d.get("definicija_id")))
+    if pokusaji:
+        return True, (f"⚠️ Test ima **{len(pokusaji)} pokušaja** — smiju se mijenjati naziv, "
+                      "rok, trajanje i AI pomoć, ali **ne zadaci**.")
+    return True, "Nema pokušaja — okvirni podaci se mijenjaju slobodno."
+
+
+def arhiviraj(sheet, definicija_id: str, *, korisnik: str = "") -> tuple[bool, str]:
+    """🗄️ U arhivu (biblioteka predložaka): test se ne zadaje i ne mijenja, ali ostaje cijel.
+
+    Arhiva NIJE brisanje — dodjele, pokušaji i ocjene ostaju. Iz arhive se test kopira u
+    🧱 Složi test i uredi kao novi, ili se vrati natrag s `vrati_iz_arhive`.
+    """
+    did = model.tekst(definicija_id)
+    d = po_id(sheet, did)
+    if not d:
+        return False, "Test ne postoji."
+    if model.tekst(d.get("status")) == "arhiviran":
+        return False, "Test je već u arhivi."
+    if not promijeni_status(sheet, did, "arhiviran", korisnik=korisnik or "caki"):
+        return False, "Status nije upisan (redak nije nađen)."
+    return True, f"Test `{did}` je u arhivi — ostaje kao predložak, učenicima nije dostupan."
+
+
+def vrati_iz_arhive(sheet, definicija_id: str, *, korisnik: str = "",
+                    novi_status: str = "zatvoren") -> tuple[bool, str]:
+    """↩️ Iz arhive natrag u rad. Zadano `zatvoren`: Caki ga vidi i smije mijenjati, učenik ne.
+
+    Namjerno NE ide odmah u `objavljen` — objava znači dodjele i ide kroz 👥 Objavi.
+    Arhiviranje je time povratno: arhiva iz koje se ne može natrag bila bi zamka.
+    """
+    did = model.tekst(definicija_id)
+    d = po_id(sheet, did)
+    if not d:
+        return False, "Test ne postoji."
+    if model.tekst(d.get("status")) != "arhiviran":
+        return False, "Test nije u arhivi."
+    if novi_status not in ("nacrt", "zatvoren"):
+        return False, "Iz arhive se vraća kao `nacrt` ili `zatvoren`."
+    if not promijeni_status(sheet, did, novi_status, korisnik=korisnik or "caki"):
+        return False, "Status nije upisan (redak nije nađen)."
+    return True, (f"Test `{did}` je vraćen iz arhive (status `{novi_status}`) — sad se smije "
+                  "mijenjati; za učenike ga objavi u 👥 Objavi.")
+
+
+def _prebroji(sheet, tab: str, uvjet) -> int:
+    """Koliko redaka u tabu zadovoljava uvjet. Nedostupan tab = 0, ne greška."""
+    try:
+        return sum(1 for r in tablice.ucitaj(sheet, tab) if uvjet(r))
+    except Exception:                                   # noqa: BLE001
+        return 0
+
+
+def opseg_brisanja(sheet, definicija_id: str) -> dict:
+    """Koliko bi redaka brisanje odnijelo — brojevi koje sučelje pokazuje PRIJE klika.
+
+    Read-only; ništa ne mijenja. Postoji zato da dijalog brisanja može napisati točan opseg i
+    zaključati gumb s objašnjenjem, umjesto da korisnik klikne i tek onda dobije odbijenicu
+    (UX pravilo 4: „ako je gumb zaključan — napiši zašto").
+
+    Ključ `smije_bez_rezultata` kaže smije li se test obrisati uz odgovor „rezultati: NE".
+    """
+    did = model.tekst(definicija_id)
+    prazno = {"definicija_id": did, "postoji": False, "naziv": "", "status": "",
+              "pokusaji": 0, "ocjene": 0, "dodjele": 0, "izmjene": 0, "zalbe": 0,
+              "statistika": 0, "rezultata_ukupno": 0, "ima_pokusaje": False,
+              "smije_bez_rezultata": False, "razlog": "Test ne postoji."}
+    if not did:
+        return dict(prazno, razlog="Nedostaje ID testa.")
+    d = po_id(sheet, did)
+    if not d:
+        return prazno
+
+    pokusaji = pokusaji_testa(sheet, did)
+    pids = {model.tekst(p.get("pokusaj_id")) for p in pokusaji
+            if model.tekst(p.get("pokusaj_id"))}
+
+    opseg = {
+        "definicija_id": did,
+        "postoji": True,
+        "naziv": model.tekst(d.get("naziv")),
+        "status": model.tekst(d.get("status")),
+        "pokusaji": len(pokusaji),
+        "dodjele": _prebroji(sheet, tablice.TAB_DODJELE,
+                             lambda r: model.tekst(r.get("definicija_id")) == did),
+        "ocjene": _prebroji(sheet, tablice.TAB_OCJENE,
+                            lambda r: model.tekst(r.get("pokusaj_id")) in pids) if pids else 0,
+        "izmjene": _prebroji(sheet, tablice.TAB_IZMJENE_OCJENA,
+                             lambda r: model.tekst(r.get("pokusaj_id")) in pids) if pids else 0,
+        "zalbe": _prebroji(sheet, tablice.TAB_ZALBE,
+                           lambda r: model.tekst(r.get("pokusaj_id")) in pids) if pids else 0,
+        "statistika": _prebroji(sheet, tablice.TAB_STATISTIKA,
+                                lambda r: model.tekst(r.get("definicija_id")) == did),
+    }
+    opseg["ima_pokusaje"] = opseg["pokusaji"] > 0
+    opseg["smije_bez_rezultata"] = not opseg["ima_pokusaje"]
+    opseg["rezultata_ukupno"] = (opseg["pokusaji"] + opseg["ocjene"] + opseg["izmjene"]
+                                 + opseg["zalbe"] + opseg["statistika"])
+    opseg["razlog"] = "" if opseg["smije_bez_rezultata"] else (
+        f"Test ima {opseg['pokusaji']} pokušaja — uz „rezultati: NE” se ne briše, jer je "
+        "rezultat dokaz. Odaberi „rezultati: DA” ili ga arhiviraj.")
+    return opseg
+
+
+def obrisi(sheet, definicija_id: str, *, korisnik: str = "",
+           sila: bool = False) -> tuple[bool, str]:
     """Obriši test. Vraća (uspjeh, razlog).
 
     Pravila:
-      · **ima pokušaja** → NE briše se (dokaz; predlaži arhiviranje),
+      · **ima pokušaja** i `sila=False` → NE briše se (dokaz; predlaži arhiviranje),
+      · **ima pokušaja** i `sila=True` → briše se test **i svi njegovi rezultati** (nepovratno),
       · ima dodjela bez pokušaja → brišu se dodjele, zatim test,
       · svaka radnja se zapisuje u `Dnevnik_radnji`.
     """
@@ -399,18 +528,17 @@ def obrisi(sheet, definicija_id: str, *, korisnik: str = "") -> tuple[bool, str]
         return False, "Test ne postoji."
 
     pokusaji = pokusaji_testa(sheet, did)
+    if pokusaji and sila:
+        return _obrisi_s_rezultatima(sheet, did, pokusaji, korisnik=korisnik)
     if pokusaji:
         return False, (f"Test ima **{len(pokusaji)} pokušaja** — ne briše se (to je dokaz). "
-                       "Predlažem **arhiviranje** (status `arhiviran`).")
+                       "Predlažem **arhiviranje** (status `arhiviran`) ili brisanje s rezultatima "
+                       "(`sila=True`, nepovratno).")
 
-    obrisane_dodjele = 0
+    # 20.11.2026.: jedno čitanje taba umjesto jednog po dodjeli (prije: `obrisi()` u petlji).
     try:
-        for red in tablice.ucitaj(sheet, tablice.TAB_DODJELE):
-            if model.tekst(red.get("definicija_id")) != did:
-                continue
-            if tablice.obrisi(sheet, tablice.TAB_DODJELE, "dodjela_id",
-                              model.tekst(red.get("dodjela_id"))):
-                obrisane_dodjele += 1
+        obrisane_dodjele = tablice.obrisi_gdje(sheet, tablice.TAB_DODJELE,
+                                               {"definicija_id": did})
     except Exception as e:                              # noqa: BLE001
         return False, f"Dodjele nije moguće obrisati: {e}"
 
@@ -422,7 +550,7 @@ def obrisi(sheet, definicija_id: str, *, korisnik: str = "") -> tuple[bool, str]
                               f"{model.tekst(d.get('naziv'))}; dodjela obrisano: {obrisane_dodjele}")
     except Exception:                                   # noqa: BLE001
         pass
-    return True, (f"Test obrisan." + (f" Uz njega i {obrisane_dodjele} dodjela."
+    return True, ("Test obrisan." + (f" Uz njega i {obrisane_dodjele} dodjela."
                                       if obrisane_dodjele else ""))
 
 
@@ -430,19 +558,21 @@ def izmijeni(sheet, definicija: dict, promjene: dict, *, korisnik: str = "") -> 
     """Izmijeni test kakav ga učenik vidi (kao v1 `testovi_admin` L2071–2121).
 
     Dopuštena polja: `naziv`, `trajanje_min`, `rok_od`, `rok_do`, `ai_pomoc`, `napomena`, `status`.
-    **Ne mijenja** zadatke (`zadaci_json`) — to je drugi posao. Blokira se ako test ima pokušaja
-    (`smije_urediti`).
+    **Ne mijenja** zadatke (`zadaci_json`) — to je drugi posao. Zato se blokira samo ako je
+    test arhiviran (`smije_urediti_metapodatke`); pokušaji NE blokiraju okvirne podatke.
     """
     d = definicija or {}
     did = model.tekst(d.get("definicija_id"))
     if not did:
         return False, "Nedostaje ID testa."
 
-    smije, razlog = smije_urediti(sheet, d)
+    # 20.11.2026.: ova funkcija NIKAD ne dira `zadaci_json`, pa je dovoljna provjera okvirnih
+    # podataka — test s pokušajima smije dobiti novi rok ili naziv.
+    smije, razlog = smije_urediti_metapodatke(sheet, d)
     if not smije:
         return False, razlog
 
-    dopusteno = ("naziv", "trajanje_min", "rok_od", "rok_do", "ai_pomoc", "napomena", "status")
+    dopusteno = META_POLJA
     polja = {k: v for k, v in (promjene or {}).items() if k in dopusteno}
     if not polja:
         return False, "Nema dopuštenih polja za izmjenu."
@@ -474,6 +604,59 @@ def izmijeni(sheet, definicija: dict, promjene: dict, *, korisnik: str = "") -> 
     return bool(ok), "Spremljeno." if ok else "Redak nije nađen."
 
 
+def postavi_student_view(sheet, definicija: dict, izbor: dict,
+                         *, korisnik: str = "") -> tuple[bool, str]:
+    """Postavi što učenik vidi — po testu. Vraća (uspjeh, poruka).
+
+    **Zašto zasebna funkcija, a ne `izmijeni()`:** `student_view_json` namjerno nije u
+    `META_POLJA`. `izmijeni()` upisuje vrijednosti kakve dobije, a ovdje to ne valja — nepoznat
+    resurs ili razina ne smiju doći do baze, jer bi ih `_view_iz_jsona()` tiho preskočio i
+    učeniku bi se, bez ijedne greške, prikazalo nešto drugo nego što je profesor postavio.
+    Zato se najprije provjeri svaki ključ i svaka razina, pa tek onda serijalizira.
+
+    **Pokušaji NE blokiraju ovu izmjenu.** Otvoriti rješenja nakon isteka roka normalan je
+    posao i ne dira ni jedan predani odgovor. Arhiviran test se ne mijenja — ista provjera kao
+    za okvirne podatke (`smije_urediti_metapodatke`).
+    """
+    d = definicija or {}
+    did = model.tekst(d.get("definicija_id"))
+    if not did:
+        return False, "Nedostaje ID testa."
+
+    smije, razlog = smije_urediti_metapodatke(sheet, d)
+    if not smije:
+        return False, razlog
+
+    trazeno = izbor or {}
+    if not isinstance(trazeno, dict):
+        return False, "Očekivan je rječnik resurs → razina."
+    for kljuc, vrijednost in trazeno.items():
+        if kljuc not in RESURSI:
+            return False, (f"Nepoznat resurs `{model.tekst(kljuc)}`. "
+                           f"Dopušteni su: {', '.join(RESURSI)}.")
+        if model.tekst(vrijednost) not in STUPNJEVI:
+            return False, (f"Nepoznata razina `{model.tekst(vrijednost)}` za `{kljuc}`. "
+                           f"Dopuštene su: {', '.join(STUPNJEVI)}.")
+
+    # Krene se od onoga što je već zapisano, pa se promijeni samo ono što je poslano —
+    # tako djelomičan izbor ne obriše ostale resurse.
+    novi = _view_iz_jsona(d.get("student_view_json"))
+    for kljuc, vrijednost in trazeno.items():
+        novi[kljuc] = model.tekst(vrijednost)
+
+    if not tablice.azuriraj(sheet, tablice.TAB_DEFINICIJE, "definicija_id", did,
+                            {"student_view_json": model.u_json(novi)}):
+        return False, "Postavke nisu upisane (redak nije nađen)."
+
+    try:
+        tablice.zapisi_radnju(
+            sheet, korisnik or "caki", "student_view", did,
+            ", ".join(f"{k}={novi[k]}" for k in RESURSI))
+    except Exception:                                   # noqa: BLE001
+        pass
+    return True, "Spremljeno — učenici od sada vide točno ovo."
+
+
 def postavi_aktivan(sheet, definicija_id: str, aktivan: bool, *, korisnik: str = "") -> tuple[bool, str]:
     """v1 „Aktivan / Deaktiviraj": učenik ga vidi ili ne (rezultati ostaju)."""
     d = po_id(sheet, definicija_id)
@@ -485,14 +668,23 @@ def postavi_aktivan(sheet, definicija_id: str, aktivan: bool, *, korisnik: str =
 
 def zatvori_odmah(sheet, definicija_id: str, *, korisnik: str = "") -> tuple[bool, str]:
     """v1 „Zatvori test odmah" (L2137): rok se postavlja na **jučer** → nitko novi ne piše, a
-    predani odmah vide rješenja."""
+    predani odmah vide rješenja.
+
+    23.11.2026.: postavlja i `status = zatvoren`. Sam datum nije bio dovoljan: učenik kojem je
+    test dodijeljen danas (pravilo „dodan poslije roka → rok je dan dodjele") i dalje je imao
+    otvoren rok, pa nije vidio rješenja. `dodjele.stanje_roka()` sada status poštuje.
+    Arhivirani test ostaje arhiviran.
+    """
     from datetime import date, timedelta
 
     d = po_id(sheet, definicija_id)
     if not d:
         return False, "Test ne postoji."
     jučer = (date.today() - timedelta(days=1)).isoformat()
-    ok, razlog = izmijeni(sheet, d, {"rok_do": jučer}, korisnik=korisnik)
+    promjene = {"rok_do": jučer}
+    if model.tekst(d.get("status")) != "arhiviran":
+        promjene["status"] = "zatvoren"
+    ok, razlog = izmijeni(sheet, d, promjene, korisnik=korisnik)
     if ok:
         try:
             tablice.zapisi_radnju(sheet, korisnik or "caki", "zatvori_odmah",
@@ -543,3 +735,121 @@ def smije_ai(definicija: dict) -> bool:
     """
     vrijednost = model.tekst((definicija or {}).get("ai_pomoc")).lower()
     return vrijednost in ("da", "1", "true", "tocno", "točno")
+
+
+def _obrisi_s_rezultatima(sheet, definicija_id: str, pokusaji: list[dict], *,
+                          korisnik: str = "") -> tuple[bool, str]:
+    """Nepovratno: obriši test i SVE njegove rezultate. Vraća (uspjeh, poruka s brojevima).
+
+    Red je od lišća prema korijenu, da nijedan redak ne ostane bez svog testa:
+    ocjene/izmjene/žalbe po pokušaju → pokušaj → statistika → dodjele → test.
+
+    Tri popravka 20.11.2026. (nađena pri provjeri, prije nego je sučelje postalo dostupno):
+
+    1. **Statistika se prije nije brisala.** Uvjet je tražio stupac `statistika_id`, a tab
+       `Statistika_zadataka` ga ne poznaje (ključ je `zadatak_id` + `definicija_id`), pa je izraz
+       uvijek bio 0 i redci su ostajali kao siročići.
+    2. **Pokušaji se brišu po `pokusaj_id`, ne po `definicija_id`.** `Pokusaji` ima oba stupca, ali
+       `definicija_id` smije biti prazan — zato `pokusaji_testa()` i traži preko `dodjela_id`.
+       Brisanje po `definicija_id` promašilo bi upravo te retke.
+    3. **Dnevnik je dobivao prazan redak.** Upisivalo se ključevima `radnja_id`/`kada`/`tko`/
+       `detalji`, a tab `Dnevnik_radnji` ima `kad`/`korisnik`/`radnja`/`sto`/`detalj`. Nijedan se
+       nije poklopio, pa je najrazornija radnja u sustavu ostavljala prazan trag. Sada ide kroz
+       `tablice.zapisi_radnju()`, koja piše ispravnim imenima stupaca.
+    """
+    did = model.tekst(definicija_id)
+    pids = [model.tekst(p.get("pokusaj_id")) for p in (pokusaji or [])
+            if model.tekst(p.get("pokusaj_id"))]
+    brojevi = {"ocjene": 0, "izmjene": 0, "zalbe": 0, "pokusaji": 0,
+               "statistika": 0, "dodjele": 0}
+
+    def _brisi(tab: str, uvjeti: dict) -> int:
+        try:
+            return tablice.obrisi_gdje(sheet, tab, uvjeti)
+        except Exception:                               # noqa: BLE001 — jedan tab ne ruši ostatak
+            return 0
+
+    for pid in pids:
+        brojevi["ocjene"] += _brisi(tablice.TAB_OCJENE, {"pokusaj_id": pid})
+        brojevi["izmjene"] += _brisi(tablice.TAB_IZMJENE_OCJENA, {"pokusaj_id": pid})
+        brojevi["zalbe"] += _brisi(tablice.TAB_ZALBE, {"pokusaj_id": pid})
+        brojevi["pokusaji"] += _brisi(tablice.TAB_POKUSAJI, {"pokusaj_id": pid})
+
+    brojevi["statistika"] = _brisi(tablice.TAB_STATISTIKA, {"definicija_id": did})
+    brojevi["dodjele"] = _brisi(tablice.TAB_DODJELE, {"definicija_id": did})
+
+    try:
+        tablice.obrisi(sheet, tablice.TAB_DEFINICIJE, "definicija_id", did)
+    except Exception as e:                              # noqa: BLE001
+        return False, f"Rezultati su obrisani, ali test nije: {e}"
+
+    tablice.zapisi_radnju(
+        sheet, korisnik or "caki", "obrisan_test_s_rezultatima", did,
+        f"pokušaji {brojevi['pokusaji']}, ocjene {brojevi['ocjene']}, "
+        f"dodjele {brojevi['dodjele']}, izmjene {brojevi['izmjene']}, "
+        f"žalbe {brojevi['zalbe']}, statistika {brojevi['statistika']}")
+
+    return True, (f"**Obrisano nepovratno:** test `{did}`, pokušaji **{brojevi['pokusaji']}**, "
+                  f"ocjene **{brojevi['ocjene']}**, dodjele **{brojevi['dodjele']}**, "
+                  f"izmjene {brojevi['izmjene']}, žalbe {brojevi['zalbe']}, "
+                  f"statistika {brojevi['statistika']}.")
+
+
+# ------------------------------------------------------------------ više testova odjednom
+
+def _zbirno(uspjeli: list, odbijeni: list, glagol: str) -> str:
+    """Jedna rečenica za sučelje: koliko je prošlo, koliko nije i zašto (UX pravilo 4)."""
+    dijelovi = []
+    if uspjeli:
+        dijelovi.append(f"{glagol} **{len(uspjeli)}**: " + ", ".join(f"`{x}`" for x in uspjeli))
+    if odbijeni:
+        dijelovi.append(f"nije prošlo **{len(odbijeni)}**: "
+                        + "; ".join(f"`{oznaka}` — {razlog}" for oznaka, razlog in odbijeni))
+    return " · ".join(dijelovi) or "Nije odabran nijedan test."
+
+
+def obrisi_vise(sheet, oznake, *, sila: bool = False, korisnik: str = "") -> dict:
+    """Obriši više testova odjednom (za višestruki odabir u arhivi).
+
+    Svaki test ide kroz `obrisi()`, pa vrijede ista pravila — test s pokušajima se bez
+    `sila=True` ne briše. **Jedan odbijeni test ne zaustavlja ostale**: tko se smije obrisati,
+    obriše se, a za ostale se vrati razlog. Zato se ne vraća (bool, str) nego rječnik.
+    """
+    obrisani: list = []
+    odbijeni: list = []
+    for oznaka_sirova in (oznake or ()):
+        oznaka = model.tekst(oznaka_sirova)
+        if not oznaka:
+            continue
+        try:
+            ok, razlog = obrisi(sheet, oznaka, korisnik=korisnik, sila=sila)
+        except Exception as e:                          # noqa: BLE001
+            ok, razlog = False, f"greška: {e}"
+        if ok:
+            obrisani.append(oznaka)
+        else:
+            odbijeni.append((oznaka, razlog))
+    return {"obrisani": obrisani, "odbijeni": odbijeni,
+            "poruka": _zbirno(obrisani, odbijeni, "Obrisano")}
+
+
+def vrati_vise_iz_arhive(sheet, oznake, *, korisnik: str = "",
+                         novi_status: str = "zatvoren") -> dict:
+    """Vrati više testova iz arhive odjednom. Isti oblik odgovora kao `obrisi_vise()`."""
+    vraceni: list = []
+    odbijeni: list = []
+    for oznaka_sirova in (oznake or ()):
+        oznaka = model.tekst(oznaka_sirova)
+        if not oznaka:
+            continue
+        try:
+            ok, razlog = vrati_iz_arhive(sheet, oznaka, korisnik=korisnik,
+                                         novi_status=novi_status)
+        except Exception as e:                          # noqa: BLE001
+            ok, razlog = False, f"greška: {e}"
+        if ok:
+            vraceni.append(oznaka)
+        else:
+            odbijeni.append((oznaka, razlog))
+    return {"vraceni": vraceni, "odbijeni": odbijeni,
+            "poruka": _zbirno(vraceni, odbijeni, "Vraćeno iz arhive")}
