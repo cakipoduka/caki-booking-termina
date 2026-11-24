@@ -530,11 +530,17 @@ def _ocjene_pokusaja(sheet, pokusaj: dict) -> dict:
         for r in _t.ucitaj(sheet, _t.TAB_OCJENE):
             if model.tekst(r.get("pokusaj_id")) != pid:
                 continue
+            _t = model.tekst(r.get("tocno")).lower() in ("da", "true", "točno", "tocno")
+            _b, _m = model.broj(r.get("bodovi"), 0), model.broj(r.get("max"), 0)
             izlaz[model.tekst(r.get("zadatak_id"))] = {
-                "tocno": model.tekst(r.get("tocno")).lower() in ("da", "true", "točno", "tocno"),
-                "bodovi": model.broj(r.get("bodovi"), 0),
-                "max": model.broj(r.get("max"), 0),
+                "tocno": _t,
+                "bodovi": _b,
+                "max": _m,
                 "komentar": model.tekst(r.get("komentar")),
+                # 24.11.2026.: djelomični bodovi (kao v1) — netočno, ali 0 < bodovi < max
+                "djelomicno": (not _t) and 0 < _b < (_m or 0),
+                "izvor": model.tekst(r.get("izvor_ocjene")),
+                "odgovor": model.tekst(r.get("odgovor")),
             }
     except Exception:                               # noqa: BLE001
         return {}
@@ -597,6 +603,8 @@ def prikazi_pregled_rjesenja(st, zadaci: list[dict], odgovori: dict, *,
         if _ocj and pokazi_bodove:
             if _ocj.get("tocno"):
                 oznaka = f"✔ točno · {_ocj['bodovi']:g}/{_ocj['max']:g} boda"
+            elif _ocj.get("djelomicno"):
+                oznaka = f"🟡 djelomično · {_ocj['bodovi']:g}/{_ocj['max']:g} boda"
             elif not model.tekst((odgovori or {}).get(str(i))):
                 oznaka = "⚪ bez odgovora · 0 bodova"
             else:
@@ -642,6 +650,12 @@ def prikazi_pregled_rjesenja(st, zadaci: list[dict], odgovori: dict, *,
                            f"{rjesavanje.pripremi_latex(red['tocan_tekst'], zamotaj=True)}")
             if red["video"]:
                 st.markdown(f"🎬 **Video:** [{red['video']['naslov']}]({red['video']['url']})")
+            if sheet is not None and pokusaj and uloga == "profesor":
+                try:
+                    prikazi_ispravak_ocjene(st, sheet, model.tekst(pokusaj.get("pokusaj_id")),
+                                            z, _ocj, kljuc=f"{kljuc}_{i}")
+                except Exception as _e_isp:            # noqa: BLE001
+                    st.caption(f"✏️ Ispravak ocjene trenutno nije dostupan ({type(_e_isp).__name__}).")
             if sheet is not None and pokusaj:
                 try:
                     if uloga == "profesor":
@@ -774,3 +788,59 @@ def prikazi_zalbu_profesoru(st, sheet, zalba: dict, *, kljuc: str, max_bodovi=No
                     st.rerun()
                 else:
                     st.error(_poruka)
+
+
+# ============================================================ ✏️ ISPRAVAK OCJENE (24.11.2026.)
+# Caki: „Funkcionalnosti v1 modula ‚Provjera i ispravak ocjena' su veće — mogu se dodijeliti
+# djelomični bodovi." Isti izbor kao v1: ostavi · točno · djelomično (bodovi) · netočno.
+
+ODLUKE_PRIKAZ = {"": "— ostavi kako je —", "tocno": "✅ točno", "djelomicno": "🟡 djelomično",
+                 "netocno": "❌ netočno"}
+
+
+def prikazi_ispravak_ocjene(st, sheet, pokusaj_id: str, zadatak: dict, ocjena: dict, *,
+                            kljuc: str, profesor: str = "caki") -> None:
+    """Profesor mijenja ocjenu jednog zadatka (u pregledu po učeniku i u ručnoj provjeri)."""
+    import provedba as _provedba
+
+    if not ocjena:
+        st.caption("✏️ Ovaj zadatak nema zapis ocjene pa se ne može ispravljati.")
+        return
+    _zid = model.tekst(zadatak.get("id"))
+    _maks = model.broj(ocjena.get("max"), 0) or model.broj(zadatak.get("bodovi"), 1) or 1
+    _sada = ("tocno" if ocjena.get("tocno") else
+             "djelomicno" if ocjena.get("djelomicno") else "netocno")
+    _izvor = model.tekst(ocjena.get("izvor"))
+    with st.form(f"{kljuc}_ocjena_{_zid}", border=True):
+        st.caption(f"✏️ **Ocjena** · sada: {ODLUKE_PRIKAZ[_sada]} · "
+                   f"{model.broj(ocjena.get('bodovi'), 0):g}/{_maks:g} b"
+                   + (f" · izvor: {_izvor}" if _izvor else "")
+                   + (" · ⚠️ nesigurno — provjeri" if _izvor in ("?", "ai") else ""))
+        _odluka = st.radio("Nova odluka", list(ODLUKE_PRIKAZ), horizontal=True,
+                           format_func=lambda k: ODLUKE_PRIKAZ[k], key=f"{kljuc}_odl_{_zid}")
+        _b = st.number_input(
+            "Bodovi (samo za djelomično)", min_value=0.0, max_value=float(_maks), step=0.5,
+            value=float(ocjena.get("bodovi")) if ocjena.get("djelomicno") else float(_maks) / 2,
+            key=f"{kljuc}_bod_{_zid}")
+        _kom = st.text_input("Komentar (vidi ga učenik)", value=model.tekst(ocjena.get("komentar")),
+                             key=f"{kljuc}_kom_{_zid}")
+        if st.form_submit_button("💾 Spremi ocjenu"):
+            _staro_kom = model.tekst(ocjena.get("komentar"))
+            if not _odluka and model.tekst(_kom) == _staro_kom:
+                st.warning("Ništa nije promijenjeno.")
+                return
+            # „ostavi kako je" + novi komentar → ista odluka (i isti bodovi), novi komentar
+            _konacna = _odluka or _sada
+            _bodovi = _b if _odluka == "djelomicno" else ocjena.get("bodovi")
+            _ok, _poruka = _provedba.ocijeni_odlukom(
+                sheet, pokusaj_id, _zid, _konacna, bodovi=_bodovi, maks=_maks,
+                komentar=_kom, profesor=profesor)
+            if _ok:
+                try:
+                    st.cache_data.clear()
+                except Exception:                      # noqa: BLE001
+                    pass
+                st.success(_poruka)
+                st.rerun()
+            else:
+                st.error(_poruka)

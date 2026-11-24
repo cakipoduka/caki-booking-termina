@@ -395,6 +395,42 @@ def ocijeni_rucno(sheet, pokusaj_id: str, zadatak_id: str, *, tocno: bool, bodov
     return False
 
 
+ODLUKE = ("tocno", "djelomicno", "netocno")
+
+
+def ocijeni_odlukom(sheet, pokusaj_id: str, zadatak_id: str, odluka: str, *, bodovi=None,
+                    maks=None, komentar: str = "", profesor: str = "caki") -> tuple[bool, str]:
+    """Profesorova odluka po zadatku, kao u v1 „Provjera i ispravak ocjena" (24.11.2026.).
+
+    `odluka`: `tocno` (puni bodovi) · `djelomicno` (upisani bodovi, 0 < b < max) · `netocno` (0).
+    Djelomično se upisuje kao **netočno s bodovima** — isto kao v1 (`status netocno + bodovi`),
+    pa ga prikaz prepoznaje po 0 < bodovi < max. Trag ide u `Izmjene_ocjena`, zbroj se preračunava.
+    """
+    odluka = model.tekst(odluka)
+    if odluka not in ODLUKE:
+        return False, "Odaberi odluku."
+    if odluka == "tocno":
+        iznos, tocno = None, True
+    elif odluka == "netocno":
+        iznos, tocno = 0, False
+    else:
+        try:
+            iznos = float(model.tekst(bodovi).replace(",", "."))
+        except ValueError:
+            return False, "Upiši bodove za djelomično."
+        gornja = model.broj(maks, 0)
+        if iznos <= 0 or (gornja and iznos >= gornja):
+            return False, (f"Djelomično znači više od 0 i manje od {gornja:g} b. "
+                           "Za 0 ili puni broj odaberi netočno ili točno.")
+        tocno = False
+    if not ocijeni_rucno(sheet, pokusaj_id, zadatak_id, tocno=tocno, bodovi=iznos,
+                         komentar=komentar, profesor=profesor):
+        return False, "Nije spremljeno — taj zadatak nema ocjenu u Ocjene_zadataka."
+    if odluka == "djelomicno":
+        return True, f"Spremljeno: djelomično, {iznos:g} b."
+    return True, "Spremljeno: točno." if odluka == "tocno" else "Spremljeno: netočno."
+
+
 def _kao_bool(vrijednost):
     """„Da"/„da"/True → True; „Ne"/0/False → False; prazno/ostalo → None."""
     tekst = model.tekst(vrijednost).lower()
