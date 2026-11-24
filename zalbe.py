@@ -207,7 +207,8 @@ def zakljuci(sheet, zalba_id: str, *, priznaj: bool, odgovor: str, profesor: str
     """Profesor JEDNOM odgovara na žalbu i odlučuje o bodovima. Vraća (uspjelo, poruka).
 
     - Odgovor je obavezan (učenik mora znati zašto).
-    - Već odgovorena žalba se ne mijenja (bez rasprave).
+    - Već odgovorena žalba se ovdje ne mijenja — za ispravak je `ispravi()` (24.11.: profesor
+      uvijek smije ispraviti; učenik ne smije podnijeti drugu žalbu).
     - `priznaj=True` → zadatak dobiva **pune bodove**, trag ide u `Izmjene_ocjena`
       (povod `zalba`) i preračunava se zbroj pokušaja; `False` → bodovi ostaju.
     """
@@ -228,3 +229,44 @@ def zakljuci(sheet, zalba_id: str, *, priznaj: bool, odgovor: str, profesor: str
     if not odgovori(sheet, zid, prihvati=False, odgovor=odgovor, tko=profesor):
         return False, "Odgovor nije zapisan."
     return True, "Žalba zaključena: bodovi nisu priznati."
+
+
+def ispravi(sheet, zalba_id: str, *, priznaj: bool, odgovor: str, profesor: str = "caki") -> tuple[bool, str]:
+    """Profesor ISPRAVLJA već zaključenu žalbu (odgovor i/ili odluku). Vraća (uspjelo, poruka).
+
+    24.11.2026. (Caki): „Nemoj konačno zaključavati — uvijek treba ostaviti opciju ispravka
+    odgovora od strane profesora." Učenik i dalje ne može podnijeti drugu žalbu (jedna po
+    zadatku); mijenja se samo profesorova strana.
+
+    - Odluka ista → mijenja se samo tekst odgovora.
+    - Odluka promijenjena → bodovi se mijenjaju: priznato = puni bodovi, nije priznato = 0;
+      svaka promjena ide u `Izmjene_ocjena` (povod `zalba_ispravak`) i zbroj se preračunava.
+    """
+    import provedba
+
+    odgovor = model.tekst(odgovor)
+    if not odgovor:
+        return False, "Napiši odgovor učeniku."
+    zid = model.tekst(zalba_id)
+    zalba = next((z for z in _svi(sheet) if model.tekst(z.get("zalba_id")) == zid), None)
+    if not zalba:
+        return False, "Žalba ne postoji."
+    if je_otvorena(zalba):
+        return zakljuci(sheet, zid, priznaj=priznaj, odgovor=odgovor, profesor=profesor)
+
+    bila_priznata = model.tekst(zalba.get("status")) == STATUS_PRIHVACENA
+    if bool(priznaj) != bila_priznata:
+        if not provedba.ocijeni_rucno(
+                sheet, model.tekst(zalba.get("pokusaj_id")), model.tekst(zalba.get("zadatak_id")),
+                tocno=bool(priznaj), bodovi=None if priznaj else 0,
+                komentar=odgovor, profesor=profesor or "caki", povod="zalba_ispravak"):
+            return False, "Bodovi se ne mogu upisati — taj zadatak nema ocjenu u Ocjene_zadataka."
+    tablice.azuriraj(sheet, TAB_ZALBE, "zalba_id", zid, {
+        "status": STATUS_PRIHVACENA if priznaj else STATUS_ODBIJENA,
+        "odgovor": odgovor,
+        "tko_odgovorio": model.tekst(profesor),
+        "odgovoreno": model.sada_iso(),
+    })
+    if bool(priznaj) != bila_priznata:
+        return True, f"Ispravljeno: {'bodovi priznati' if priznaj else 'bodovi nisu priznati'}."
+    return True, "Ispravljen odgovor (odluka ista)."

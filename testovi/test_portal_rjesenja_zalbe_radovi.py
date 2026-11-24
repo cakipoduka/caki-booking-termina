@@ -199,3 +199,32 @@ def test_ai_sloj_ocjenjivanja_koristi_ai_pomoc_v2(monkeypatch):
     rez = ocjenjivanje.ai_provjeri_izraz("1/2", "0.5", "x", kljuc="k", tajna="t")
     assert pozvano, "AI se nije ni pozvao (učitan je v1 ai_pomoc bez `pitaj`)"
     assert rez is not None and rez.get("tocno") is True
+
+
+# ------------------------------------------------------------------ 24.11.: formule uz test
+
+def test_portal_ucenik_vidi_formule(tmp_path):
+    import formule_testa as F
+    from streamlit.testing.v1 import AppTest
+
+    formule = F.u_json([{"formula_id": "F1", "naslov": "Volumen kocke", "cjelina": "Geometrija",
+                         "tekst_latex": "V=a^3"}])
+    skripta = tmp_path / "rj.py"
+    skripta.write_text(f'''
+import json, sys
+sys.path.insert(0, {str(KORIJEN)!r})
+import streamlit as st
+import ekran_ucenika_v2 as e
+zadaci = [{{"id": "Z1", "tekst": "2+2?", "odgovor": "4", "bodovi": 1, "tip": "kratki_odgovor"}}]
+e.prikazi(st, None, {{"definicija_id": "T1", "zadaci_json": json.dumps(zadaci),
+                     "trajanje_min": 60, "formule_json": {formule!r}}},
+          {{"dodjela_id": "D1", "ucenik_id": "OH3229"}}, dry=True)
+''', encoding="utf-8")
+    at = AppTest.from_file(str(skripta), default_timeout=60).run()
+    assert not at.exception, [str(x.value) for x in at.exception]
+    assert "$$V=a^3$$" in " | ".join(m.value for m in at.markdown)
+
+
+def test_portal_zalba_ispravak_postoji():
+    import zalbe
+    assert hasattr(zalbe, "ispravi") and hasattr(zalbe, "zakljuci")

@@ -390,7 +390,9 @@ def smije_urediti(sheet, definicija: dict, *, danas=None) -> tuple[bool, str]:
 
 
 
-META_POLJA = ("naziv", "trajanje_min", "rok_od", "rok_do", "ai_pomoc", "napomena", "status")
+# 24.11.2026.: + `formule_json` (📐 formule uz test — okvir testa, kao rok; pokušaji ga ne zaključavaju)
+META_POLJA = ("naziv", "trajanje_min", "rok_od", "rok_do", "ai_pomoc", "napomena", "status",
+              "formule_json")
 
 
 def smije_urediti_metapodatke(sheet, definicija: dict, *, danas=None) -> tuple[bool, str]:

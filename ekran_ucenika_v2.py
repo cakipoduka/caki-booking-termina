@@ -130,6 +130,13 @@ def prikazi(st, sheet, definicija: dict, dodjela: dict, *, dry: bool = False) ->
             st.rerun()
         b3.caption(f"Pitanje **{index + 1}** od **{len(zadaci)}** · odgovor se sprema sam")
 
+    # --- 📐 formule uz test (24.11.2026., iz v1): gumb otvara popis, ne zauzima mjesto
+    try:
+        import formule_testa
+        formule_testa.gumb_formule(st, definicija, kljuc=_k("formule", pokusaj["pokusaj_id"]))
+    except Exception:                                   # noqa: BLE001 — formule ne ruše test
+        pass
+
     # --- pitanje
     z = zadaci[index]
     trenutni = model.tekst(odgovori.get(str(index)))
@@ -733,4 +740,37 @@ def prikazi_zalbu_profesoru(st, sheet, zalba: dict, *, kljuc: str, max_bodovi=No
         _kada_o = model.datum_hr(model.tekst(zalba.get("odgovoreno"))[:10]) or "—"
         st.info(f"⚖️ **Žalba učenika** ({_kada}): {model.tekst(zalba.get('razlog')) or '—'}  \n"
                 f"**Tvoj odgovor** ({_kada_o}): {model.tekst(zalba.get('odgovor')) or '—'}  \n"
-                f"**Odluka:** {_zalbe.opis_odluke(zalba)} — zaključeno.")
+                f"**Odluka:** {_zalbe.opis_odluke(zalba)}")
+        # 24.11.2026. (Caki): ne zaključavati konačno — profesor uvijek smije ispraviti.
+        _otvori = f"{kljuc}_ispravi_{_zid}"
+        if not st.session_state.get(_otvori):
+            if st.button("✏️ Ispravi odgovor ili odluku", key=f"{_otvori}_gumb"):
+                st.session_state[_otvori] = True
+                st.rerun()
+            return
+        _priznata = model.tekst(zalba.get("status")) == _zalbe.STATUS_PRIHVACENA
+        _puni = f" ({model.broj(max_bodovi, 0):g} b.)" if max_bodovi not in (None, "") else ""
+        _opcije = [f"✅ Priznajem bodove{_puni}", "❌ Ne priznajem"]
+        with st.form(f"{kljuc}_ispravak_{_zid}"):
+            _odg = st.text_area("Ispravljeni odgovor učeniku", value=model.tekst(zalba.get("odgovor")),
+                                height=80, key=f"{kljuc}_isp_tekst_{_zid}")
+            _odluka = st.radio("Odluka o bodovima", _opcije, index=0 if _priznata else 1,
+                               horizontal=True, key=f"{kljuc}_isp_odluka_{_zid}")
+            _c1, _c2 = st.columns(2)
+            _spremi = _c1.form_submit_button("Spremi ispravak")
+            _odustani = _c2.form_submit_button("Odustani")
+            if _odustani:
+                st.session_state.pop(_otvori, None)
+                st.rerun()
+            if _spremi:
+                _ok, _poruka = _zalbe.ispravi(sheet, _zid, priznaj=_odluka.startswith("✅"),
+                                              odgovor=_odg, profesor=profesor)
+                if _ok:
+                    st.session_state.pop(_otvori, None)
+                    try:
+                        st.cache_data.clear()
+                    except Exception:                  # noqa: BLE001
+                        pass
+                    st.rerun()
+                else:
+                    st.error(_poruka)

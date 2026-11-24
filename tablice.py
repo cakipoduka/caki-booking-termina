@@ -58,6 +58,7 @@ ZAGLAVLJA = {
         "zadaci_json", "broj_zadataka", "bodovi_ukupno", "trajanje_min",
         "rok_od", "rok_do", "status", "student_view_json", "varijanta_pravilo",
         "pdf_verzija", "autor", "kreirano", "napomena", "ai_pomoc",
+        "formule_json",  # 24.11.2026.: 📐 zamrznute formule uz test (iz v1)
     ],
     # v2: dodjele TESTOVA. CRM koristi `Dodjele` za nešto drugo — zato je ime različito.
     TAB_DODJELE: [
@@ -689,9 +690,20 @@ def azuriraj(sheet, tab: str, kljuc: str, vrijednost: str, promjene: dict) -> bo
     if not redak:
         return False
     zaglavlje = [ime_stupca(h) for h in vrijednosti[0]]
+    while zaglavlje and not zaglavlje[-1]:
+        zaglavlje.pop()
     for polje, novo in (promjene or {}).items():
         if polje not in zaglavlje:
-            continue
+            # 24.11.2026.: stupac koji sustav traži (ZAGLAVLJA), a postojeći tab ga još nema
+            # (npr. `formule_json` u Definicije_testova) — dopiši ga na kraj zaglavlja umjesto
+            # da se vrijednost tiho izgubi. Poziv prema Googleu samo kad stupac stvarno nedostaje.
+            if polje not in (ZAGLAVLJA.get(tab) or []):
+                continue
+            stupac = len(zaglavlje) + 1
+            if int(getattr(ws, "col_count", stupac) or stupac) < stupac:
+                _retry(ws.add_cols, stupac - int(ws.col_count))
+            _retry(ws.update_cell, 1, stupac, polje)
+            zaglavlje.append(polje)
         _retry(ws.update_cell, redak, zaglavlje.index(polje) + 1, novo)
     return True
 
